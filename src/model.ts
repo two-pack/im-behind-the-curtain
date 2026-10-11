@@ -8,6 +8,11 @@ export const FORMAT_VERSION = 1;
 export const ROLES = ["system", "developer", "user", "assistant"] as const;
 export type Role = (typeof ROLES)[number];
 
+/** What a human reply must be: free text, or text that reads as JSON. */
+export type ReplyKind = "text" | "json";
+
+const REPLY_KINDS: readonly ReplyKind[] = ["text", "json"];
+
 export interface Message {
   role: Role;
   content: string;
@@ -17,7 +22,7 @@ export interface Message {
 export interface ConversationRequest {
   format: "chat.completions";
   model: string;
-  replyKind: "text";
+  replyKind: ReplyKind;
   requiredShape: Record<string, unknown> | null;
   stream: boolean;
   includeUsage: boolean;
@@ -45,7 +50,7 @@ export interface StateFile {
 
 export interface ReplyFile {
   formatVersion: 1;
-  kind: "text";
+  kind: ReplyKind;
   body: string;
   source?: string;
   writtenAt?: string;
@@ -63,6 +68,10 @@ const UNSUPPORTED = { kind: "unsupported" } as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isReplyKind(value: unknown): value is ReplyKind {
+  return typeof value === "string" && (REPLY_KINDS as readonly string[]).includes(value);
 }
 
 function isRole(value: unknown): value is Role {
@@ -102,7 +111,7 @@ export function parseRequestFile(data: unknown): Loaded<RequestFile> {
   if (conversation === undefined) {
     return UNREADABLE;
   }
-  if (data.format !== "chat.completions" || data.replyKind !== "text") {
+  if (data.format !== "chat.completions" || !isReplyKind(data.replyKind)) {
     return UNSUPPORTED;
   }
   return {
@@ -113,7 +122,7 @@ export function parseRequestFile(data: unknown): Loaded<RequestFile> {
       receivedAt: data.receivedAt as string,
       format: "chat.completions",
       model: data.model as string,
-      replyKind: "text",
+      replyKind: data.replyKind,
       requiredShape: isRecord(data.requiredShape) ? data.requiredShape : null,
       stream: data.stream as boolean,
       includeUsage: data.includeUsage as boolean,
@@ -142,15 +151,15 @@ export function parseStateFile(data: unknown): Loaded<StateFile> {
   };
 }
 
-/** In this version only a text reply is accepted. Other kinds are `unsupported`. */
+/** A text or json reply is accepted. Other kinds are `unsupported`. */
 export function parseReplyFile(data: unknown): Loaded<ReplyFile> {
   if (!isRecord(data) || data.formatVersion !== FORMAT_VERSION || typeof data.body !== "string") {
     return UNREADABLE;
   }
-  if (data.kind !== "text") {
+  if (!isReplyKind(data.kind)) {
     return UNSUPPORTED;
   }
-  const reply: ReplyFile = { formatVersion: FORMAT_VERSION, kind: "text", body: data.body };
+  const reply: ReplyFile = { formatVersion: FORMAT_VERSION, kind: data.kind, body: data.body };
   if (typeof data.source === "string") {
     reply.source = data.source;
   }
@@ -189,10 +198,14 @@ export function createStateFile(
   return { formatVersion: FORMAT_VERSION, id, state, updatedAt, endedAt, endReason: null };
 }
 
-export function createReplyFile(body: string, writtenAt: string): ReplyFile {
+export function createReplyFile(
+  body: string,
+  writtenAt: string,
+  kind: ReplyKind = "text",
+): ReplyFile {
   return {
     formatVersion: FORMAT_VERSION,
-    kind: "text",
+    kind,
     body,
     source: "imbehind-answer",
     writtenAt,

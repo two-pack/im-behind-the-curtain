@@ -108,3 +108,21 @@ export async function postChat(
   });
   return { status: response.status, body: (await response.json()) as Record<string, unknown> };
 }
+
+/** POSTs a Chat Completions request and returns the status, the content type and the raw text. */
+export async function postChatRaw(
+  baseUrl: string,
+  content: string,
+  extra: Record<string, unknown> = {},
+): Promise<{ status: number; contentType: string; text: string }> {
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "whatever", messages: [{ role: "user", content }], ...extra }),
+  });
+  return {
+    status: response.status,
+    contentType: response.headers.get("content-type") ?? "",
+    text: await response.text(),
+  };
+}

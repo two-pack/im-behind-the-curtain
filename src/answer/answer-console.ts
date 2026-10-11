@@ -9,7 +9,7 @@ import type { Clock } from "../clock.js";
 import { EXIT, IoFailure } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger, Screen } from "../log.js";
-import type { Role } from "../model.js";
+import type { ReplyKind, Role } from "../model.js";
 import { endOfInputHint } from "../platform.js";
 
 /** Every sentence the screen shows, in one place. */
@@ -24,7 +24,15 @@ const TEXT = {
   unsupported: (id: string) =>
     `Cannot show request ${shortId(id)}: this version does not support it.`,
   prompt: () => `Type your reply. Finish with ${endOfInputHint()}.`,
+  jsonPrompt: () => `Type the JSON. Finish with ${endOfInputHint()}.`,
+  jsonAgain: () => `Type the JSON again. Finish with ${endOfInputHint()}.`,
+  requiredShape: "Required shape:",
+  anyJson: "Any JSON value is accepted as long as it is valid JSON.",
+  notJson: (reason: string) => `Not sent: your reply is not valid JSON (${reason}).`,
 } as const;
+
+/** The word shown after "Reply:" for each kind of reply. */
+const REPLY_KIND_LABELS: Readonly<Record<ReplyKind, string>> = { text: "text", json: "JSON" };
 
 const ROLE_LABELS: Readonly<Record<Role, string>> = {
   system: "System",
@@ -279,7 +287,7 @@ export class AnswerConsole {
     if (typed.kind === "exit") {
       return typed.code;
     }
-    return this.send(item.id, typed.text, signal);
+    return this.send(item.id, typed.text, item.request.replyKind, signal);
   }
 
   private show(item: WaitingExchange, total: number): void {
@@ -289,7 +297,7 @@ export class AnswerConsole {
     screen.line(head + "-".repeat(Math.max(3, SEPARATOR_WIDTH - head.length)));
     screen.line(`Received: ${formatReceived(request.receivedAt)}`);
     screen.line(`Model:    ${request.model}`);
-    screen.line(`Reply:    ${request.replyKind}`);
+    screen.line(`Reply:    ${REPLY_KIND_LABELS[request.replyKind]}`);
     screen.line("");
     for (const message of request.conversation) {
       screen.line(`${ROLE_LABELS[message.role]}:`);
@@ -298,7 +306,24 @@ export class AnswerConsole {
       }
       screen.line("");
     }
-    screen.line(TEXT.prompt());
+    if (request.replyKind === "json") {
+      this.showRequiredShape(request.requiredShape);
+    }
+    screen.line(request.replyKind === "json" ? TEXT.jsonPrompt() : TEXT.prompt());
+  }
+
+  /** The shape the client asked for, nested by two spaces, or the note that any JSON will do. */
+  private showRequiredShape(shape: Record<string, unknown> | null): void {
+    const { screen } = this.options;
+    if (shape === null) {
+      screen.line(TEXT.anyJson);
+    } else {
+      screen.line(TEXT.requiredShape);
+      for (const line of JSON.stringify(shape, null, 2).split("\n")) {
+        screen.line(`  ${line}`);
+      }
+    }
+    screen.line("");
   }
 
   /** Reads until there is a reply that is not empty, or until the program must end. */
@@ -315,19 +340,40 @@ export class AnswerConsole {
         return { kind: "exit", code: EXIT.failure };
       }
       const text = normalizeReply(read.text);
-      if (text !== "") {
+      if (text === "") {
+        this.options.screen.line(TEXT.emptyReply);
+      } else {
         this.emptyStreak = 0;
-        return { kind: "text", text };
+        if (this.accepts(item.request.replyKind, text)) {
+          return { kind: "text", text };
+        }
       }
-      this.options.screen.line(TEXT.emptyReply);
     }
   }
 
-  private async send(id: string, text: string, signal: AbortSignal): Promise<number | undefined> {
+  /**
+   * The check of the reply before it is placed. A reply that fails is not sent: the
+   * reason is shown, and the same request asks again.
+   */
+  private accepts(kind: ReplyKind, text: string): boolean {
+    const check = this.options.broker.checkReply(kind, text);
+    if (!check.ok) {
+      this.options.screen.line(TEXT.notJson(check.reason));
+      this.options.screen.line(TEXT.jsonAgain());
+    }
+    return check.ok;
+  }
+
+  private async send(
+    id: string,
+    text: string,
+    kind: ReplyKind,
+    signal: AbortSignal,
+  ): Promise<number | undefined> {
     const { broker, screen, errorScreen, clock, pollIntervalMs } = this.options;
     let placed: Awaited<ReturnType<ExchangeBroker["placeReply"]>>;
     try {
-      placed = await broker.placeReply(id, text);
+      placed = await broker.placeReply(id, text, kind);
     } catch (error) {
       if (!(error instanceof IoFailure)) {
         throw error;

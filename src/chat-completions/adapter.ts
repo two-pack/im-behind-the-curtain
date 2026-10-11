@@ -3,7 +3,13 @@
  * conversation form, and builds the response and error bodies.
  * It has no side effects and calls no other module.
  */
-import { type ConversationRequest, type Message, ROLES, type Role } from "../model.js";
+import {
+  type ConversationRequest,
+  type Message,
+  type ReplyKind,
+  ROLES,
+  type Role,
+} from "../model.js";
 
 export type ErrorCode = "invalid_request" | "not_found" | "method_not_allowed" | "storage_error";
 
@@ -125,9 +131,44 @@ function toConversation(items: unknown[]): Message[] {
   });
 }
 
+/** The reply kind and the required shape of a request, from `response_format`. */
+function readResponseFormat(body: Record<string, unknown>): {
+  replyKind: ReplyKind;
+  requiredShape: Record<string, unknown> | null;
+} {
+  const format = body.response_format;
+  if (!isRecord(format)) {
+    return { replyKind: "text", requiredShape: null };
+  }
+  if (format.type === "json_object") {
+    return { replyKind: "json", requiredShape: null };
+  }
+  if (format.type !== "json_schema") {
+    return { replyKind: "text", requiredShape: null };
+  }
+  const wrapper = format.json_schema;
+  if (!isRecord(wrapper)) {
+    return { replyKind: "json", requiredShape: null };
+  }
+  if (wrapper.schema === undefined) {
+    return { replyKind: "json", requiredShape: wrapper };
+  }
+  return { replyKind: "json", requiredShape: isRecord(wrapper.schema) ? wrapper.schema : null };
+}
+
+/** `stream` and `stream_options.include_usage`; only the value true counts. */
+function readStreaming(body: Record<string, unknown>): { stream: boolean; includeUsage: boolean } {
+  const stream = body.stream === true;
+  const options = body.stream_options;
+  return {
+    stream,
+    includeUsage: stream && isRecord(options) && options.include_usage === true,
+  };
+}
+
 /**
  * Checks a request body in orderconverts it.
- * Unknown fields are ignored, and `stream` is read as false in this version.
+ * Unknown fields are ignored.
  */
 export function parseChatCompletionsRequest(text: string): AdapterResult {
   const body = parseObject(text);
@@ -150,10 +191,8 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
     request: {
       format: "chat.completions",
       model: body.model as string,
-      replyKind: "text",
-      requiredShape: null,
-      stream: false,
-      includeUsage: false,
+      ...readResponseFormat(body),
+      ...readStreaming(body),
       conversation: toConversation(items),
       originalRequest: body,
     },
@@ -183,6 +222,57 @@ export function buildCompletion(input: CompletionInput): ChatCompletion {
     ],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
+}
+
+export interface StreamInput extends CompletionInput {
+  /** Whether to add the final usage chunk. */
+  includeUsage: boolean;
+}
+
+type StreamChoice = { index: 0; delta: Record<string, unknown>; finish_reason: "stop" | null };
+
+interface StreamChunk {
+  id: string;
+  object: "chat.completion.chunk";
+  created: number;
+  model: string;
+  choices: StreamChoice[];
+  usage?: ChatCompletion["usage"];
+}
+
+/** One server-sent event: a line of JSON and a blank line. */
+function event(chunk: StreamChunk): string {
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+}
+
+/**
+ * The events of a streamed response, in order: the role, the whole reply in one
+ * content chunk, stop, the usage chunk when asked, and `[DONE]`. Every chunk has the same id,
+ * created and model.
+ */
+export function buildStreamEvents(input: StreamInput): string[] {
+  const base = {
+    id: `chatcmpl-${input.requestId}`,
+    object: "chat.completion.chunk",
+    created: input.nowSeconds,
+    model: input.model,
+  } as const;
+  const choice = (delta: Record<string, unknown>, finish: "stop" | null): StreamChoice[] => [
+    { index: 0, delta, finish_reason: finish },
+  ];
+  const chunks: StreamChunk[] = [
+    { ...base, choices: choice({ role: "assistant", content: "" }, null) },
+    { ...base, choices: choice({ content: input.content }, null) },
+    { ...base, choices: choice({}, "stop") },
+  ];
+  if (input.includeUsage) {
+    chunks.push({
+      ...base,
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+  }
+  return [...chunks.map(event), "data: [DONE]\n\n"];
 }
 
 export function errorBody(code: ErrorCode, message: string): ErrorBody {

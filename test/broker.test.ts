@@ -194,7 +194,7 @@ describe("accepting a reply", () => {
   it("does not accept a reply of a kind it does not know", async () => {
     const { store, broker, events } = setup();
     const { id } = await submitWaiting(broker);
-    store.putFile(id, "reply.json", serializeFile({ formatVersion: 1, kind: "json", body: "{}" }));
+    store.putFile(id, "reply.json", serializeFile({ formatVersion: 1, kind: "skip", body: "{}" }));
     await broker.pollOnce();
     expect(stateOf(store, id)).toBe("waiting");
     expect(store.count("acceptReply")).toBe(0);
@@ -591,6 +591,56 @@ describe("placing and confirming a reply", () => {
       state: "unreadable",
     });
     expect(await broker.confirmReply(id, "x")).toBe("unreadable");
+  });
+});
+
+describe("json replies", () => {
+  it("has one reply check: json is checked, text is not, shape is not looked at", () => {
+    const { broker } = setup();
+    expect(broker.checkReply("json", '{"passed": true}')).toEqual({ ok: true });
+    expect(broker.checkReply("json", '{"passed":')).toEqual({
+      ok: false,
+      reason: "unexpected end of input at line 1",
+    });
+    expect(broker.checkReply("text", '{"passed":')).toEqual({ ok: true });
+  });
+
+  it("places a json reply with kind json and the body exactly as given", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    const body = '{ "passed":   true }';
+    const result = await broker.placeReply(id, body, "json");
+    expect(result.kind).toBe("placed");
+    const stored = JSON.parse(store.entries.get(id)?.files.get("reply.json") ?? "{}");
+    expect(stored).toMatchObject({ formatVersion: 1, kind: "json", body });
+  });
+
+  it("accepts a json reply with the same steps as a text reply and passes the body as typed", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    const body = '{ "passed":   true }';
+    store.putFile(id, "reply.json", serializeFile(createReplyFile(body, NOW, "json")));
+    await broker.pollOnce();
+    await settle();
+    const entry = store.entries.get(id);
+    expect(entry?.files.has("reply.json")).toBe(false);
+    expect(entry?.files.has("reply.accepted.json")).toBe(true);
+    expect(stateOf(store, id)).toBe("replied");
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body });
+    expect(events).toEqual([{ type: "replied", id }]);
+  });
+
+  it("lists a waiting json request with its reply kind and required shape", async () => {
+    const { broker } = setup();
+    const submitted = await broker.submit({
+      ...request,
+      replyKind: "json",
+      requiredShape: { type: "object" },
+    });
+    const listing = await broker.listWaiting(new Set());
+    expect(listing.waiting.map((item) => item.id)).toEqual([submitted.id]);
+    expect(listing.waiting[0]?.request.replyKind).toBe("json");
+    expect(listing.waiting[0]?.request.requiredShape).toEqual({ type: "object" });
   });
 });
 

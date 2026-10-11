@@ -26,7 +26,11 @@ const RECEIVED_AT = new Date(2026, 9, 9, 14, 5, 12).toISOString();
 const PROMPT = "Type your reply. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).";
 const WAITING = "Waiting for requests... (press Ctrl+C to quit)";
 
-function requestWith(conversation: Message[], model = "whatever"): ConversationRequest {
+function requestWith(
+  conversation: Message[],
+  model = "whatever",
+  extra: Partial<ConversationRequest> = {},
+): ConversationRequest {
   return {
     format: "chat.completions",
     model,
@@ -36,6 +40,7 @@ function requestWith(conversation: Message[], model = "whatever"): ConversationR
     includeUsage: false,
     conversation,
     originalRequest: { model },
+    ...extra,
   };
 }
 
@@ -72,8 +77,12 @@ function setup(steps: Step[]) {
     reader,
     serveBroker,
     controller,
-    addWaiting(id = ID, conversation: Message[] = [{ role: "user", content: "Hello" }]) {
-      const request = requestWith(conversation);
+    addWaiting(
+      id = ID,
+      conversation: Message[] = [{ role: "user", content: "Hello" }],
+      extra: Partial<ConversationRequest> = {},
+    ) {
+      const request = requestWith(conversation, "whatever", extra);
       store.addRaw(id, {
         request: createRequestFile(id, RECEIVED_AT, request),
         state: createStateFile(id, "waiting", RECEIVED_AT, null),
@@ -86,6 +95,10 @@ function setup(steps: Step[]) {
     replyBody(id = ID): string | undefined {
       const bytes = store.entries.get(id)?.files.get("reply.json");
       return bytes === undefined ? undefined : (JSON.parse(bytes) as { body: string }).body;
+    },
+    replyKind(id = ID): string | undefined {
+      const bytes = store.entries.get(id)?.files.get("reply.json");
+      return bytes === undefined ? undefined : (JSON.parse(bytes) as { kind: string }).kind;
     },
   };
 }
@@ -579,5 +592,160 @@ describe("ending the input with Ctrl+Z and Enter on Windows", () => {
     input.write(CTRL_Z);
     input.write("\r");
     expect(await reading).toEqual({ kind: "reply", text: "x\nmore", gotInput: true });
+  });
+});
+
+describe("a request that asks for JSON", () => {
+  const SHAPE = {
+    type: "object",
+    properties: { passed: { type: "boolean" } },
+    required: ["passed"],
+  };
+  const JSON_PROMPT = "Type the JSON. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).";
+
+  it("shows the reply kind, the required shape in a nested layout, and the JSON prompt", async () => {
+    const t = setup([]);
+    t.addWaiting(ID, [{ role: "user", content: "Did the login succeed?" }], {
+      replyKind: "json",
+      requiredShape: SHAPE,
+    });
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).toEqual([
+      separator(1, 1, "a1b2c3"),
+      "Received: 2026-10-09 14:05:12",
+      "Model:    whatever",
+      "Reply:    JSON",
+      "",
+      "User:",
+      "  Did the login succeed?",
+      "",
+      "Required shape:",
+      "  {",
+      '    "type": "object",',
+      '    "properties": {',
+      '      "passed": {',
+      '        "type": "boolean"',
+      "      }",
+      "    },",
+      '    "required": [',
+      '      "passed"',
+      "    ]",
+      "  }",
+      "",
+      JSON_PROMPT,
+    ]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("says any JSON value is accepted when no shape was asked for", async () => {
+    const t = setup([]);
+    t.addWaiting(ID, [{ role: "user", content: "Hi" }], { replyKind: "json" });
+    const running = t.start();
+    await settle();
+    const lines = t.stdout();
+    expect(lines).toContain("Any JSON value is accepted as long as it is valid JSON.");
+    expect(lines).not.toContain("Required shape:");
+    expect(lines.at(-1)).toBe(JSON_PROMPT);
+    expect(lines.at(-2)).toBe("");
+    t.controller.abort();
+    await running;
+  });
+
+  it("places a valid JSON reply exactly as typed, with kind json", async () => {
+    const t = setup(['{ "passed":   true }\r\n']);
+    t.addWaiting(ID, undefined, { replyKind: "json", requiredShape: SHAPE });
+    const running = t.start();
+    await settle();
+    expect(t.replyBody()).toBe('{ "passed":   true }');
+    expect(t.replyKind()).toBe("json");
+    await t.serveBroker.pollOnce();
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain("Sent.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("does not send a reply that is not valid JSON, and asks again for the same request", async () => {
+    const seen: (string | undefined)[] = [];
+    const t = setup([
+      '{"passed":',
+      () => {
+        seen.push(t.replyBody());
+        return '{"passed": true}';
+      },
+    ]);
+    t.addWaiting(ID, undefined, { replyKind: "json", requiredShape: SHAPE });
+    const running = t.start();
+    await settle();
+    expect(seen).toEqual([undefined]);
+    const lines = t.stdout();
+    const at = lines.indexOf(
+      "Not sent: your reply is not valid JSON (unexpected end of input at line 1).",
+    );
+    expect(at).toBeGreaterThan(0);
+    expect(lines[at + 1]).toBe(
+      "Type the JSON again. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).",
+    );
+    expect(lines.filter((line) => line.startsWith("--- Request"))).toHaveLength(1);
+    expect(t.reader.calls).toBe(2);
+    expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
+    expect(t.replyBody()).toBe('{"passed": true}');
+    t.controller.abort();
+    await running;
+  });
+
+  it("keeps asking after several bad replies, and never prints what was typed (NFR10.2)", async () => {
+    const t = setup(['{"secret-token": ZQZ}', "secret-token", '{"a": 1} secret-token', "42"]);
+    t.addWaiting(ID, undefined, { replyKind: "json" });
+    const running = t.start();
+    await settle();
+    expect(t.reader.calls).toBe(4);
+    expect(t.replyBody()).toBe("42");
+    expect(t.raw()).not.toMatch(/secret-token|ZQZ/);
+    expect(t.stdout()).toContain(
+      "Not sent: your reply is not valid JSON (unexpected character at line 1, column 18).",
+    );
+    t.controller.abort();
+    await running;
+  });
+
+  it("sends a reply that does not match the required shape as typed", async () => {
+    const t = setup(['{"reason": "x"}']);
+    t.addWaiting(ID, undefined, { replyKind: "json", requiredShape: SHAPE });
+    const running = t.start();
+    await settle();
+    expect(t.replyBody()).toBe('{"reason": "x"}');
+    expect(t.stdout().some((line) => line.startsWith("Not sent: your reply is not valid"))).toBe(
+      false,
+    );
+    t.controller.abort();
+    await running;
+  });
+
+  it("handles an empty reply first, with the empty-reply notice and not a JSON error", async () => {
+    const t = setup(["\n\n", "[]"]);
+    t.addWaiting(ID, undefined, { replyKind: "json" });
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).toContain("The reply is empty. Type a reply, or press Ctrl+C to quit.");
+    expect(t.stdout().some((line) => line.startsWith("Not sent: your reply is not valid"))).toBe(
+      false,
+    );
+    expect(t.replyBody()).toBe("[]");
+    t.controller.abort();
+    await running;
+  });
+
+  it("does not check a text request, which accepts text that is not JSON", async () => {
+    const t = setup(['{"passed":']);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.replyBody()).toBe('{"passed":');
+    expect(t.replyKind()).toBe("text");
+    t.controller.abort();
+    await running;
   });
 });

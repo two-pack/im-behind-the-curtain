@@ -263,7 +263,7 @@ describe("a request that gets a reply", () => {
     const { port, store, broker, out } = await startServer();
     const pending = send(port, {
       headers: { Authorization: "Bearer key" },
-      body: chat("Hello", { stream: true, temperature: 0.1 }),
+      body: chat("Hello", { stream: false, temperature: 0.1 }),
     });
     await waitFor(() => store.entries.size === 1);
     const [id] = [...store.entries.keys()];
@@ -343,6 +343,182 @@ describe("a request that gets a reply", () => {
     // Ids are assigned in the order the requests arrive, so storage order is id order.
     const assigned = [...store.entries.keys()];
     expect([...assigned].sort()).toEqual(assigned);
+  });
+});
+
+/** Sends a request and tells whether any part of the response (even the headers) has arrived. */
+function sendWatching(port: number, body: string) {
+  let arrived = false;
+  const pending = new Promise<Reply>((resolve, reject) => {
+    const request = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        method: "POST",
+        path: "/v1/chat/completions",
+        headers: { "Content-Type": "application/json" },
+      },
+      (response) => {
+        arrived = true;
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          resolve({
+            status: response.statusCode ?? 0,
+            headers: response.headers,
+            text,
+            json: () => JSON.parse(text) as ReplyBody,
+          });
+        });
+      },
+    );
+    request.on("error", reject);
+    request.end(body);
+  });
+  return { pending, hasArrived: () => arrived };
+}
+
+/** The events of a stream: the text after "data: " of each block. */
+function eventsOf(text: string): string[] {
+  expect(text.endsWith("\n\n")).toBe(true);
+  return text
+    .slice(0, -2)
+    .split("\n\n")
+    .map((block) => {
+      expect(block.startsWith("data: ")).toBe(true);
+      return block.slice("data: ".length);
+    });
+}
+
+describe("streaming", () => {
+  async function streamed(extra: Record<string, unknown>, content = "Hi") {
+    const context = await startServer();
+    const watching = sendWatching(context.port, chat("Hello", { stream: true, ...extra }));
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    // Nothing, not even the headers, is sent while the human has not replied.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(watching.hasArrived()).toBe(false);
+    await answer(context, id, content);
+    return { reply: await watching.pending, id, context };
+  }
+
+  it("sends text/event-stream once the reply arrives: role, content, stop, then [DONE]", async () => {
+    const { reply, id } = await streamed({});
+    expect(reply.status).toBe(200);
+    expect(reply.headers["content-type"]).toContain("text/event-stream");
+    const events = eventsOf(reply.text);
+    expect(events).toHaveLength(4);
+    expect(events[3]).toBe("[DONE]");
+    const chunks = events.slice(0, 3).map((event) => JSON.parse(event));
+    const common = {
+      id: `chatcmpl-${id}`,
+      object: "chat.completion.chunk",
+      created: 1791813940,
+      model: "whatever",
+    };
+    expect(chunks).toEqual([
+      {
+        ...common,
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      },
+      { ...common, choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }] },
+      { ...common, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+    ]);
+  });
+
+  it("sends the whole reply in one content chunk and adds a usage chunk when asked", async () => {
+    const body = 'line one\nline two {"a": 1}';
+    const { reply } = await streamed({ stream_options: { include_usage: true } }, body);
+    const events = eventsOf(reply.text);
+    expect(events).toHaveLength(5);
+    const contents = events
+      .slice(0, 4)
+      .map((event) => JSON.parse(event).choices[0]?.delta?.content)
+      .filter((content) => content !== undefined && content !== "");
+    expect(contents).toEqual([body]);
+    expect(JSON.parse(events[3] as string)).toMatchObject({
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    expect(events[4]).toBe("[DONE]");
+  });
+
+  it("streams a structured-output request in the same form", async () => {
+    const { reply, context, id } = await streamed({
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "x", schema: { type: "object" } },
+      },
+    });
+    expect(reply.headers["content-type"]).toContain("text/event-stream");
+    expect(eventsOf(reply.text)).toHaveLength(4);
+    const stored = context.store.entries.get(id)?.request;
+    expect(stored).toMatchObject({ replyKind: "json", stream: true });
+  });
+
+  it("answers a stream:false or missing stream request with the JSON response", async () => {
+    for (const extra of [
+      { stream: false },
+      {},
+      { stream: false, stream_options: { include_usage: true } },
+    ]) {
+      const context = await startServer();
+      const pending = send(context.port, { body: chat("Hello", extra) });
+      await waitFor(() => context.store.entries.size === 1);
+      const [id] = [...context.store.entries.keys()] as [string];
+      await answer(context, id, "Hi");
+      const reply = await pending;
+      expect(reply.headers["content-type"]).toContain("application/json");
+      expect(reply.json().choices[0]?.message.content).toBe("Hi");
+    }
+  });
+
+  it("answers a failure before the stream starts with the normal JSON error", async () => {
+    const { port, store } = await startServer();
+    store.fail("createRequest");
+    const reply = await send(port, { body: chat("Hello", { stream: true }) });
+    expect(reply.status).toBe(500);
+    expect(reply.headers["content-type"]).toContain("application/json");
+    expect(reply.headers["content-type"]).not.toContain("text/event-stream");
+    expect(reply.json().error).toEqual({
+      message: "The request could not be stored.",
+      type: "server_error",
+      code: "storage_error",
+    });
+    const rejected = await send(port, { body: '{"stream": true' });
+    expect(rejected.status).toBe(400);
+    expect(rejected.headers["content-type"]).toContain("application/json");
+  });
+});
+
+describe("the received line shows the reply kind and stream", () => {
+  it("adds json and stream to the line, and nothing from the request", async () => {
+    const context = await startServer();
+    const pendings = [
+      send(context.port, { body: chat("SECRET-TEXT", {}) }),
+      send(context.port, { body: chat("SECRET-TEXT", { stream: true }) }),
+      send(context.port, {
+        body: chat("SECRET-TEXT", { response_format: { type: "json_object" } }),
+      }),
+      send(context.port, {
+        body: chat("SECRET-TEXT", { response_format: { type: "json_object" }, stream: true }),
+      }),
+    ];
+    await waitFor(() => context.out.length === 4);
+    const details = context.out.map((line) => /[0-9a-f]{6} {2}(.*)\n$/.exec(line)?.[1]);
+    expect(details.sort()).toEqual([
+      "chat/completions  json",
+      "chat/completions  json  stream",
+      "chat/completions  text",
+      "chat/completions  text  stream",
+    ]);
+    expect(context.out.join("")).not.toContain("SECRET-TEXT");
+    for (const id of context.store.entries.keys()) {
+      await answer(context, id, "ok");
+    }
+    await Promise.all(pendings);
   });
 });
 

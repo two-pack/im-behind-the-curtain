@@ -34,6 +34,20 @@ node dist/bin.js answer   # 端末2: リクエストを表示して、返答を�
 
 どちらのコマンドも、Ctrl+Cで終えられます。誰も返答していないリクエストは保存先に残り、次に `imbehind answer` を起動したときにもう一度表示されます。
 
+### 構造化出力
+
+リクエストの `response_format` の `type` が `json_schema` か `json_object` のとき、`imbehind answer` は `Reply:    JSON` と表示します。`json_schema` では、求められている形を `Required shape:` の下に表示します。`json_object` では、JSONとして読めればどんな値でもよいことを表示します。JSONを打ち込み、Ctrl+Dで終えます。Windowsでは、Ctrl+Zを押してからEnterを押します。
+
+- 返答は、RFC 8259のJSONとして読める必要があります。最上位はどんな値でもよく、空白は許されます。コメント、末尾のカンマ、`NaN`、`Infinity` は許されません。読めないときは何も送りません。`imbehind answer` は、`Not sent: your reply is not valid JSON (...)` と、読めなくなった行と桁を表示し、同じリクエストの入力に戻ります。
+- 求められている形に合うかは確かめません。JSONとして読めれば、形に合わない返答もそのまま送ります。
+- 返答は、打ち込んだとおりの文字列で `choices[0].message.content` に入ります。
+
+### ストリーミング
+
+リクエストに `"stream": true` があるときは、返答を書いている間、何も送りません。書き終えると、サーバーは返答の全体を `text/event-stream` で送ります。内容は、役割の断片、返答の全体を入れた断片1つ、`stop` の断片、`data: [DONE]` の順です。`"stream_options": {"include_usage": true}` があるときは、`[DONE]` の前に、`choices` が空でトークン数がすべて0の断片を1つ足します。`"stream": true` がないリクエストには、これまでどおりのJSONの応答を返します。構造化出力も同じ形でストリーミングできます。
+
+リクエストを保存できなかったときは、ストリームを始めずに、通常のJSONのエラーを返します。`imbehind serve` の `received` の行には、構造化出力なら `json`、ストリーミングなら `stream` が付きます。例は `chat/completions  json  stream` です。
+
 リクエストはOSごとの利用者のデータ用ディレクトリに保存されます。Linuxは `$XDG_DATA_HOME/imbehind`、未設定なら `~/.local/share/imbehind` です。macOSは `~/Library/Application Support/imbehind`、Windowsは `%LOCALAPPDATA%\imbehind` です。保存先はハードリンクを作れる必要があります。
 
 この版の `imbehind serve` は、`127.0.0.1:3000` だけで待ち受けます。受け付けるのは、`POST /v1/chat/completions` に届く文章のメッセージです。ブラウザが付ける `Origin` ヘッダーのあるリクエストと、`Host` ヘッダーが `127.0.0.1` でも `localhost` でもないリクエストは断ります。

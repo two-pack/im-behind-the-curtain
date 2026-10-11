@@ -10,6 +10,7 @@
  */
 import type { Clock } from "./clock.js";
 import { IO_REASONS, type IoReason } from "./errors.js";
+import type { ReplyKind } from "./model.js";
 
 /** Where text goes. `process.stdout` and `process.stderr` fit, and tests pass a recorder. */
 export interface Sink {
@@ -61,8 +62,17 @@ export class Logger {
     this.out.write(`Listening on http://${host}:${port} (storage: ${storageDir})\n`);
   }
 
-  received(shortId: string): void {
-    this.event("received", shortId, "chat/completions  text");
+  /**
+   * The line for an accepted request: the endpoint, the reply kind, and `stream` only when the
+   * request streams. Only these fixed words are written.
+   */
+  received(shortId: string, replyKind: ReplyKind, stream: boolean): void {
+    const kind = replyKind === "json" ? "json" : "text";
+    this.event(
+      "received",
+      shortId,
+      `chat/completions  ${kind}${stream === true ? "  stream" : ""}`,
+    );
   }
 
   replied(shortId: string): void {

@@ -69,6 +69,95 @@ describe("a round trip with curl (NFR4.1)", () => {
     expect(serve.stdout()).toMatch(/replied {4}[0-9a-f]{6}/);
   });
 
+  const URL_PATH = "/v1/chat/completions";
+  const SCHEMA = {
+    type: "object",
+    properties: { passed: { type: "boolean" }, reason: { type: "string" } },
+    required: ["passed", "reason"],
+  };
+
+  it("returns a structured-output reply exactly as typed, after a refused bad reply", async () => {
+    const serve = await startServe();
+    const typed = '{"passed": true,   "reason": "The dashboard is shown."}';
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(['{"passed":', typed]));
+    const body = JSON.stringify({
+      model: "whatever",
+      messages: [{ role: "user", content: "Did the login succeed?" }],
+      response_format: { type: "json_schema", json_schema: { name: "result", schema: SCHEMA } },
+    });
+
+    const result = await curl(
+      [
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "20",
+        "-X",
+        "POST",
+        `${serve.baseUrl}${URL_PATH}`,
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+        "@-",
+      ],
+      body,
+    );
+
+    expect(result.code).toBe(0);
+    const completion = JSON.parse(result.stdout) as { choices: { message: { content: string } }[] };
+    expect(completion.choices[0]?.message.content).toBe(typed);
+    await waitFor(() => answer.stdout().includes("Sent."));
+    const screen = answer.stdout();
+    expect(screen).toContain("Reply:    JSON");
+    expect(screen).toContain("Required shape:");
+    expect(screen).toContain(
+      "Not sent: your reply is not valid JSON (unexpected end of input at line 1).",
+    );
+    expect(serve.stdout()).toMatch(/received {3}[0-9a-f]{6} {2}chat\/completions {2}json\n/);
+  });
+
+  it("streams the reply as server-sent events that end with [DONE]", async () => {
+    const serve = await startServe();
+    startAnswer(serve.storageDir, new ScriptedReader(["Hi"]));
+    const body =
+      '{"model":"whatever","stream":true,"messages":[{"role":"user","content":"Hello"}]}';
+
+    const result = await curl(
+      [
+        "--silent",
+        "--show-error",
+        "--no-buffer",
+        "--max-time",
+        "20",
+        "-i",
+        "-X",
+        "POST",
+        `${serve.baseUrl}${URL_PATH}`,
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+        "@-",
+      ],
+      body,
+    );
+
+    expect(result.code).toBe(0);
+    const [head = "", ...rest] = result.stdout.split("\r\n\r\n");
+    expect(head.toLowerCase()).toContain("content-type: text/event-stream");
+    const events = rest
+      .join("\r\n\r\n")
+      .split("\n\n")
+      .filter((block) => block !== "");
+    expect(events).toHaveLength(4);
+    expect(events.every((event) => event.startsWith("data: "))).toBe(true);
+    expect(events[3]).toBe("data: [DONE]");
+    const contents = events
+      .slice(0, 3)
+      .map((event) => JSON.parse(event.slice("data: ".length)).choices[0].delta.content);
+    expect(contents).toEqual(["", "Hi", undefined]);
+    expect(serve.stdout()).toMatch(/chat\/completions {2}text {2}stream\n/);
+  });
+
   it("rejects a request from a browser page (Origin header) and does not show it", async () => {
     const serve = await startServe();
     const answer = startAnswer(serve.storageDir, new ScriptedReader([]));

@@ -34,6 +34,20 @@ The rest of this README writes these as `imbehind serve` and `imbehind answer`.
 
 Press Ctrl+C to quit either command. A request that nobody has answered stays in the storage directory, and `imbehind answer` shows it again the next time it starts.
 
+### Structured output
+
+If the request has `response_format` with `type` set to `json_schema` or `json_object`, `imbehind answer` shows `Reply:    JSON`. For `json_schema` it also shows the requested shape under `Required shape:`; for `json_object` it says that any JSON value is accepted. Type the JSON and finish with Ctrl+D (on Windows: Ctrl+Z, then Enter).
+
+- The reply must be valid JSON (RFC 8259): any top-level value, with white space allowed, and no comments, trailing commas, `NaN` or `Infinity`. If it is not, nothing is sent. `imbehind answer` prints `Not sent: your reply is not valid JSON (...)` with the line (and column) where reading stopped, and asks again for the same request.
+- The reply is not checked against the requested shape. A valid JSON reply that does not match it is sent as it is.
+- The reply is sent exactly as you typed it, in `choices[0].message.content`.
+
+### Streaming
+
+If the request has `"stream": true`, nothing is sent while you write the reply. When you finish, the server sends the whole reply as `text/event-stream`: a chunk with the role, one chunk with your whole reply, a `stop` chunk, and `data: [DONE]`. With `"stream_options": {"include_usage": true}` it adds a last chunk with an empty `choices` and zero token counts before `[DONE]`. A request without `"stream": true` gets the normal JSON response, and structured output can be streamed the same way.
+
+If the request cannot be stored, the server answers with the normal JSON error instead of starting a stream. The `received` line of `imbehind serve` shows `json` for structured output and `stream` for a streamed request, for example `chat/completions  json  stream`.
+
 Requests are stored under the user data directory: `$XDG_DATA_HOME/imbehind` (or `~/.local/share/imbehind`) on Linux, `~/Library/Application Support/imbehind` on macOS, and `%LOCALAPPDATA%\imbehind` on Windows. The storage directory must support hard links.
 
 In this version `imbehind serve` always listens on `127.0.0.1:3000`, and it accepts text messages on `POST /v1/chat/completions`. A request with a browser `Origin` header, or with a `Host` header that is not `127.0.0.1` or `localhost`, is refused.

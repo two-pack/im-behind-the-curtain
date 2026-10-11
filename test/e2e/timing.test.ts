@@ -2,7 +2,7 @@ import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
 import type { ReadResult, ReplyReader } from "../../src/answer/answer-console.js";
 import { waitFor } from "../helpers/io.js";
-import { postChat, startAnswer, startServe } from "../helpers/system.js";
+import { postChat, postChatRaw, startAnswer, startServe } from "../helpers/system.js";
 
 /** A reader the test controls: it waits until the test types a reply. */
 class GatedReader implements ReplyReader {
@@ -62,5 +62,22 @@ describe("timing with the real clock (NFR6.1, NFR7.1)", () => {
     for (const elapsed of returned) {
       expect(elapsed).toBeLessThanOrEqual(LIMIT_MS);
     }
+  });
+
+  it("returns a streamed reply within 2000 ms of the person typing it (NFR7.1)", async () => {
+    const serve = await startServe();
+    const reader = new GatedReader();
+    startAnswer(serve.storageDir, reader);
+    const response = postChatRaw(serve.baseUrl, "streamed question", { stream: true });
+    await waitFor(() => reader.waiting, LIMIT_MS * 2);
+    const typedAt = performance.now();
+    reader.type("streamed answer");
+    const reply = await response;
+    const elapsed = performance.now() - typedAt;
+    expect(reply.status).toBe(200);
+    expect(reply.contentType).toContain("text/event-stream");
+    expect(reply.text).toContain("streamed answer");
+    expect(reply.text.endsWith("data: [DONE]\n\n")).toBe(true);
+    expect(elapsed).toBeLessThanOrEqual(LIMIT_MS);
   });
 });

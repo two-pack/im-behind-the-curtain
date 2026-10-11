@@ -26,7 +26,7 @@ describe("serve log lines (NFR10.4)", () => {
 
   it("writes received and replied lines with a local time and the short id", () => {
     const { out, logger } = setup();
-    logger.received("a1b2c3");
+    logger.received("a1b2c3", "text", false);
     logger.replied("a1b2c3");
     expect(out).toEqual([
       "14:05:12 received   a1b2c3  chat/completions  text\n",
@@ -36,7 +36,7 @@ describe("serve log lines (NFR10.4)", () => {
 
   it("pads the event to ten columns and puts two spaces before the detail", () => {
     const { out, logger } = setup();
-    logger.received("a1b2c3");
+    logger.received("a1b2c3", "text", false);
     logger.replied("a1b2c3");
     logger.failure("a1b2c3", "read failed");
     const columns = out.map((line) => line.slice("14:05:12 ".length));
@@ -120,14 +120,30 @@ describe("failure lines (NFR10.1 to NFR10.5)", () => {
     const { out, logger } = setup();
     // @ts-expect-error a reason must be one of the fixed phrases
     logger.failure("a1b2c3", "SECRET-CONTENT-12345");
-    // @ts-expect-error received takes only the short id
-    logger.received("a1b2c3", "SECRET-CONTENT-12345");
+    // @ts-expect-error received takes only a reply kind and a stream flag
+    logger.received("a1b2c3", "SECRET-CONTENT-12345", "SECRET-CONTENT-12345");
     logger.replied("SECRET-CONTENT-12345");
     expect(out.join("")).not.toContain("SECRET-CONTENT-12345");
     expect(out).toEqual([
       "14:05:12 error      a1b2c3  failed\n",
       "14:05:12 received   a1b2c3  chat/completions  text\n",
       "14:05:12 replied    ------\n",
+    ]);
+  });
+});
+
+describe("the received line supplement", () => {
+  it("shows the reply kind, and stream only when the request streams", () => {
+    const { out, logger } = setup();
+    logger.received("a1b2c3", "text", false);
+    logger.received("a1b2c3", "json", false);
+    logger.received("a1b2c3", "json", true);
+    logger.received("a1b2c3", "text", true);
+    expect(out).toEqual([
+      "14:05:12 received   a1b2c3  chat/completions  text\n",
+      "14:05:12 received   a1b2c3  chat/completions  json\n",
+      "14:05:12 received   a1b2c3  chat/completions  json  stream\n",
+      "14:05:12 received   a1b2c3  chat/completions  text  stream\n",
     ]);
   });
 });

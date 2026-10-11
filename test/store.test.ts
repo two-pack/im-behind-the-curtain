@@ -299,6 +299,61 @@ describe("writing state", () => {
   });
 });
 
+describe("json requests and replies", () => {
+  const shape = { type: "object", properties: { passed: { type: "boolean" } } };
+  const jsonRequest = createRequestFile(ID, NOW, {
+    ...conversation,
+    replyKind: "json",
+    requiredShape: shape,
+    stream: true,
+    includeUsage: true,
+  });
+
+  it("writes replyKind, requiredShape, stream and includeUsage as real values", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(jsonRequest, sampleState());
+    const onDisk = JSON.parse(await readFile(path.join(requests, ID, "request.json"), "utf8"));
+    expect(onDisk).toMatchObject({
+      formatVersion: 1,
+      replyKind: "json",
+      requiredShape: shape,
+      stream: true,
+      includeUsage: true,
+    });
+    const read = await store.readRequest(ID);
+    expect(read.kind === "ok" && read.value.replyKind).toBe("json");
+    expect(read.kind === "ok" && read.value.requiredShape).toEqual(shape);
+  });
+
+  it("reads a request of an unknown reply kind as unsupported, not unreadable", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(sampleRequest(), sampleState());
+    const file = path.join(requests, ID, "request.json");
+    const onDisk = JSON.parse(await readFile(file, "utf8"));
+    await writeFile(file, JSON.stringify({ ...onDisk, replyKind: "image" }));
+    expect((await store.readRequest(ID)).kind).toBe("unsupported");
+  });
+
+  it("places a json reply, accepts it like a text reply, and reads it back as written", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(jsonRequest, sampleState());
+    const body = '{"passed":   true}';
+    const bytes = serializeFile(createReplyFile(body, NOW, "json"));
+    await store.placeReply(ID, bytes);
+    await store.acceptReply(ID);
+    await store.removeReply(ID);
+    expect(await names(path.join(requests, ID))).toEqual([
+      "reply.accepted.json",
+      "request.json",
+      "state.json",
+    ]);
+    const read = await store.readReply(ID, "reply.accepted.json");
+    expect(read?.bytes).toBe(bytes);
+    expect(read?.parsed.kind === "ok" && read.parsed.value.kind).toBe("json");
+    expect(read?.parsed.kind === "ok" && read.parsed.value.body).toBe(body);
+  });
+});
+
 describe("placing a reply", () => {
   const replyText = serializeFile(createReplyFile("Hi", NOW));
 

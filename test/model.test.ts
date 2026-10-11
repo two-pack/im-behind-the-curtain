@@ -108,7 +108,34 @@ describe("reading a request file", () => {
     expect(parseRequestFile({ ...validRequestJson(), format: "messages" }).kind).toBe(
       "unsupported",
     );
-    expect(parseRequestFile({ ...validRequestJson(), replyKind: "json" }).kind).toBe("unsupported");
+    expect(parseRequestFile({ ...validRequestJson(), replyKind: "image" }).kind).toBe(
+      "unsupported",
+    );
+  });
+
+  it("reads a json request with its required shape, stream and includeUsage", () => {
+    const shape = { type: "object", properties: { passed: { type: "boolean" } } };
+    const parsed = parseRequestFile({
+      ...validRequestJson(),
+      replyKind: "json",
+      requiredShape: shape,
+      stream: true,
+      includeUsage: true,
+    });
+    expect(parsed.kind).toBe("ok");
+    if (parsed.kind === "ok") {
+      expect(parsed.value.replyKind).toBe("json");
+      expect(parsed.value.requiredShape).toEqual(shape);
+      expect(parsed.value.stream).toBe(true);
+      expect(parsed.value.includeUsage).toBe(true);
+    }
+  });
+
+  it("reads a json request whose required shape is null or not an object as no shape", () => {
+    for (const requiredShape of [null, "x", 5, []]) {
+      const parsed = parseRequestFile({ ...validRequestJson(), replyKind: "json", requiredShape });
+      expect(parsed.kind === "ok" && parsed.value.requiredShape).toBeNull();
+    }
   });
 
   it("ignores fields it does not know", () => {
@@ -147,8 +174,16 @@ describe("reading a reply file", () => {
     expect(parsed.kind === "ok" && parsed.value.body).toBe("Hi");
   });
 
+  it("accepts a version 1 json reply and keeps its body as written", () => {
+    const written = createReplyFile('{"passed":   true}', RECEIVED_AT, "json");
+    expect(written.kind).toBe("json");
+    const parsed = parseReplyFile(written);
+    expect(parsed.kind === "ok" && parsed.value.kind).toBe("json");
+    expect(parsed.kind === "ok" && parsed.value.body).toBe('{"passed":   true}');
+  });
+
   it("does not accept a reply of an unknown kind or version in this version", () => {
-    expect(parseReplyFile({ formatVersion: 1, kind: "json", body: "{}" }).kind).toBe("unsupported");
+    expect(parseReplyFile({ formatVersion: 1, kind: "skip", body: "{}" }).kind).toBe("unsupported");
     expect(parseReplyFile({ formatVersion: 2, kind: "text", body: "x" }).kind).toBe("unreadable");
     expect(parseReplyFile({ formatVersion: 1, kind: "text", body: 5 }).kind).toBe("unreadable");
     expect(parseReplyFile("nope").kind).toBe("unreadable");

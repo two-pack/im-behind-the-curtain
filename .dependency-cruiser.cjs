@@ -4,7 +4,7 @@
  *   cli            -> config, http, answer-console, broker, store, log, clock, platform
  *   http           -> chat-completions, broker, log
  *   answer-console -> broker, log, clock, platform
- *   broker         -> store, clock
+ *   broker         -> store, clock, reply-check
  *   log            -> clock
  *   store          -> platform
  *   config         -> platform
@@ -12,9 +12,9 @@
  *
  * errors, ids and model are leaf modules that any module may use. A leaf module may import
  * another leaf module, but never a module that is not a leaf, and leaf modules never form a
- * cycle. clock imports nothing from the project (no rule allows it). chat-completions and
- * platform import only the leaf modules. Type-only imports count as dependencies. Cycles are
- * never allowed.
+ * cycle. clock imports nothing from the project (no rule allows it). chat-completions,
+ * platform and reply-check import only the leaf modules. Type-only imports count as
+ * dependencies. Cycles are never allowed.
  */
 
 const LEAVES = "errors|ids|model";
@@ -92,7 +92,8 @@ module.exports = {
     allow("platform", []),
     allow("http/server", ["chat-completions/adapter", "broker/exchange-broker", "log"]),
     allow("answer/answer-console", ["broker/exchange-broker", "log", "clock", "platform"]),
-    allow("broker/exchange-broker", ["store/exchange-store", "clock"]),
+    allow("broker/exchange-broker", ["store/exchange-store", "clock", "broker/reply-check"]),
+    allow("broker/reply-check", []),
     allow("store/exchange-store", ["platform"]),
     allow("chat-completions/adapter", []),
   ],

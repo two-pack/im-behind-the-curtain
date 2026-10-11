@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCompletion,
+  buildStreamEvents,
   errorBody,
   parseChatCompletionsRequest,
 } from "../src/chat-completions/adapter.js";
@@ -101,6 +102,46 @@ describe("checking the request body", () => {
   });
 });
 
+describe("the required shape of a json request", () => {
+  const SCHEMA = {
+    type: "object",
+    properties: { passed: { type: "boolean" } },
+    required: ["passed"],
+  };
+
+  function parsed(responseFormat: unknown) {
+    const result = parseChatCompletionsRequest(body({ ...VALID, response_format: responseFormat }));
+    if (!result.ok) {
+      throw new Error("expected the request to be accepted");
+    }
+    return result.request;
+  }
+
+  it("keeps the content of schema as the required shape", () => {
+    const request = parsed({ type: "json_schema", json_schema: { name: "x", schema: SCHEMA } });
+    expect(request.replyKind).toBe("json");
+    expect(request.requiredShape).toEqual(SCHEMA);
+  });
+
+  it("keeps the whole json_schema object when there is no schema inside it", () => {
+    const wrapper = { name: "x", strict: true };
+    expect(parsed({ type: "json_schema", json_schema: wrapper }).requiredShape).toEqual(wrapper);
+  });
+
+  it("has no required shape when json_schema or schema is not an object, or for json_object", () => {
+    for (const responseFormat of [
+      { type: "json_schema" },
+      { type: "json_schema", json_schema: "x" },
+      { type: "json_schema", json_schema: { name: "x", schema: "not an object" } },
+      { type: "json_object" },
+    ]) {
+      const request = parsed(responseFormat);
+      expect(request.replyKind).toBe("json");
+      expect(request.requiredShape).toBeNull();
+    }
+  });
+});
+
 describe("converting to the shared form", () => {
   it("keeps roles and order, and turns null content into an empty string", () => {
     const result = parseChatCompletionsRequest(
@@ -131,10 +172,9 @@ describe("converting to the shared form", () => {
     expect(result.request.includeUsage).toBe(false);
   });
 
-  it("ignores unknown fields and treats stream as false", () => {
+  it("ignores unknown fields", () => {
     const original = {
       ...VALID,
-      stream: true,
       temperature: 0.2,
       n: 3,
       tools: [{ type: "function" }],
@@ -144,8 +184,6 @@ describe("converting to the shared form", () => {
     const result = parseChatCompletionsRequest(body(original));
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.request.stream).toBe(false);
-      expect(result.request.replyKind).toBe("text");
       expect(result.request.originalRequest).toEqual(original);
     }
   });
@@ -184,5 +222,144 @@ describe("building an error body", () => {
         code: "storage_error",
       },
     });
+  });
+});
+
+describe("the reply kind", () => {
+  function kindOf(extra: Record<string, unknown>) {
+    const result = parseChatCompletionsRequest(body({ ...VALID, ...extra }));
+    if (!result.ok) {
+      throw new Error("expected the request to be accepted");
+    }
+    return result.request.replyKind;
+  }
+
+  it("is json for response_format json_schema and json_object", () => {
+    expect(kindOf({ response_format: { type: "json_schema" } })).toBe("json");
+    expect(kindOf({ response_format: { type: "json_object" } })).toBe("json");
+  });
+
+  it("is text for any other type, a missing type, no response_format, or a non-object", () => {
+    for (const responseFormat of [
+      { type: "text" },
+      { type: "other" },
+      { type: 5 },
+      {},
+      "json_object",
+      ["json_object"],
+      null,
+      5,
+    ]) {
+      expect(kindOf({ response_format: responseFormat })).toBe("text");
+    }
+    expect(kindOf({})).toBe("text");
+  });
+});
+
+describe("reading stream and include_usage", () => {
+  function flags(extra: Record<string, unknown>) {
+    const result = parseChatCompletionsRequest(body({ ...VALID, ...extra }));
+    if (!result.ok) {
+      throw new Error("expected the request to be accepted");
+    }
+    return { stream: result.request.stream, includeUsage: result.request.includeUsage };
+  }
+
+  it("reads stream true, and include_usage only together with it", () => {
+    expect(flags({ stream: true })).toEqual({ stream: true, includeUsage: false });
+    expect(flags({ stream: true, stream_options: { include_usage: true } })).toEqual({
+      stream: true,
+      includeUsage: true,
+    });
+    expect(flags({ stream: true, stream_options: { include_usage: false } })).toEqual({
+      stream: true,
+      includeUsage: false,
+    });
+  });
+
+  it("ignores include_usage when stream is false or missing", () => {
+    expect(flags({ stream: false, stream_options: { include_usage: true } })).toEqual({
+      stream: false,
+      includeUsage: false,
+    });
+    expect(flags({ stream_options: { include_usage: true } })).toEqual({
+      stream: false,
+      includeUsage: false,
+    });
+  });
+
+  it("reads only the value true: other values mean no stream and no usage", () => {
+    expect(flags({ stream: "true" }).stream).toBe(false);
+    expect(flags({ stream: 1 }).stream).toBe(false);
+    expect(flags({ stream: true, stream_options: "yes" }).includeUsage).toBe(false);
+    expect(flags({ stream: true, stream_options: { include_usage: "true" } }).includeUsage).toBe(
+      false,
+    );
+  });
+});
+
+describe("building the stream", () => {
+  const INPUT = {
+    requestId: "20261009T140640321Z-d4e5f6",
+    model: "whatever",
+    content: "Hi\nthere",
+    nowSeconds: 1791814000,
+    includeUsage: false,
+  };
+
+  function parsed(events: string[]) {
+    return events.map((event) => {
+      expect(event.startsWith("data: ")).toBe(true);
+      expect(event.endsWith("\n\n")).toBe(true);
+      const text = event.slice("data: ".length, -2);
+      return text === "[DONE]" ? text : (JSON.parse(text) as Record<string, unknown>);
+    });
+  }
+
+  it("makes role, one content, stop and [DONE], each as one line and a blank line", () => {
+    const events = buildStreamEvents(INPUT);
+    expect(events).toHaveLength(4);
+    for (const event of events) {
+      expect(event.slice(0, -2)).not.toContain("\n");
+    }
+    const id = "chatcmpl-20261009T140640321Z-d4e5f6";
+    const common = { id, object: "chat.completion.chunk", created: 1791814000, model: "whatever" };
+    expect(parsed(events)).toEqual([
+      {
+        ...common,
+        choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }],
+      },
+      { ...common, choices: [{ index: 0, delta: { content: "Hi\nthere" }, finish_reason: null }] },
+      { ...common, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      "[DONE]",
+    ]);
+    expect(events[3]).toBe("data: [DONE]\n\n");
+  });
+
+  it("adds a usage chunk with empty choices and zero values only when asked", () => {
+    const events = parsed(buildStreamEvents({ ...INPUT, includeUsage: true }));
+    expect(events).toHaveLength(5);
+    expect(events[3]).toEqual({
+      id: "chatcmpl-20261009T140640321Z-d4e5f6",
+      object: "chat.completion.chunk",
+      created: 1791814000,
+      model: "whatever",
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    expect(events[4]).toBe("[DONE]");
+  });
+
+  it("uses the same id, created and model in every chunk, and keeps the whole reply in one chunk", () => {
+    const chunks = parsed(
+      buildStreamEvents({ ...INPUT, includeUsage: true, content: "a".repeat(5000) }),
+    ).filter((chunk) => chunk !== "[DONE]") as Record<string, unknown>[];
+    expect(new Set(chunks.map((chunk) => chunk.id)).size).toBe(1);
+    expect(new Set(chunks.map((chunk) => chunk.created)).size).toBe(1);
+    expect(new Set(chunks.map((chunk) => chunk.model)).size).toBe(1);
+    const contents = chunks.flatMap((chunk) =>
+      (chunk.choices as { delta: { content?: string } }[]).map((choice) => choice.delta.content),
+    );
+    expect(contents.filter((content) => content === "a".repeat(5000))).toHaveLength(1);
   });
 });

@@ -6,10 +6,12 @@ import {
   createReplyFile,
   createRequestFile,
   createStateFile,
+  type ReplyKind,
   type RequestFile,
   serializeFile,
 } from "../model.js";
 import type { ExchangeStorage } from "../store/exchange-store.js";
+import { checkReply, type ReplyCheck } from "./reply-check.js";
 
 /** What the broker tells the outside. The log lines are made elsewhere. */
 export type BrokerEvent =
@@ -187,10 +189,18 @@ export class ExchangeBroker {
   }
 
   /**
+   * The one check of a reply before it is placed. The answer screen calls it, and
+   * so does the later unit that checks hand-written replies.
+   */
+  checkReply(kind: ReplyKind, body: string): ReplyCheck {
+    return checkReply(kind, body);
+  }
+
+  /**
    * Places this answer's reply. `too-late` means the request is no longer waiting or another
    * reply came first. An input/output failure is thrown for the caller to show.
    */
-  async placeReply(id: string, body: string): Promise<PlaceResult> {
+  async placeReply(id: string, body: string, kind: ReplyKind = "text"): Promise<PlaceResult> {
     const state = await this.store.readState(id);
     if (state.kind !== "ok" || state.value.state !== "waiting") {
       return { kind: "too-late" };
@@ -199,7 +209,7 @@ export class ExchangeBroker {
     if (files.has("reply.json") || files.has("reply.accepted.json")) {
       return { kind: "too-late" };
     }
-    const bytes = serializeFile(createReplyFile(body, this.clock.now().toISOString()));
+    const bytes = serializeFile(createReplyFile(body, this.clock.now().toISOString(), kind));
     try {
       await this.store.placeReply(id, bytes);
     } catch (error) {
@@ -341,7 +351,7 @@ export class ExchangeBroker {
     return accepted.parsed.value.body;
   }
 
-  /** In this version only a version 1 text reply is accepted. */
+  /** Only a version 1 reply of a kind this version knows is accepted. */
   private async canAccept(id: string): Promise<boolean> {
     const reply = await this.store.readReply(id, "reply.json");
     return reply?.parsed.kind === "ok";

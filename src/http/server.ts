@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import type { BrokerEvent, ExchangeBroker } from "../broker/exchange-broker.js";
 import {
   buildCompletion,
+  buildStreamEvents,
   type ErrorCode,
   errorBody,
   MESSAGES,
@@ -141,6 +142,26 @@ function respond(
   }
 }
 
+/**
+ * Sends a whole stream in one write, once the reply is there. Nothing, not even
+ * the headers, goes out while the human has not replied, so a failure before this point is
+ * still answered with a normal JSON error.
+ */
+function respondStream(response: http.ServerResponse, events: string[]): void {
+  if (response.destroyed || response.writableEnded) {
+    return;
+  }
+  try {
+    response.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+    });
+    response.end(events.join(""));
+  } catch (error) {
+    throw new ConnectionError(error);
+  }
+}
+
 function listenFailure(error: NodeJS.ErrnoException, port: number): StartupError {
   if (error.code === "EADDRINUSE") {
     return new StartupError(`port ${port} is already in use.`);
@@ -248,17 +269,18 @@ export class HttpServer {
       respond(response, 500, errorBody("storage_error", MESSAGES.storage));
       return;
     }
-    this.options.logger.received(shortId(submitted.id));
+    this.options.logger.received(shortId(submitted.id), request.replyKind, request.stream);
     const outcome = await submitted.outcome;
-    respond(
-      response,
-      200,
-      buildCompletion({
-        requestId: outcome.id,
-        model: request.model,
-        content: outcome.body,
-        nowSeconds: this.options.nowSeconds(),
-      }),
-    );
+    const input = {
+      requestId: outcome.id,
+      model: request.model,
+      content: outcome.body,
+      nowSeconds: this.options.nowSeconds(),
+    };
+    if (request.stream) {
+      respondStream(response, buildStreamEvents({ ...input, includeUsage: request.includeUsage }));
+    } else {
+      respond(response, 200, buildCompletion(input));
+    }
   }
 }
