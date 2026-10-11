@@ -48,6 +48,12 @@ If the request has `"stream": true`, nothing is sent while you write the reply. 
 
 If the request cannot be stored, the server answers with the normal JSON error instead of starting a stream. The `received` line of `imbehind serve` shows `json` for structured output and `stream` for a streamed request, for example `chat/completions  json  stream`.
 
+### Request content
+
+A message `content` can be a string, `null` (shown as `(empty)`), or an array of text parts (`{"type": "text", "text": "..."}`, joined without a separator). Any other part, a role other than `system`, `developer`, `user` or `assistant`, and an `n` of 2 or more are refused with a `400` error. Unknown fields are ignored. A request body larger than 10 MB (10485760 bytes) is refused with `413` and `request_too_large`, and nothing is stored.
+
+`imbehind answer` shows every `system` and `developer` message and the last three of the other messages. When it leaves messages out, it prints one line such as `(3 earlier messages omitted. Full conversation: <path>)`, where `<path>` is the `request.json` file with the whole conversation. A message longer than 200 lines is cut after 200 lines with a similar line. Control characters other than newline and tab are shown as `\xNN` (for example `\x1b`).
+
 Requests are stored under the user data directory: `$XDG_DATA_HOME/imbehind` (or `~/.local/share/imbehind`) on Linux, `~/Library/Application Support/imbehind` on macOS, and `%LOCALAPPDATA%\imbehind` on Windows. The storage directory must support hard links.
 
 In this version `imbehind serve` always listens on `127.0.0.1:3000`, and it accepts text messages on `POST /v1/chat/completions`. A request with a browser `Origin` header, or with a `Host` header that is not `127.0.0.1` or `localhost`, is refused.

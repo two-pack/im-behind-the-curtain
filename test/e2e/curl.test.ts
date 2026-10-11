@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { readdir } from "node:fs/promises";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { waitFor } from "../helpers/io.js";
 import { ScriptedReader } from "../helpers/scripted-reader.js";
@@ -180,5 +182,110 @@ describe("a round trip with curl (NFR4.1)", () => {
       error: { message: "Cross-origin requests are not accepted.", code: "invalid_request" },
     });
     expect(answer.stdout()).not.toContain("Request 1 of");
+  });
+});
+
+interface CurlReply {
+  status: number;
+  body: { error?: { message: string; type: string; code: string } };
+}
+
+/** POSTs a body with curl and returns the status and the JSON body. Write errors are tolerated. */
+async function curlPost(baseUrl: string, body: string): Promise<CurlReply> {
+  const result = await curl(
+    [
+      "--silent",
+      "--max-time",
+      "30",
+      "-w",
+      "\n%{http_code}",
+      "-X",
+      "POST",
+      `${baseUrl}/v1/chat/completions`,
+      "-H",
+      "Content-Type: application/json",
+      "--data-binary",
+      "@-",
+    ],
+    body,
+  ).catch(() => undefined);
+  const text = result?.stdout ?? "";
+  const split = text.lastIndexOf("\n");
+  return {
+    status: Number(text.slice(split + 1)),
+    body: split > 0 ? (JSON.parse(text.slice(0, split)) as CurlReply["body"]) : {},
+  };
+}
+
+async function storedRequests(storageDir: string): Promise<string[]> {
+  return readdir(path.join(storageDir, "requests")).catch(() => []);
+}
+
+describe("requests that are turned away or let through", () => {
+  const MESSAGES = [{ role: "user", content: "Hello" }];
+
+  async function refused(body: string) {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader([]));
+    const reply = await curlPost(serve.baseUrl, body);
+    expect(await storedRequests(serve.storageDir)).toEqual([]);
+    expect(answer.stdout()).not.toContain("Request 1 of");
+    return reply;
+  }
+
+  it("answers 400 when messages is missing", async () => {
+    const reply = await refused(JSON.stringify({ model: "m" }));
+    expect(reply.status).toBe(400);
+    expect(reply.body.error).toEqual({
+      message: '"messages" must be a non-empty array.',
+      type: "invalid_request_error",
+      code: "invalid_request",
+    });
+  });
+
+  it("answers 400 when n is 2", async () => {
+    const reply = await refused(JSON.stringify({ model: "m", messages: MESSAGES, n: 2 }));
+    expect(reply.status).toBe(400);
+    expect(reply.body.error?.message).toBe('Only one choice can be returned; "n" must be 1.');
+  });
+
+  it("answers 400 and names an unsupported role", async () => {
+    const reply = await refused(
+      JSON.stringify({ model: "m", messages: [{ role: "critic", content: "x" }] }),
+    );
+    expect(reply.status).toBe(400);
+    expect(reply.body.error?.message).toBe('Unsupported message role: "critic".');
+  });
+
+  it("answers 413 for a body larger than 10 MB", async () => {
+    const big = JSON.stringify({
+      model: "m",
+      messages: [{ role: "user", content: "a".repeat(10485760) }],
+    });
+    expect(Buffer.byteLength(big)).toBeGreaterThan(10485760);
+    const reply = await refused(big);
+    expect(reply.status).toBe(413);
+    expect(reply.body.error).toEqual({
+      message: "Request body is larger than 10 MB.",
+      type: "invalid_request_error",
+      code: "request_too_large",
+    });
+  });
+
+  it("accepts a request with an unknown field and shows the conversation", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["Hi"]));
+    const reply = await curlPost(
+      serve.baseUrl,
+      JSON.stringify({
+        model: "m",
+        foo: { bar: 1 },
+        messages: [{ role: "user", content: "Hello", foo: 2 }],
+      }),
+    );
+    expect(reply.status).toBe(200);
+    await waitFor(() => answer.stdout().includes("Sent."));
+    expect(answer.stdout()).toContain("User:\n  Hello\n");
+    expect(answer.stdout()).not.toContain("foo");
   });
 });

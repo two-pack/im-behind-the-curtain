@@ -108,16 +108,41 @@ function preflight(request: http.IncomingMessage): Refusal | undefined {
   return undefined;
 }
 
-async function readBody(request: http.IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  try {
-    for await (const chunk of request) {
-      chunks.push(chunk as Buffer);
-    }
-  } catch (error) {
-    throw new ConnectionError(error);
-  }
-  return Buffer.concat(chunks).toString("utf8");
+/** The most bytes of request body that are accepted. */
+const BODY_LIMIT = 10485760;
+
+/**
+ * Reads the whole body as text. Gives undefined, and stops reading, as soon as more than
+ * `BODY_LIMIT` bytes have arrived. The bytes are counted as they arrive, not as characters.
+ */
+function readBody(request: http.IncomingMessage): Promise<string | undefined> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    request.on("data", (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > BODY_LIMIT) {
+        chunks.length = 0;
+        request.pause();
+        resolve(undefined);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    request.on("error", (error) => reject(new ConnectionError(error)));
+    request.on("close", () => {
+      if (!request.complete) {
+        reject(new ConnectionError(new Error("the client closed the connection")));
+      }
+    });
+  });
+}
+
+/** The 413 answer. The connection is closed after it, because the rest of the body is not read. */
+function respondTooLarge(response: http.ServerResponse): void {
+  const body = errorBody("request_too_large", MESSAGES.requestTooLarge);
+  respond(response, 413, body, { Connection: "close" });
 }
 
 function respond(
@@ -252,7 +277,13 @@ export class HttpServer {
       respond(response, refusal.status, errorBody(refusal.code, refusal.message), headers);
       return;
     }
-    const parsed = parseChatCompletionsRequest(await readBody(request));
+    const declaredLength = Number(request.headers["content-length"]);
+    const text = declaredLength > BODY_LIMIT ? undefined : await readBody(request);
+    if (text === undefined) {
+      respondTooLarge(response);
+      return;
+    }
+    const parsed = parseChatCompletionsRequest(text);
     if (!parsed.ok) {
       const { status, code, message } = parsed.rejection;
       respond(response, status, errorBody(code, message));

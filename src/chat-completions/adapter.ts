@@ -11,7 +11,12 @@ import {
   type Role,
 } from "../model.js";
 
-export type ErrorCode = "invalid_request" | "not_found" | "method_not_allowed" | "storage_error";
+export type ErrorCode =
+  | "invalid_request"
+  | "request_too_large"
+  | "not_found"
+  | "method_not_allowed"
+  | "storage_error";
 
 /** The fixed English sentences of this API. A request value is never copied into them. */
 export const MESSAGES = {
@@ -19,7 +24,9 @@ export const MESSAGES = {
   messagesRequired: '"messages" must be a non-empty array.',
   modelRequired: '"model" must be a string.',
   messageNotObject: "Each message must be an object.",
-  contentType: "Message content must be a string or null in this version.",
+  contentType: "Message content must be a string, null, or an array of text parts.",
+  tooManyChoices: 'Only one choice can be returned; "n" must be 1.',
+  requestTooLarge: "Request body is larger than 10 MB.",
   notFound: "Not found.",
   methodNotAllowed: "Method not allowed.",
   storage: "The request could not be stored.",
@@ -84,8 +91,7 @@ function isRole(value: unknown): value is Role {
   return typeof value === "string" && (ROLES as readonly string[]).includes(value);
 }
 
-function roleMessage(item: unknown): string {
-  const role = (item as Record<string, unknown>).role;
+function roleMessage(role: unknown): string {
   const shown = typeof role === "string" ? role.slice(0, MAX_ROLE_LENGTH) : "";
   return `Unsupported message role: "${shown}".`;
 }
@@ -102,16 +108,6 @@ const BODY_CHECKS: readonly Check<Record<string, unknown>>[] = [
   (body) => (typeof body.model === "string" ? undefined : MESSAGES.modelRequired),
 ];
 
-/** Checks on one message, in order: object, role, content. */
-const MESSAGE_CHECKS: readonly Check<unknown>[] = [
-  (item) => (isRecord(item) ? undefined : MESSAGES.messageNotObject),
-  (item) => (isRole((item as Record<string, unknown>).role) ? undefined : roleMessage(item)),
-  (item) => {
-    const content = (item as Record<string, unknown>).content;
-    return typeof content === "string" || content === null ? undefined : MESSAGES.contentType;
-  },
-];
-
 /** Runs the checks in order and returns the first error. */
 function firstError<T>(checks: readonly Check<T>[], value: T): string | undefined {
   for (const check of checks) {
@@ -123,12 +119,58 @@ function firstError<T>(checks: readonly Check<T>[], value: T): string | undefine
   return undefined;
 }
 
-/** Converts messages that already passed `MESSAGE_CHECKS`. A null content becomes "". */
-function toConversation(items: unknown[]): Message[] {
-  return items.map((item) => {
-    const message = item as { role: Role; content: string | null };
-    return { role: message.role, content: message.content ?? "" };
-  });
+function textOfPart(part: unknown): string | undefined {
+  return isRecord(part) && part.type === "text" && typeof part.text === "string"
+    ? part.text
+    : undefined;
+}
+
+/**
+ * The text of a message content: a string as it is, null as "", an array of text
+ * parts joined without a separator. Anything else gives undefined.
+ */
+function readContent(content: unknown): string | undefined {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (content === null) {
+    return "";
+  }
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  const texts = content.map(textOfPart);
+  return texts.every((text) => text !== undefined) ? texts.join("") : undefined;
+}
+
+type MessageResult = { message: Message } | { error: string };
+
+/** Checks one message in the order object, role, content, keeping only those two. */
+function convertMessage(item: unknown): MessageResult {
+  if (!isRecord(item)) {
+    return { error: MESSAGES.messageNotObject };
+  }
+  if (!isRole(item.role)) {
+    return { error: roleMessage(item.role) };
+  }
+  const content = readContent(item.content);
+  if (content === undefined) {
+    return { error: MESSAGES.contentType };
+  }
+  return { message: { role: item.role, content } };
+}
+
+/** Checks the messages one by one and stops at the first one that fails. */
+function convertMessages(items: unknown[]): { messages: Message[] } | { error: string } {
+  const messages: Message[] = [];
+  for (const item of items) {
+    const converted = convertMessage(item);
+    if ("error" in converted) {
+      return converted;
+    }
+    messages.push(converted.message);
+  }
+  return { messages };
 }
 
 /** The reply kind and the required shape of a request, from `response_format`. */
@@ -167,8 +209,9 @@ function readStreaming(body: Record<string, unknown>): { stream: boolean; includ
 }
 
 /**
- * Checks a request body in orderconverts it.
- * Unknown fields are ignored.
+ * Checks a request body in order:
+ * JSON object, messages, model, each message, n. The first failure decides. Unknown fields are
+ * ignored.
  */
 export function parseChatCompletionsRequest(text: string): AdapterResult {
   const body = parseObject(text);
@@ -179,12 +222,12 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
   if (bodyError !== undefined) {
     return reject(bodyError);
   }
-  const items = body.messages as unknown[];
-  for (const item of items) {
-    const messageError = firstError(MESSAGE_CHECKS, item);
-    if (messageError !== undefined) {
-      return reject(messageError);
-    }
+  const converted = convertMessages(body.messages as unknown[]);
+  if ("error" in converted) {
+    return reject(converted.error);
+  }
+  if (typeof body.n === "number" && body.n >= 2) {
+    return reject(MESSAGES.tooManyChoices);
   }
   return {
     ok: true,
@@ -193,7 +236,7 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
       model: body.model as string,
       ...readResponseFormat(body),
       ...readStreaming(body),
-      conversation: toConversation(items),
+      conversation: converted.messages,
       originalRequest: body,
     },
   };

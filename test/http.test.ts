@@ -258,6 +258,145 @@ describe("rejected bodies", () => {
   });
 });
 
+const BODY_LIMIT = 10485760;
+const TOO_LARGE = {
+  error: {
+    message: "Request body is larger than 10 MB.",
+    type: "invalid_request_error",
+    code: "request_too_large",
+  },
+};
+
+interface RawReply {
+  status: number;
+  text: string;
+}
+
+/**
+ * Sends a request on a raw connection and waits until the server closes it. `writeBody` may
+ * write the body in pieces; write errors are ignored, because the server answers 413 while the
+ * body is still being sent. The test fails if the connection stays open.
+ */
+function rawExchange(
+  port: number,
+  head: string,
+  writeBody: (socket: net.Socket) => void,
+): Promise<RawReply> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1");
+    const chunks: Buffer[] = [];
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("the server did not close the connection"));
+    }, 3000);
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.on("error", () => {});
+    socket.on("close", () => {
+      clearTimeout(timer);
+      const raw = Buffer.concat(chunks).toString("utf8");
+      const split = raw.indexOf("\r\n\r\n");
+      resolve({ status: Number(raw.slice(9, 12)), text: split === -1 ? "" : raw.slice(split + 4) });
+    });
+    socket.write(head);
+    writeBody(socket);
+  });
+}
+
+const POST_HEAD =
+  "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n";
+
+/** A chat body of exactly `total` bytes. With `twoByte`, the padding is made of "é" (2 bytes each). */
+function chatOfBytes(total: number, twoByte: boolean): string {
+  const base = Buffer.byteLength(chat(""));
+  const free = total - base;
+  const pad = twoByte
+    ? "é".repeat(Math.floor(free / 2)) + (free % 2 === 1 ? "a" : "")
+    : "a".repeat(free);
+  const text = chat(pad);
+  expect(Buffer.byteLength(text)).toBe(total);
+  return text;
+}
+
+/** Writes `text` as HTTP chunks of 1 MiB at most, then the end chunk. */
+function writeChunked(socket: net.Socket, text: string): void {
+  const bytes = Buffer.from(text, "utf8");
+  for (let offset = 0; offset < bytes.length; offset += 1048576) {
+    const piece = bytes.subarray(offset, offset + 1048576);
+    socket.write(`${piece.length.toString(16)}\r\n`);
+    socket.write(piece);
+    socket.write("\r\n");
+  }
+  socket.write("0\r\n\r\n");
+}
+
+describe("the size of the body", () => {
+  it("refuses a Content-Length above the limit without reading the body, and closes", async () => {
+    const { port, store, out } = await startServer();
+    const head = `${POST_HEAD}Content-Length: ${BODY_LIMIT + 1}\r\n\r\n`;
+    // Only 12 of the declared 10485761 bytes are sent, and the connection stays open. The server
+    // must answer from the header alone; waiting for the rest would make rawExchange time out.
+    const reply = await rawExchange(port, head, (socket) => socket.write('{"model":"m"'));
+    expect(reply.status).toBe(413);
+    expect(JSON.parse(reply.text)).toEqual(TOO_LARGE);
+    expect(store.entries.size).toBe(0);
+    expect(out).toEqual([]);
+  });
+
+  it("refuses a body without Content-Length once more than the limit has arrived, and closes", async () => {
+    const { port, store } = await startServer();
+    const head = `${POST_HEAD}Transfer-Encoding: chunked\r\n\r\n`;
+    const reply = await rawExchange(port, head, (socket) =>
+      writeChunked(socket, "x".repeat(BODY_LIMIT + 1)),
+    );
+    expect(reply.status).toBe(413);
+    expect(JSON.parse(reply.text)).toEqual(TOO_LARGE);
+    expect(store.entries.size).toBe(0);
+  });
+
+  it("counts the bytes that arrive, not the characters, when there is no Content-Length", async () => {
+    const { port, store } = await startServer();
+    // Two-byte characters ("é"): more bytes than the limit, fewer characters than the limit.
+    const text = chatOfBytes(BODY_LIMIT + 1, true);
+    expect(Buffer.byteLength(text)).toBe(BODY_LIMIT + 1);
+    expect(text.length).toBeLessThan(BODY_LIMIT);
+    const head = `${POST_HEAD}Transfer-Encoding: chunked\r\n\r\n`;
+    const reply = await rawExchange(port, head, (socket) => writeChunked(socket, text));
+    expect(reply.status).toBe(413);
+    expect(JSON.parse(reply.text)).toEqual(TOO_LARGE);
+    expect(store.entries.size).toBe(0);
+  });
+
+  it("accepts a body of exactly the limit and stores it", async () => {
+    const context = await startServer();
+    const pending = send(context.port, { body: chatOfBytes(BODY_LIMIT, false) });
+    await waitFor(() => context.store.entries.size === 1);
+    const id = [...context.store.entries.keys()][0] as string;
+    await answer(context, id, "ok");
+    const reply = await pending;
+    expect(reply.status).toBe(200);
+    expect(reply.json().choices[0]?.message.content).toBe("ok");
+  });
+
+  it("accepts exactly the limit when it is made of two-byte characters, and without Content-Length", async () => {
+    const context = await startServer();
+    const pending = send(context.port, {
+      headers: { "Transfer-Encoding": "chunked" },
+      body: chatOfBytes(BODY_LIMIT, true),
+    });
+    await waitFor(() => context.store.entries.size === 1);
+    const id = [...context.store.entries.keys()][0] as string;
+    await answer(context, id, "ok");
+    expect((await pending).status).toBe(200);
+  });
+
+  it("answers 413 before it looks at whether the body is JSON", async () => {
+    const { port } = await startServer();
+    const head = `${POST_HEAD}Content-Length: ${BODY_LIMIT + 1}\r\n\r\n`;
+    const reply = await rawExchange(port, head, (socket) => socket.write("not json"));
+    expect(JSON.parse(reply.text)).toEqual(TOO_LARGE);
+  });
+});
+
 describe("a request that gets a reply", () => {
   it("holds the connection until a reply is accepted, then answers 200", async () => {
     const { port, store, broker, out } = await startServer();

@@ -9,8 +9,9 @@ import type { Clock } from "../clock.js";
 import { EXIT, IoFailure } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger, Screen } from "../log.js";
-import type { ReplyKind, Role } from "../model.js";
+import type { ReplyKind } from "../model.js";
 import { endOfInputHint } from "../platform.js";
+import { conversationLines, escapeAllControls, escapeControls } from "./conversation-view.js";
 
 /** Every sentence the screen shows, in one place. */
 const TEXT = {
@@ -33,13 +34,6 @@ const TEXT = {
 
 /** The word shown after "Reply:" for each kind of reply. */
 const REPLY_KIND_LABELS: Readonly<Record<ReplyKind, string>> = { text: "text", json: "JSON" };
-
-const ROLE_LABELS: Readonly<Record<Role, string>> = {
-  system: "System",
-  developer: "Developer",
-  user: "User",
-  assistant: "Assistant",
-};
 
 /** Total width of the line above each request. */
 const SEPARATOR_WIDTH = 60;
@@ -168,14 +162,6 @@ function formatReceived(iso: string): string {
   return `${day} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-/** The lines of one message, indented by two spaces. */
-function indented(content: string): string[] {
-  if (content === "") {
-    return ["  (empty)"];
-  }
-  return content.split(/\r\n|\r|\n/).map((line) => (line === "" ? "" : `  ${line}`));
-}
-
 export interface AnswerConsoleOptions {
   broker: ExchangeBroker;
   /** Where requests and notices go. */
@@ -296,15 +282,12 @@ export class AnswerConsole {
     const head = `--- Request 1 of ${total} (${shortId(item.id)}) `;
     screen.line(head + "-".repeat(Math.max(3, SEPARATOR_WIDTH - head.length)));
     screen.line(`Received: ${formatReceived(request.receivedAt)}`);
-    screen.line(`Model:    ${request.model}`);
+    screen.line(`Model:    ${escapeAllControls(request.model)}`);
     screen.line(`Reply:    ${REPLY_KIND_LABELS[request.replyKind]}`);
     screen.line("");
-    for (const message of request.conversation) {
-      screen.line(`${ROLE_LABELS[message.role]}:`);
-      for (const line of indented(message.content)) {
-        screen.line(line);
-      }
-      screen.line("");
+    const path = this.options.broker.requestFilePath(item.id);
+    for (const line of conversationLines(request.conversation, path)) {
+      screen.line(line);
     }
     if (request.replyKind === "json") {
       this.showRequiredShape(request.requiredShape);
@@ -319,7 +302,7 @@ export class AnswerConsole {
       screen.line(TEXT.anyJson);
     } else {
       screen.line(TEXT.requiredShape);
-      for (const line of JSON.stringify(shape, null, 2).split("\n")) {
+      for (const line of escapeControls(JSON.stringify(shape, null, 2)).split("\n")) {
         screen.line(`  ${line}`);
       }
     }

@@ -201,6 +201,11 @@ export class ExchangeStore {
     return { bytes: text, parsed: json.ok ? parseReplyFile(json.value) : { kind: "unreadable" } };
   }
 
+  /** Where request.json of a request is, whether or not the file exists. Reads nothing. */
+  requestFilePath(id: string): string {
+    return path.join(this.requestDir(id), "request.json");
+  }
+
   private requestDir(id: string): string {
     return path.join(this.requestsDir, id);
   }
@@ -304,4 +309,5 @@ export type ExchangeStorage = Pick<
   | "acceptReply"
   | "removeReply"
   | "readReply"
+  | "requestFilePath"
 >;

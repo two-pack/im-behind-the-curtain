@@ -126,6 +126,11 @@ export class ExchangeBroker {
     return { id, outcome };
   }
 
+  /** Where request.json of a request is: the file that holds the whole conversation. */
+  requestFilePath(id: string): string {
+    return this.store.requestFilePath(id);
+  }
+
   /** Looks at every request that is still waiting and accepts the replies that arrived. */
   async pollOnce(): Promise<void> {
     let ids: string[];

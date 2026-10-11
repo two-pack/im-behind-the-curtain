@@ -173,6 +173,10 @@ export class FakeStore implements ExchangeStorage {
     return { bytes, parsed };
   }
 
+  requestFilePath(id: string): string {
+    return `/fake-storage/requests/${id}/request.json`;
+  }
+
   /** Puts a reply file in place the way a user tool or another answer would. */
   putFile(id: string, name: ReplyFileName, bytes: string): void {
     this.entries.get(id)?.files.set(name, bytes);

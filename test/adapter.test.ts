@@ -3,6 +3,7 @@ import {
   buildCompletion,
   buildStreamEvents,
   errorBody,
+  MESSAGES,
   parseChatCompletionsRequest,
 } from "../src/chat-completions/adapter.js";
 
@@ -80,15 +81,17 @@ describe("checking the request body", () => {
     expect(message).toBe('Unsupported message role: "".');
   });
 
-  it("rejects content that is neither a string nor null", () => {
-    for (const content of [[{ type: "text", text: "x" }], 5, {}, true]) {
+  it("rejects content that is not a string, null, or an array of text parts", () => {
+    for (const content of [5, {}, true]) {
       const message = rejectionOf(
         body({ model: "m", messages: [{ role: "user", content }] }),
       ).message;
-      expect(message).toBe("Message content must be a string or null in this version.");
+      expect(message).toBe("Message content must be a string, null, or an array of text parts.");
     }
     const missing = rejectionOf(body({ model: "m", messages: [{ role: "user" }] }));
-    expect(missing.message).toBe("Message content must be a string or null in this version.");
+    expect(missing.message).toBe(
+      "Message content must be a string, null, or an array of text parts.",
+    );
   });
 
   it("decides by the first offending message, and by role before content", () => {
@@ -99,6 +102,122 @@ describe("checking the request body", () => {
       }),
     );
     expect(first.message).toBe('Unsupported message role: "bad".');
+  });
+});
+
+describe("the content of a message", () => {
+  const CONTENT_MESSAGE = "Message content must be a string, null, or an array of text parts.";
+
+  function conversationOf(content: unknown) {
+    const result = parseChatCompletionsRequest(
+      body({ model: "m", messages: [{ role: "user", content }] }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error("expected the request to be accepted");
+    }
+    return result.request.conversation;
+  }
+
+  it("joins the text of an array of text parts without a separator", () => {
+    const parts = [
+      { type: "text", text: "Hello, " },
+      { type: "text", text: "world" },
+    ];
+    expect(conversationOf(parts)).toEqual([{ role: "user", content: "Hello, world" }]);
+  });
+
+  it("keeps a null content and an empty array as an empty string", () => {
+    expect(conversationOf(null)).toEqual([{ role: "user", content: "" }]);
+    expect(conversationOf([])).toEqual([{ role: "user", content: "" }]);
+  });
+
+  it("rejects a part that is not a text part", () => {
+    const bad: unknown[] = [
+      [{ type: "image_url", image_url: { url: "x" } }],
+      [{ type: "text", text: "a" }, { type: "input_audio" }],
+      [{ type: "text" }],
+      [{ type: "text", text: 5 }],
+      [{ text: "no type" }],
+      ["a string part"],
+      [null],
+      [[{ type: "text", text: "nested" }]],
+    ];
+    for (const content of bad) {
+      const rejection = rejectionOf(body({ model: "m", messages: [{ role: "user", content }] }));
+      expect(rejection).toEqual({ status: 400, code: "invalid_request", message: CONTENT_MESSAGE });
+    }
+  });
+});
+
+describe("the n field", () => {
+  function withN(extra: Record<string, unknown>) {
+    return parseChatCompletionsRequest(body({ ...VALID, ...extra }));
+  }
+
+  it("rejects an n of 2 or more with a fixed message", () => {
+    for (const n of [2, 3, 100, 2.5]) {
+      expect(rejectionOf(body({ ...VALID, n }))).toEqual({
+        status: 400,
+        code: "invalid_request",
+        message: 'Only one choice can be returned; "n" must be 1.',
+      });
+    }
+  });
+
+  it("accepts an n that is 1, less than 1, null, not a number, or missing", () => {
+    for (const extra of [{ n: 1 }, { n: 0 }, { n: -4 }, { n: 1.5 }, { n: null }, { n: "2" }, {}]) {
+      expect(withN(extra).ok).toBe(true);
+    }
+  });
+});
+
+describe("the order of the checks", () => {
+  const BAD_N = { n: 2 };
+
+  it("checks messages, then model, then each message, then n", () => {
+    expect(rejectionOf(body({ ...BAD_N })).message).toBe('"messages" must be a non-empty array.');
+    expect(rejectionOf(body({ ...BAD_N, messages: VALID.messages })).message).toBe(
+      '"model" must be a string.',
+    );
+    expect(
+      rejectionOf(body({ ...BAD_N, model: "m", messages: [{ role: "critic", content: 5 }] }))
+        .message,
+    ).toBe('Unsupported message role: "critic".');
+    expect(
+      rejectionOf(body({ ...BAD_N, model: "m", messages: [{ role: "user", content: 5 }] })).message,
+    ).toBe("Message content must be a string, null, or an array of text parts.");
+    expect(rejectionOf(body({ ...VALID, ...BAD_N })).message).toBe(
+      'Only one choice can be returned; "n" must be 1.',
+    );
+  });
+
+  it("decides by the first message that fails, even when a later one fails differently", () => {
+    const messages = [
+      { role: "user", content: "ok" },
+      { role: "user", content: 5 },
+      { role: "critic", content: "x" },
+    ];
+    expect(rejectionOf(body({ model: "m", messages })).message).toBe(
+      "Message content must be a string, null, or an array of text parts.",
+    );
+  });
+});
+
+describe("unknown fields", () => {
+  it("accepts unknown fields at the top and inside a message, and keeps only role and content", () => {
+    const result = parseChatCompletionsRequest(
+      body({
+        model: "m",
+        foo: "bar",
+        messages: [{ role: "user", content: "Hi", name: "alice", foo: { deep: true } }],
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.request.conversation).toEqual([{ role: "user", content: "Hi" }]);
+      expect(result.request.originalRequest).toMatchObject({ foo: "bar" });
+    }
   });
 });
 
@@ -176,7 +295,7 @@ describe("converting to the shared form", () => {
     const original = {
       ...VALID,
       temperature: 0.2,
-      n: 3,
+      n: 1,
       tools: [{ type: "function" }],
       response_format: { type: "json_object" },
       surprise: { nested: true },
@@ -220,6 +339,16 @@ describe("building an error body", () => {
         message: "The request could not be stored.",
         type: "server_error",
         code: "storage_error",
+      },
+    });
+  });
+
+  it("builds the 413 body for a request that is too large", () => {
+    expect(errorBody("request_too_large", MESSAGES.requestTooLarge)).toEqual({
+      error: {
+        message: "Request body is larger than 10 MB.",
+        type: "invalid_request_error",
+        code: "request_too_large",
       },
     });
   });

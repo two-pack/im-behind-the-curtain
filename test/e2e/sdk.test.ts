@@ -121,4 +121,24 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
       }),
     ).rejects.toMatchObject({ status: 400 });
   });
+
+  it("accepts a message whose content is an array of text parts", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["Hi"]));
+    const completion = await clientFor(serve.baseUrl).chat.completions.create({
+      model: "whatever",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Hello, " },
+            { type: "text", text: "world" },
+          ],
+        },
+      ],
+    });
+    expect(completion.choices[0]?.message.content).toBe("Hi");
+    await waitFor(() => answer.stdout().includes("Sent."));
+    expect(answer.stdout()).toContain("User:\n  Hello, world\n");
+  });
 });

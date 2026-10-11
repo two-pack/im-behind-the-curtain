@@ -48,6 +48,12 @@ node dist/bin.js answer   # 端末2: リクエストを表示して、返答を�
 
 リクエストを保存できなかったときは、ストリームを始めずに、通常のJSONのエラーを返します。`imbehind serve` の `received` の行には、構造化出力なら `json`、ストリーミングなら `stream` が付きます。例は `chat/completions  json  stream` です。
 
+### リクエストの中身
+
+発言の `content` には、文字列、`null`（`(empty)` と表示します）、文章の部品の配列（`{"type": "text", "text": "..."}`。区切りなしでつなげます）を指定できます。それ以外の部品、`system`、`developer`、`user`、`assistant` 以外の役割、2以上の `n` は、`400` のエラーで断ります。知らない項目は無視します。本文が10 MB（10485760バイト）を超えるリクエストは、`413` と `request_too_large` で断り、何も保存しません。
+
+`imbehind answer` は、`system` と `developer` の発言をすべて、それ以外は最後の3件を表示します。発言を省いたときは、`(3 earlier messages omitted. Full conversation: <path>)` のような行を1つ表示します。`<path>` は、会話の全体を入れた `request.json` の場所です。200行を超える発言は、200行で切り、同じような行を足します。改行とタブ以外の制御文字は、`\xNN`（たとえば `\x1b`）の形で表示します。
+
 リクエストはOSごとの利用者のデータ用ディレクトリに保存されます。Linuxは `$XDG_DATA_HOME/imbehind`、未設定なら `~/.local/share/imbehind` です。macOSは `~/Library/Application Support/imbehind`、Windowsは `%LOCALAPPDATA%\imbehind` です。保存先はハードリンクを作れる必要があります。
 
 この版の `imbehind serve` は、`127.0.0.1:3000` だけで待ち受けます。受け付けるのは、`POST /v1/chat/completions` に届く文章のメッセージです。ブラウザが付ける `Origin` ヘッダーのあるリクエストと、`Host` ヘッダーが `127.0.0.1` でも `localhost` でもないリクエストは断ります。

@@ -210,6 +210,14 @@ describe("listing requests", () => {
     expect([...(await store.listFiles(ID))].sort()).toEqual(["request.json", "state.json"]);
     expect((await store.listFiles(OTHER_ID)).size).toBe(0);
   });
+
+  it("tells where request.json of a request is", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(sampleRequest(), sampleState());
+    const file = store.requestFilePath(ID);
+    expect(file).toBe(path.join(requests, ID, "request.json"));
+    expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({ id: ID });
+  });
 });
 
 describe("reading files", () => {

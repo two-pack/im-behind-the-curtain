@@ -644,6 +644,17 @@ describe("json replies", () => {
   });
 });
 
+describe("where the whole conversation can be read", () => {
+  it("returns the place of request.json that the store gives, without reading anything", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    const callsBefore = { ...store.calls };
+    expect(broker.requestFilePath(id)).toBe(store.requestFilePath(id));
+    expect(broker.requestFilePath(id)).toMatch(/request\.json$/);
+    expect(store.calls).toEqual(callsBefore);
+  });
+});
+
 describe("subscribing to events", () => {
   it("stops sending events to a handler that unsubscribed", async () => {
     const { store, broker } = setup();

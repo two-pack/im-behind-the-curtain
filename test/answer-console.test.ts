@@ -749,3 +749,136 @@ describe("a request that asks for JSON", () => {
     await running;
   });
 });
+
+describe("a long conversation and unsafe text", () => {
+  const FILE = `/fake-storage/requests/${ID}/request.json`;
+
+  function users(count: number, first = 1): Message[] {
+    return Array.from({ length: count }, (_, index) => ({
+      role: "user" as const,
+      content: `user ${first + index}`,
+    }));
+  }
+
+  async function shown(
+    conversation: Message[],
+    extra: Partial<ConversationRequest> = {},
+    model?: string,
+  ): Promise<string[]> {
+    const t = setup([]);
+    t.addWaiting(ID, conversation, extra);
+    if (model !== undefined) {
+      const entry = t.store.entries.get(ID);
+      if (entry !== undefined && typeof entry.request === "object") {
+        entry.request.model = model;
+      }
+    }
+    const running = t.start();
+    await settle();
+    const lines = t.stdout();
+    t.controller.abort();
+    await running;
+    return lines;
+  }
+
+  it("shows the system message and the last three others, and says where the full text is", async () => {
+    const lines = await shown([{ role: "system", content: "rules" }, ...users(6)]);
+    expect(lines.slice(5, 17)).toEqual([
+      "System:",
+      "  rules",
+      "",
+      `(3 earlier messages omitted. Full conversation: ${FILE})`,
+      "",
+      "User:",
+      "  user 4",
+      "",
+      "User:",
+      "  user 5",
+      "",
+      "User:",
+    ]);
+    expect(lines.join("\n")).not.toContain("user 3");
+  });
+
+  it("shows every system and developer message, and the last three of the other five", async () => {
+    const lines = await shown([
+      { role: "system", content: "rules" },
+      { role: "developer", content: "style" },
+      ...users(5),
+    ]);
+    const text = lines.join("\n");
+    expect(text).toContain("  rules");
+    expect(text).toContain("  style");
+    expect(text).toContain("  user 5");
+    expect(text).toContain("  user 3");
+    expect(text).not.toContain("  user 2");
+    expect(text).toContain("(2 earlier messages omitted.");
+  });
+
+  it("omits nothing for exactly three other messages and one message for four", async () => {
+    const three = (await shown(users(3))).join("\n");
+    expect(three).not.toContain("omitted");
+    const four = (await shown(users(4))).join("\n");
+    expect(four).toContain(`(1 earlier message omitted. Full conversation: ${FILE})`);
+    expect(four).not.toContain("user 1\n");
+  });
+
+  it("writes one omission line when a developer message sits between the omitted ones", async () => {
+    const lines = await shown([
+      { role: "user", content: "u1" },
+      { role: "developer", content: "d1" },
+      ...users(4, 2),
+    ]);
+    expect(lines.filter((line) => line.includes("earlier message"))).toEqual([
+      `(2 earlier messages omitted. Full conversation: ${FILE})`,
+    ]);
+  });
+
+  it("shows control characters in a visible form and writes none of them", async () => {
+    const t = setup([]);
+    t.addWaiting(ID, [{ role: "user", content: "\x1b[31mred\x1b[0m\x07 bell\x7f\x9b" }]);
+    const running = t.start();
+    await settle();
+    t.controller.abort();
+    await running;
+    expect(t.stdout()).toContain("  \\x1b[31mred\\x1b[0m\\x07 bell\\x7f\\x9b");
+    const forbidden = [...t.raw()].filter((char) => {
+      const code = char.charCodeAt(0);
+      return (code < 0x20 && char !== "\n") || (code >= 0x7f && code <= 0x9f);
+    });
+    expect(forbidden).toEqual([]);
+  });
+
+  it("shows (empty) for an empty message", async () => {
+    const lines = await shown([{ role: "user", content: "" }]);
+    expect(lines).toContain("  (empty)");
+  });
+
+  it("cuts a message of 1000 lines at 200 lines", async () => {
+    const content = Array.from({ length: 1000 }, (_, index) => `line ${index + 1}`).join("\n");
+    const lines = await shown([{ role: "user", content }]);
+    expect(lines).toContain("  line 200");
+    expect(lines).not.toContain("  line 201");
+    expect(lines).toContain(`  (800 more lines omitted. Full conversation: ${FILE})`);
+  });
+
+  it("replaces control characters in the required shape and in the model name", async () => {
+    const lines = await shown(
+      [{ role: "user", content: "Hi" }],
+      { replyKind: "json", requiredShape: { description: "a\x9bb" } },
+      "gpt\n\x1b[2Jx",
+    );
+    expect(lines).toContain("Model:    gpt\\x0a\\x1b[2Jx");
+    expect(lines).toContain('    "description": "a\\x9bb"');
+  });
+
+  it("keeps the first lines and the reply kind as before", async () => {
+    const lines = await shown(users(5), { replyKind: "json" });
+    expect(lines.slice(0, 4)).toEqual([
+      separator(1, 1, "a1b2c3"),
+      "Received: 2026-10-09 14:05:12",
+      "Model:    whatever",
+      "Reply:    JSON",
+    ]);
+  });
+});
