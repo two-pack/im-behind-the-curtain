@@ -1,0 +1,88 @@
+import { spawnSync } from "node:child_process";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import { makeTempDir } from "./helpers/fs.js";
+
+const CONFIG = path.resolve(".dependency-cruiser.cjs");
+const CRUISER = path.resolve("node_modules", "dependency-cruiser", "bin", "dependency-cruiser.mjs");
+const TSCONFIG = JSON.stringify({
+  compilerOptions: { module: "NodeNext", moduleResolution: "NodeNext", target: "ES2023" },
+  include: ["src/**/*.ts"],
+});
+
+interface Violation {
+  rule: { name: string };
+  from: string;
+  to: string;
+}
+
+/** Writes a small src/ tree into a temporary folder and cruises it with the project's rules. */
+async function cruise(files: Record<string, string>): Promise<Violation[]> {
+  const dir = await makeTempDir();
+  await writeFile(path.join(dir, "tsconfig.json"), TSCONFIG);
+  for (const [name, content] of Object.entries(files)) {
+    const target = path.join(dir, "src", name);
+    await mkdir(path.dirname(target), { recursive: true });
+    await writeFile(target, content);
+  }
+  const result = spawnSync(
+    process.execPath,
+    [CRUISER, "src", "--config", CONFIG, "--output-type", "json"],
+    { cwd: dir, encoding: "utf8" },
+  );
+  const report = JSON.parse(result.stdout) as { summary: { violations: Violation[] } };
+  return report.summary.violations;
+}
+
+const LEAF = "export const value = 1;\n";
+
+describe("the dependency rules (logical-components: the leaf modules)", () => {
+  it("lets a leaf module import another leaf module", async () => {
+    const violations = await cruise({
+      "errors.ts": LEAF,
+      "ids.ts": 'import { value } from "./errors.js";\nexport const other = value;\n',
+      "model.ts": 'import { other } from "./ids.js";\nexport const third = other;\n',
+    });
+    expect(violations).toEqual([]);
+  });
+
+  it("reports a cycle between leaf modules", async () => {
+    const violations = await cruise({
+      "errors.ts": 'import { b } from "./ids.js";\nexport const a = b;\n',
+      "ids.ts": 'import { a } from "./errors.js";\nexport const b = a;\n',
+    });
+    expect(violations.map((violation) => violation.rule.name)).toContain("no-circular");
+  });
+
+  it("reports a leaf module that imports a module that is not a leaf", async () => {
+    const violations = await cruise({
+      "ids.ts": 'import { value } from "./clock.js";\nexport const other = value;\n',
+      "clock.ts": LEAF,
+    });
+    expect(violations.map((violation) => `${violation.from} -> ${violation.to}`)).toEqual([
+      "src/ids.ts -> src/clock.ts",
+    ]);
+  });
+
+  it("still reports an import against the direction of the design", async () => {
+    const violations = await cruise({
+      "errors.ts": LEAF,
+      "log.ts": 'import { value } from "./broker/exchange-broker.js";\nexport const x = value;\n',
+      "broker/exchange-broker.ts": 'import { value } from "../errors.js";\nexport { value };\n',
+    });
+    expect(violations.map((violation) => `${violation.from} -> ${violation.to}`)).toEqual([
+      "src/log.ts -> src/broker/exchange-broker.ts",
+    ]);
+  });
+
+  it("still allows an import the design allows", async () => {
+    const violations = await cruise({
+      "errors.ts": LEAF,
+      "clock.ts": LEAF,
+      "log.ts":
+        'import { value } from "./clock.js";\nimport { value as v2 } from "./errors.js";\nexport const x = [value, v2];\n',
+    });
+    expect(violations).toEqual([]);
+  });
+});
