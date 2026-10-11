@@ -174,13 +174,31 @@ describe("reading a state file", () => {
   });
 
   it("treats an unknown state value as a finished request", () => {
-    for (const state of ["abandoned", "invalid_reply", "future"]) {
+    for (const state of ["future", "", "REPLIED"]) {
       const parsed = parseStateFile({
         ...createStateFile(ID, "waiting", RECEIVED_AT, null),
         state,
       });
       expect(parsed.kind === "ok" && parsed.value.state).toBe("other");
     }
+  });
+
+  it("knows abandoned and invalid_reply as states of finished requests", () => {
+    for (const state of ["abandoned", "invalid_reply"]) {
+      const parsed = parseStateFile({
+        ...createStateFile(ID, "waiting", RECEIVED_AT, null),
+        state,
+      });
+      expect(parsed.kind === "ok" && parsed.value.state).toBe(state);
+    }
+    const abandoned = createStateFile(
+      ID,
+      "abandoned",
+      RECEIVED_AT,
+      RECEIVED_AT,
+      "server restarted",
+    );
+    expect(abandoned).toMatchObject({ state: "abandoned", endReason: "server restarted" });
   });
 
   it("treats a file whose formatVersion is not 1 as unreadable", () => {

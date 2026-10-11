@@ -173,6 +173,12 @@ export class FakeStore implements ExchangeStorage {
     return { bytes, parsed };
   }
 
+  async removeRequest(id: string): Promise<"removed" | "kept"> {
+    await this.enter("removeRequest", "delete failed");
+    this.entries.delete(id);
+    return "removed";
+  }
+
   requestFilePath(id: string): string {
     return `/fake-storage/requests/${id}/request.json`;
   }

@@ -1,4 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 import { afterEach } from "vitest";
 import { AnswerConsole, type ReplyReader } from "../../src/answer/answer-console.js";
@@ -27,17 +28,34 @@ export interface RunningServe {
   stop: () => Promise<number>;
 }
 
+export interface ServeOptions {
+  storageDir?: string;
+  storeFs?: StoreFs;
+  args?: string[];
+  clock?: Clock;
+  /**
+   * Gives serve no test override of the port and the storage directory: the words in `args`
+   * and the variables in `env` decide, as for a real start.
+   */
+  raw?: boolean;
+  /** The environment variables of serve. Only with `raw`. */
+  env?: Record<string, string>;
+}
+
 /**
  * Starts the real `imbehind serve` in this process, on a free port and a temporary directory.
  * `args` are the words after `serve`, such as `--timeout 1`. `clock` replaces the clock of serve.
  */
-export async function startServe(
-  options: { storageDir?: string; storeFs?: StoreFs; args?: string[]; clock?: Clock } = {},
-): Promise<RunningServe> {
-  const t = makeIo();
-  const storageDir = options.storageDir ?? (await makeTempDir());
+export async function startServe(options: ServeOptions = {}): Promise<RunningServe> {
+  const raw = options.raw === true;
+  const t = makeIo(
+    options.env === undefined
+      ? undefined
+      : { platform: "linux", env: options.env, homedir: "/home/alice" },
+  );
+  const given = options.storageDir ?? (raw ? undefined : await makeTempDir());
   const exit = main(["serve", ...(options.args ?? [])], t.io, {
-    settings: { port: 0, storageDir },
+    settings: raw ? undefined : { port: 0, storageDir: given },
     storeFs: options.storeFs,
     clock: options.clock,
   });
@@ -47,19 +65,33 @@ export async function startServe(
   };
   cleanups.push(stop);
   await Promise.race([waitFor(() => t.out.text().includes("Listening on")), exit]);
-  const match = /Listening on http:\/\/127\.0\.0\.1:(\d+) /.exec(t.out.text());
+  const match = /Listening on http:\/\/(\[[^\]]+\]|[0-9.]+):(\d+) \(storage: (.*)\)/.exec(
+    t.out.text(),
+  );
   if (match === null) {
     throw new Error(`serve did not start: ${t.err.text()}`);
   }
-  const port = Number(match[1]);
+  const port = Number(match[2]);
   return {
     port,
-    baseUrl: `http://127.0.0.1:${port}`,
-    storageDir,
+    baseUrl: `http://${match[1]}:${port}`,
+    storageDir: given ?? (match[3] as string),
     stdout: () => t.out.text(),
     stderr: () => t.err.text(),
     stop,
   };
+}
+
+/** A port that nothing listens on now. It could be taken before it is used, but rarely is. */
+export async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address() as net.AddressInfo;
+      probe.close(() => resolve(port));
+    });
+  });
 }
 
 export interface RunningAnswer {
@@ -91,6 +123,9 @@ export function startAnswer(
     clock: systemClock,
     reader,
     pollIntervalMs,
+    storageDir,
+    // The serve that these tests started holds the lock. The check itself has its own tests.
+    checkServe: async () => ({ kind: "running" }),
   });
   const controller = new AbortController();
   const done = answer.run(controller.signal);

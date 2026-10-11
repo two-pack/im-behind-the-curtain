@@ -1,19 +1,23 @@
 /**
  * Dependency rules for src/. They follow the module graph of the design:
  *
- *   cli            -> config, http, answer-console, broker, store, log, clock, platform
+ *   cli            -> config, http, answer-console, broker, store, serve-lock, sweeper, log, clock,
+ *                     platform
  *   http           -> chat-completions, broker, log
  *   answer-console -> broker, log, clock, platform, conversation-view
  *   broker         -> store, clock, reply-check
+ *   sweeper        -> broker, clock
  *   log            -> clock
  *   store          -> platform
+ *   serve-lock     -> platform
  *   config         -> platform
  *   bin            -> cli, platform
  *
  * errors, ids and model are leaf modules that any module may use. A leaf module may import
  * another leaf module, but never a module that is not a leaf, and leaf modules never form a
  * cycle. clock imports nothing from the project (no rule allows it). chat-completions,
- * platform, reply-check and conversation-view import only the leaf modules. Type-only imports count as
+ * platform, reply-check and conversation-view import only the leaf modules. serve-lock imports
+ * only platform and the leaf modules. Type-only imports count as
  * dependencies. Cycles are never allowed.
  */
 
@@ -82,6 +86,8 @@ module.exports = {
       "answer/answer-console",
       "broker/exchange-broker",
       "store/exchange-store",
+      "store/serve-lock",
+      "sweeper/sweeper",
       "log",
       "clock",
       "platform",
@@ -102,6 +108,8 @@ module.exports = {
     allow("broker/exchange-broker", ["store/exchange-store", "clock", "broker/reply-check"]),
     allow("broker/reply-check", []),
     allow("store/exchange-store", ["platform"]),
+    allow("store/serve-lock", ["platform"]),
+    allow("sweeper/sweeper", ["broker/exchange-broker", "clock"]),
     allow("chat-completions/adapter", []),
   ],
   allowedSeverity: "error",

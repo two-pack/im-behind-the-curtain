@@ -412,6 +412,24 @@ export function buildStreamEvents(input: StreamInput): string[] {
   return [...chunks.map(event), "data: [DONE]\n\n"];
 }
 
+/** The body of GET /v1/models. */
+export interface ModelList {
+  object: "list";
+  data: { id: string; object: "model"; created: number; owned_by: string }[];
+}
+
+/** The one model of this server. The time is fixed, so the answer does not depend on the clock. */
+const MODEL_ID = "imbehind";
+const MODEL_CREATED = 1791800000;
+
+/** The list of models: always the single model `imbehind`. */
+export function buildModelList(): ModelList {
+  return {
+    object: "list",
+    data: [{ id: MODEL_ID, object: "model", created: MODEL_CREATED, owned_by: MODEL_ID }],
+  };
+}
+
 /** The message of the 504 answer. The limit is the number of seconds the server waited. */
 export function replyTimeoutMessage(limitSeconds: number): string {
   return `No reply within ${limitSeconds} seconds. Increase the server timeout or reply sooner.`;

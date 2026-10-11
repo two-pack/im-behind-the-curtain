@@ -1,8 +1,9 @@
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import type { BrokerEvent, ExchangeBroker, ExchangeOutcome } from "../broker/exchange-broker.js";
 import {
   buildCompletion,
+  buildModelList,
   buildStreamEvents,
   type ErrorCode,
   errorBody,
@@ -15,9 +16,22 @@ import { shortId } from "../ids.js";
 import type { Logger } from "../log.js";
 import type { ConversationRequest } from "../model.js";
 
+/** What the HTTP server needs from a Node.js server. A test replaces it to make listening fail. */
+export interface ListenTarget {
+  once(event: "error", listener: (error: NodeJS.ErrnoException) => void): unknown;
+  off(event: "error", listener: (error: NodeJS.ErrnoException) => void): unknown;
+  on(event: "error", listener: (error: Error) => void): unknown;
+  listen(port: number, host: string, callback: () => void): unknown;
+  address(): AddressInfo | string | null;
+  close(callback: () => void): unknown;
+  closeAllConnections(): void;
+}
+
 export interface HttpServerOptions {
   host: string;
   port: number;
+  /** Makes the server that listens. Only tests set it. */
+  createServer?: (listener: http.RequestListener) => ListenTarget;
   broker: ExchangeBroker;
   logger: Logger;
   /** The time in whole seconds since the epoch, for the `created` field. */
@@ -45,14 +59,49 @@ interface Refusal {
 }
 
 const CHAT_PATH = "/v1/chat/completions";
-const LOCAL_HOST_NAMES = new Set(["127.0.0.1", "localhost"]);
+const MODELS_PATH = "/v1/models";
+/** The one method each path takes. */
+const ROUTES: ReadonlyMap<string, string> = new Map([
+  [CHAT_PATH, "POST"],
+  [MODELS_PATH, "GET"],
+]);
 
-/** The name part of a Host header: no port, in lower case. */
-function hostName(header: string): string {
-  const name = header.startsWith("[")
-    ? header.slice(0, header.indexOf("]") + 1)
-    : header.split(":")[0];
-  return (name ?? "").toLowerCase();
+/** The part after the name: nothing, or ":" and one or more digits. */
+const PORT_PART = /^(?::\d+)?$/;
+
+/**
+ * Splits a Host header into its name and the rest (the port part). The name of `[::1]` is `::1`,
+ * and nothing may follow the closing bracket but the port part. Without a bracket the name ends at
+ * the first colon, so a bare `::1` has an empty name. Undefined when a bracket is not closed.
+ */
+function splitHostHeader(header: string): { name: string; rest: string } | undefined {
+  if (header.startsWith("[")) {
+    const end = header.indexOf("]");
+    return end === -1 ? undefined : { name: header.slice(1, end), rest: header.slice(end + 1) };
+  }
+  const colon = header.indexOf(":");
+  return colon === -1
+    ? { name: header, rest: "" }
+    : { name: header.slice(0, colon), rest: header.slice(colon) };
+}
+
+/**
+ * Whether a Host header is this machine. The port part must be absent or ":" and
+ * digits. The name must be `localhost` in any case, `::1` in brackets, or an IPv4 address of
+ * 127.0.0.0/8 written as four decimal numbers: `127.1` and the hex or octal forms are refused.
+ * The module of the settings has its own check for the `--host` option, because this module may
+ * not import it.
+ */
+function isLocalHostHeader(header: string): boolean {
+  const parts = splitHostHeader(header);
+  if (parts === undefined || !PORT_PART.test(parts.rest)) {
+    return false;
+  }
+  if (header.startsWith("[")) {
+    return parts.name === "::1";
+  }
+  const name = parts.name.toLowerCase();
+  return name === "localhost" || (net.isIPv4(name) && name.startsWith("127."));
 }
 
 function pathOf(target: string | undefined): string {
@@ -71,22 +120,23 @@ function checkOrigin(request: http.IncomingMessage): Refusal | undefined {
 /** A Host that is not this machine is refused. A missing Host is accepted. */
 function checkHost(request: http.IncomingMessage): Refusal | undefined {
   const header = request.headers.host;
-  if (header === undefined || LOCAL_HOST_NAMES.has(hostName(header))) {
+  if (header === undefined || isLocalHostHeader(header)) {
     return undefined;
   }
   return { status: 400, code: "invalid_request", message: MESSAGES.unexpectedHost };
 }
 
 function checkRoute(request: http.IncomingMessage): Refusal | undefined {
-  if (pathOf(request.url) !== CHAT_PATH) {
+  const method = ROUTES.get(pathOf(request.url));
+  if (method === undefined) {
     return { status: 404, code: "not_found", message: MESSAGES.notFound };
   }
-  if (request.method !== "POST") {
+  if (request.method !== method) {
     return {
       status: 405,
       code: "method_not_allowed",
       message: MESSAGES.methodNotAllowed,
-      allow: "POST",
+      allow: method,
     };
   }
   return undefined;
@@ -188,14 +238,26 @@ function respondStream(response: http.ServerResponse, events: string[]): void {
   }
 }
 
-function listenFailure(error: NodeJS.ErrnoException, port: number): StartupError {
+/** The sentences for a failure to listen. */
+function listenFailure(error: NodeJS.ErrnoException, host: string, port: number): StartupError {
   if (error.code === "EADDRINUSE") {
-    return new StartupError(`port ${port} is already in use.`);
+    return new StartupError(
+      `port ${port} is already in use. Choose another port with --port or IMBEHIND_PORT.`,
+    );
   }
   if (error.code === "EACCES") {
     return new StartupError(`no permission to listen on port ${port}.`);
   }
+  if (error.code === "EADDRNOTAVAIL") {
+    const shown = host.includes(":") ? `[${host}]` : host;
+    return new StartupError(`cannot listen on ${shown}:${port}: address not available.`);
+  }
   return new StartupError(`cannot listen on port ${port}: ${describeFsError(error)}.`);
+}
+
+/** The Node.js server of production: `Host` is not required, so a missing one is accepted. */
+function createNodeServer(listener: http.RequestListener): ListenTarget {
+  return http.createServer({ requireHostHeader: false }, listener);
 }
 
 /**
@@ -205,12 +267,13 @@ function listenFailure(error: NodeJS.ErrnoException, port: number): StartupError
  */
 export class HttpServer {
   private readonly options: HttpServerOptions;
-  private readonly server: http.Server;
+  private readonly server: ListenTarget;
   private unsubscribe: (() => void) | undefined;
 
   constructor(options: HttpServerOptions) {
     this.options = options;
-    this.server = http.createServer({ requireHostHeader: false }, (request, response) => {
+    const create = options.createServer ?? createNodeServer;
+    this.server = create((request, response) => {
       void this.handle(request, response);
     });
   }
@@ -219,7 +282,7 @@ export class HttpServer {
   async listen(): Promise<{ host: string; port: number }> {
     await new Promise<void>((resolve, reject) => {
       const onError = (error: NodeJS.ErrnoException): void => {
-        reject(listenFailure(error, this.options.port));
+        reject(listenFailure(error, this.options.host, this.options.port));
       };
       this.server.once("error", onError);
       this.server.listen(this.options.port, this.options.host, () => {
@@ -259,7 +322,10 @@ export class HttpServer {
     }
   }
 
-  private logEnding(type: "replied" | "skipped" | "cancelled" | "timed_out", id: string): void {
+  private logEnding(
+    type: "replied" | "skipped" | "cancelled" | "timed_out" | "abandoned",
+    id: string,
+  ): void {
     const { logger } = this.options;
     if (type === "replied") {
       logger.replied(id);
@@ -267,6 +333,8 @@ export class HttpServer {
       logger.skipped(id);
     } else if (type === "cancelled") {
       logger.cancelled(id);
+    } else if (type === "abandoned") {
+      logger.abandoned(id);
     } else {
       logger.timedOut(id);
     }
@@ -294,6 +362,10 @@ export class HttpServer {
     if (refusal !== undefined) {
       const headers = refusal.allow === undefined ? {} : { Allow: refusal.allow };
       respond(response, refusal.status, errorBody(refusal.code, refusal.message), headers);
+      return;
+    }
+    if (pathOf(request.url) === MODELS_PATH) {
+      respond(response, 200, buildModelList());
       return;
     }
     const declaredLength = Number(request.headers["content-length"]);

@@ -1,9 +1,10 @@
+import { EventEmitter } from "node:events";
 import http from "node:http";
 import net from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { ExchangeBroker } from "../src/broker/exchange-broker.js";
 import { StartupError } from "../src/errors.js";
-import { HttpServer } from "../src/http/server.js";
+import { HttpServer, type HttpServerOptions } from "../src/http/server.js";
 import { Logger, type LoggerOptions } from "../src/log.js";
 import { createReplyFile, serializeFile } from "../src/model.js";
 import { FakeClock } from "./helpers/fake-clock.js";
@@ -19,6 +20,7 @@ async function startServer(
   port = 0,
   makeLogger?: (options: LoggerOptions) => Logger,
   waitLimitSeconds?: number,
+  listenHost = "127.0.0.1",
 ) {
   const store = new FakeStore();
   const clock = new FakeClock();
@@ -33,7 +35,7 @@ async function startServer(
   const logger = makeLogger === undefined ? new Logger(loggerOptions) : makeLogger(loggerOptions);
   const unexpected: unknown[] = [];
   const server = new HttpServer({
-    host: "127.0.0.1",
+    host: listenHost,
     port,
     broker,
     logger,
@@ -71,12 +73,19 @@ interface ReplyBody {
 
 function send(
   port: number,
-  options: { method?: string; path?: string; headers?: http.OutgoingHttpHeaders; body?: string },
+  options: {
+    method?: string;
+    path?: string;
+    headers?: http.OutgoingHttpHeaders;
+    body?: string;
+    /** The address to connect to. The default is 127.0.0.1. */
+    host?: string;
+  },
 ): Promise<Reply> {
   return new Promise((resolve, reject) => {
     const request = http.request(
       {
-        host: "127.0.0.1",
+        host: options.host ?? "127.0.0.1",
         port,
         method: options.method ?? "POST",
         path: options.path ?? "/v1/chat/completions",
@@ -156,7 +165,39 @@ describe("checks before the body is read", () => {
 
   it("refuses a Host that is not a local name and stores nothing", async () => {
     const { port, store } = await startServer();
-    for (const host of ["evil.example", "localhost.evil.com", "127.0.0.2:3000", "[::1]:3000"]) {
+    for (const host of [
+      "evil.example",
+      "localhost.evil.com",
+      "0.0.0.0",
+      "192.168.0.5:3000",
+      "128.0.0.1",
+      "[::2]:3000",
+      "[::1",
+      "::1",
+      // The port part is nothing, or ":" and digits. Nothing else may follow the name.
+      "localhost:",
+      "127.0.0.1:",
+      "[::1]:",
+      "localhost:abc",
+      "localhost:30x0",
+      "localhost:-1",
+      "localhost:3000:1",
+      "localhost:3000@evil.com",
+      "localhost@evil.com",
+      "[::1]evil.com",
+      "[::1]@evil.com",
+      "[::1]:3000@evil.com",
+      // An IPv4 address is four decimal numbers, and nothing shorter or in another base.
+      "127.1",
+      "127.0.1",
+      "0x7f.0.0.1",
+      "0x7f000001",
+      "0177.0.0.1",
+      "2130706433",
+      "127.0.0.256",
+      "127.0.0.1.1",
+      "127.0.0.1.evil.com",
+    ]) {
       const reply = await send(port, { headers: { Host: host }, body: chat("Hello") });
       expect(reply.status).toBe(400);
       expect(reply.json().error).toEqual({
@@ -176,6 +217,13 @@ describe("checks before the body is read", () => {
       "127.0.0.1",
       `127.0.0.1:${port}`,
       "LocalHost:1",
+      "127.0.0.2:3000",
+      "127.255.255.254",
+      "[::1]",
+      "[::1]:3000",
+      "[::1]:65535",
+      "127.0.0.1:3000",
+      "LocalHost",
     ]) {
       const reply = await send(port, { method: "GET", path: "/nothing", headers: { Host: host } });
       expect(reply.status).toBe(404);
@@ -197,17 +245,21 @@ describe("checks before the body is read", () => {
 });
 
 describe("paths and methods", () => {
-  it("answers 404 for any other path, including GET /v1/models in this version", async () => {
+  it("answers 404 for any other path", async () => {
     const { port } = await startServer();
-    for (const path of ["/", "/v1/models", "/v1/chat/completions/", "/v1/responses"]) {
+    for (const path of [
+      "/",
+      "/v1/models/",
+      "/v1/models/imbehind",
+      "/v1/chat/completions/",
+      "/v1/responses",
+    ]) {
       const reply = await send(port, { method: "GET", path });
       expect(reply.status).toBe(404);
       expect(reply.json()).toEqual({
         error: { message: "Not found.", type: "invalid_request_error", code: "not_found" },
       });
     }
-    const post = await send(port, { path: "/v1/models", body: "{}" });
-    expect(post.status).toBe(404);
   });
 
   it("answers 405 for another method on the chat completions path", async () => {
@@ -955,7 +1007,9 @@ describe("listening (NFR9.1)", () => {
     started.push(second);
     const failure = second.listen();
     await expect(failure).rejects.toBeInstanceOf(StartupError);
-    await expect(failure).rejects.toThrow(`port ${first.port} is already in use.`);
+    await expect(failure).rejects.toThrow(
+      `port ${first.port} is already in use. Choose another port with --port or IMBEHIND_PORT.`,
+    );
   });
 
   it("stops accepting and drops open connections when closed", async () => {
@@ -969,6 +1023,194 @@ describe("listening (NFR9.1)", () => {
     expect(await pending).toBe("dropped");
     await expect(send(port, { method: "GET", path: "/nothing" })).rejects.toThrow();
     expect(store.entries.size).toBe(1);
+  });
+});
+
+/** Whether this machine can listen on the address. Real sockets are used only where it can. */
+function canBind(host: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.listen(0, host, () => probe.close(() => resolve(true)));
+  });
+}
+
+const HAS_IPV6_LOOPBACK = await canBind("::1");
+const HAS_SECOND_LOOPBACK = await canBind("127.0.0.2");
+
+describe("listening on other local addresses", () => {
+  it.skipIf(!HAS_SECOND_LOOPBACK)(
+    "listens on 127.0.0.2 and takes a request for that Host",
+    async () => {
+      const { host, port } = await startServer(0, undefined, undefined, "127.0.0.2");
+      expect(host).toBe("127.0.0.2");
+      const reply = await send(port, {
+        host: "127.0.0.2",
+        method: "GET",
+        path: "/v1/models",
+        headers: { Host: `127.0.0.2:${port}` },
+      });
+      expect(reply.status).toBe(200);
+    },
+  );
+
+  it.skipIf(!HAS_IPV6_LOOPBACK)("listens on ::1 and takes a request for that Host", async () => {
+    const { host, port } = await startServer(0, undefined, undefined, "::1");
+    expect(host).toBe("::1");
+    const reply = await send(port, {
+      host: "::1",
+      method: "GET",
+      path: "/v1/models",
+      headers: { Host: `[::1]:${port}` },
+    });
+    expect(reply.status).toBe(200);
+  });
+});
+
+/** A listener that fails at once with the given error code, as an address the OS lacks does. */
+function failingListener(code: string): NonNullable<HttpServerOptions["createServer"]> {
+  return () => {
+    const emitter = new EventEmitter();
+    return Object.assign(emitter, {
+      listen: () => {
+        queueMicrotask(() => emitter.emit("error", Object.assign(new Error("injected"), { code })));
+      },
+      address: () => null,
+      close: (callback: () => void) => callback(),
+      closeAllConnections: () => {},
+    });
+  };
+}
+
+async function listenFailureOf(host: string, port: number, code: string): Promise<Error> {
+  const store = new FakeStore();
+  const clock = new FakeClock();
+  const server = new HttpServer({
+    host,
+    port,
+    broker: new ExchangeBroker({ store, clock, pollIntervalMs: 500 }),
+    logger: new Logger({ out: { write: () => {} }, err: { write: () => {} }, clock }),
+    nowSeconds: () => 0,
+    onUnexpectedFailure: () => {},
+    createServer: failingListener(code),
+  });
+  try {
+    await server.listen();
+  } catch (error) {
+    return error as Error;
+  }
+  return expect.unreachable("listen should have failed");
+}
+
+describe("the sentence when listening fails", () => {
+  it("names the address and the port when the address is not available", async () => {
+    const error = await listenFailureOf("127.0.0.2", 3000, "EADDRNOTAVAIL");
+    expect(error).toBeInstanceOf(StartupError);
+    expect(error.message).toBe("cannot listen on 127.0.0.2:3000: address not available.");
+  });
+
+  it("writes an IPv6 address in brackets", async () => {
+    const error = await listenFailureOf("::1", 3100, "EADDRNOTAVAIL");
+    expect(error.message).toBe("cannot listen on [::1]:3100: address not available.");
+  });
+
+  it("says how to choose another port when the port is in use", async () => {
+    const error = await listenFailureOf("127.0.0.1", 3000, "EADDRINUSE");
+    expect(error.message).toBe(
+      "port 3000 is already in use. Choose another port with --port or IMBEHIND_PORT.",
+    );
+  });
+
+  it("keeps the sentences for a port that needs permission and for any other failure", async () => {
+    expect((await listenFailureOf("127.0.0.1", 80, "EACCES")).message).toBe(
+      "no permission to listen on port 80.",
+    );
+    expect((await listenFailureOf("127.0.0.1", 80, "EMFILE")).message).toBe(
+      "cannot listen on port 80: too many open files.",
+    );
+  });
+});
+
+describe("Host names for every local address", () => {
+  it("refuses a bad Host before the route is looked at, for every path", async () => {
+    const { port, store } = await startServer();
+    for (const path of ["/v1/models", "/v1/chat/completions", "/nothing"]) {
+      const reply = await send(port, { method: "GET", path, headers: { Host: "evil.example" } });
+      expect(reply.status).toBe(400);
+      expect(reply.json().error.message).toBe("Unexpected Host header.");
+    }
+    expect(store.entries.size).toBe(0);
+  });
+});
+
+describe("GET /v1/models", () => {
+  const LIST = {
+    object: "list",
+    data: [{ id: "imbehind", object: "model", created: 1791800000, owned_by: "imbehind" }],
+  };
+
+  it("returns the fixed model list as JSON", async () => {
+    const { port } = await startServer();
+    const reply = await send(port, { method: "GET", path: "/v1/models" });
+    expect(reply.status).toBe(200);
+    expect(reply.headers["content-type"]).toBe("application/json");
+    expect(JSON.parse(reply.text)).toEqual(LIST);
+  });
+
+  it("does not look at Authorization, and ignores the query string", async () => {
+    const { port } = await startServer();
+    const withKey = await send(port, {
+      method: "GET",
+      path: "/v1/models",
+      headers: { Authorization: "Bearer sk-anything" },
+    });
+    const withQuery = await send(port, { method: "GET", path: "/v1/models?limit=1&after=x" });
+    expect(JSON.parse(withKey.text)).toEqual(LIST);
+    expect(JSON.parse(withQuery.text)).toEqual(LIST);
+  });
+
+  it("gives the same body whatever the clock says", async () => {
+    const { port, clock } = await startServer();
+    const first = await send(port, { method: "GET", path: "/v1/models" });
+    await clock.advance(86400000);
+    const second = await send(port, { method: "GET", path: "/v1/models" });
+    expect(second.text).toBe(first.text);
+  });
+
+  it("stores nothing, shows nothing to answer, and writes no event line", async () => {
+    const { port, store, out, err, broker } = await startServer();
+    await send(port, { method: "GET", path: "/v1/models" });
+    expect(store.entries.size).toBe(0);
+    expect(out).toEqual([]);
+    expect(err).toEqual([]);
+    expect((await broker.listWaiting(new Set())).waiting).toEqual([]);
+  });
+
+  it("answers 405 with Allow: GET for any other method", async () => {
+    const { port } = await startServer();
+    for (const method of ["POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]) {
+      const reply = await send(port, { method, path: "/v1/models" });
+      expect(reply.status, method).toBe(405);
+      expect(reply.headers.allow).toBe("GET");
+      if (method !== "HEAD") {
+        expect(reply.json().error).toEqual({
+          message: "Method not allowed.",
+          type: "invalid_request_error",
+          code: "method_not_allowed",
+        });
+      }
+    }
+  });
+
+  it("refuses a request with an Origin header, like the other path", async () => {
+    const { port } = await startServer();
+    const reply = await send(port, {
+      method: "GET",
+      path: "/v1/models",
+      headers: { Origin: "https://evil.example" },
+    });
+    expect(reply.status).toBe(400);
+    expect(reply.json().error.message).toBe("Cross-origin requests are not accepted.");
   });
 });
 

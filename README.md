@@ -32,7 +32,7 @@ The rest of this README writes these as `imbehind serve` and `imbehind answer`.
 5. Type your reply, and finish it with Ctrl+D (on Windows: Ctrl+Z, then Enter). Line breaks are normalized to `\n`, and the line breaks at the end are removed. An empty reply is not sent.
 6. `curl` receives a Chat Completions response with your text in `choices[0].message.content`, and `imbehind answer` prints `Sent.`.
 
-Press Ctrl+C to quit either command. A request that nobody has answered stays in the storage directory, and `imbehind answer` shows it again the next time it starts.
+Press Ctrl+C to quit either command. When you quit `imbehind serve`, a request that nobody has answered stays in the storage directory as it is, and the next `imbehind serve` ends it as `abandoned` (see Storage). `imbehind answer` only starts while a `imbehind serve` runs.
 
 ### Structured output
 
@@ -54,9 +54,9 @@ A message `content` can be a string, `null` (shown as `(empty)`), or an array of
 
 `imbehind answer` shows every `system` and `developer` message and the last three of the other messages. When it leaves messages out, it prints one line such as `(3 earlier messages omitted. Full conversation: <path>)`, where `<path>` is the `request.json` file with the whole conversation. A message longer than 200 lines is cut after 200 lines with a similar line. Control characters other than newline and tab are shown as `\xNN` (for example `\x1b`).
 
-Requests are stored under the user data directory: `$XDG_DATA_HOME/imbehind` (or `~/.local/share/imbehind`) on Linux, `~/Library/Application Support/imbehind` on macOS, and `%LOCALAPPDATA%\imbehind` on Windows. The storage directory must support hard links.
+Requests are stored in the storage directory (see Storage). The storage directory must support hard links.
 
-In this version `imbehind serve` always listens on `127.0.0.1:3000`, and it accepts text messages on `POST /v1/chat/completions`. A request with a browser `Origin` header, or with a `Host` header that is not `127.0.0.1` or `localhost`, is refused.
+`imbehind serve` accepts text messages on `POST /v1/chat/completions`, and answers `GET /v1/models` (see Model list). A request with a browser `Origin` header, or with a `Host` header that is not a local name, is refused. The local names are an address of `127.0.0.0/8` (such as `127.0.0.1`), `[::1]` and `localhost`, in any case and with or without a port.
 
 ### Skipping a request
 
@@ -97,6 +97,61 @@ const client = new OpenAI({
   timeout: 1800 * 1000,
 });
 ```
+
+## Settings
+
+`imbehind serve` has six settings. Each one comes from the command line option if you give it, else from the environment variable, else from the default. An empty environment variable counts as not set. Write an option as `--port 3100` or `--port=3100`.
+
+| Option | Environment variable | Default | Meaning |
+|---|---|---|---|
+| `--host` | `IMBEHIND_HOST` | `127.0.0.1` | The address to listen on. Only a local address is allowed: an address of `127.0.0.0/8`, `::1` (also written `[::1]`), or `localhost` when every address it names is local. |
+| `--port` | `IMBEHIND_PORT` | `3000` | The port, from 1 to 65535. |
+| `--dir` | `IMBEHIND_DIR` | the storage directory of your system (see Storage) | The storage directory. A relative path is made absolute from the folder where you start the command. |
+| `--timeout` | `IMBEHIND_TIMEOUT` | `1800` | How long to wait for a reply, in seconds, from 0 to 2147483. `0` means no limit. |
+| `--retention` | `IMBEHIND_RETENTION` | `86400` | How long a finished request is kept, in seconds, from 0 to 315360000. `0` means never delete. |
+| `--sweep-interval` | `IMBEHIND_SWEEP_INTERVAL` | `600` | How often old requests are looked for, in seconds, from 1 to 2147483. |
+
+`imbehind answer` and `imbehind path` take only `--dir` and `IMBEHIND_DIR`, and they find the same storage directory as `imbehind serve`. If you give `--port` or another option of `imbehind serve` to them, they stop with the usage line.
+
+`--retention` must not be shorter than `--timeout` when neither is 0, because a request could be deleted while it still waits. Every value is checked before anything is created or opened, in this order: the way the command is written, `--host`, `--port`, `--timeout`, `--retention`, `--sweep-interval`, `--dir`, then retention against timeout. The first problem is printed as one line and nothing else happens:
+
+```
+Error: 0.0.0.0 is not a local address. imbehind only listens on this machine (127.0.0.0/8, ::1, localhost).
+Error: --port must be a number from 1 to 65535 (got "abc").
+Error: --retention (600 seconds) must not be shorter than --timeout (1800 seconds).
+```
+
+The exit codes are 0 for success (`imbehind path`), 1 when a command cannot start or cannot read the storage directory (a port that is in use, an address that is not available, a storage directory that is used by another `imbehind serve`, `imbehind serve` not running for `imbehind answer`), 2 for a wrong way of writing the command or a value that is not allowed, and 130 for Ctrl+C.
+
+## Storage
+
+The default storage directory is `$XDG_DATA_HOME/imbehind` (or `~/.local/share/imbehind` when `XDG_DATA_HOME` is not set) on Linux, `~/Library/Application Support/imbehind` on macOS, and `%LOCALAPPDATA%\imbehind` on Windows. `imbehind path` prints the storage directory that the current options and variables choose, as one line, and exits with code 0. It does not create or read anything, so it works before the first start.
+
+```sh
+imbehind path
+IMBEHIND_DIR=/data/imbehind imbehind path
+```
+
+Only `imbehind serve` creates the storage directory. `imbehind answer` never creates it.
+
+- **Permissions.** On Linux and macOS, `imbehind serve` creates every folder with mode `0700` and every file with mode `0600`, so only you can use them. A folder that exists already is not changed, and a `reply.json` that you put there yourself keeps its mode (the `reply.accepted.json` that is made from it is always `0600`). On Windows no mode is set, and the permissions of your user profile apply.
+- **One serve for one directory.** `imbehind serve` writes `serve.lock` in the storage directory and renews it every 5 seconds. A second `imbehind serve` on the same directory stops with `Error: <directory> is already used by another imbehind serve.` A lock that was left by a `imbehind serve` that was killed is taken over by itself, as soon as its process is gone or its last renewal is more than 15 seconds old. A `serve.lock` that is not a lock file of this program is never read or deleted: `imbehind serve` stops and tells you to remove it if no `imbehind serve` uses the directory.
+- **Restart.** The requests that were still waiting when `imbehind serve` started (for example because the earlier one was stopped with Ctrl+C) are ended as `abandoned` right after the first line, one line each, such as `14:00:00 abandoned  c9d0e1  server restarted`. Their clients are gone, so they are not shown by `imbehind answer`.
+- **Old requests.** A finished request is deleted with its folder once `--retention` seconds have passed since it ended (24 hours by default). The check runs at the start and then every `--sweep-interval` seconds (10 minutes by default). A request that waits is never deleted. A folder is deleted only when it holds nothing but `request.json`, `state.json`, `reply.json`, `reply.accepted.json` and the hidden files named like `.reply.accepted.<pid>.<seq>.<hex>.tmp` (also `.state.…` and `.reply.…`) that a stopped `imbehind serve` can leave behind. If it holds any other file, it is kept as it is and `imbehind serve` prints a line such as `14:05:12 error      a1b2c3  kept unknown files` once for that request. With `--retention 0` nothing is deleted. Apart from those leftovers, files and folders whose names start with a dot, and files that this program did not make, are never read or deleted. A symbolic link in `requests/` is neither followed nor deleted.
+- **Without a serve.** When no `imbehind serve` runs, `imbehind answer` ends with exit code 1 and prints `Error: imbehind serve is not running for <directory>.` and `Start it with: imbehind serve`. If it cannot read the directory, it prints `Error: cannot read <directory>: <reason>.` It checks once, when it starts.
+
+### Model list
+
+`GET /v1/models` returns the same list every time, with no API key needed and without storing anything or printing a line:
+
+```json
+{
+  "object": "list",
+  "data": [{ "id": "imbehind", "object": "model", "created": 1791800000, "owned_by": "imbehind" }]
+}
+```
+
+Any other method on this path is refused with `405`.
 
 ## Development
 

@@ -41,18 +41,27 @@ export interface RequestFile extends ConversationRequest {
 }
 
 /** The states this version writes. A request leaves `waiting` once, for one of the others. */
-export type WrittenState = "waiting" | "replied" | "skipped" | "cancelled" | "timed_out";
+export type WrittenState =
+  | "waiting"
+  | "replied"
+  | "skipped"
+  | "cancelled"
+  | "timed_out"
+  | "abandoned";
 
-const WRITTEN_STATES: readonly string[] = [
+/** Every state this version knows by name: the written ones, and `invalid_reply`. */
+const KNOWN_STATES: readonly string[] = [
   "waiting",
   "replied",
   "skipped",
   "cancelled",
   "timed_out",
+  "abandoned",
+  "invalid_reply",
 ];
 
 /** `other` stands for any state this version does not know. It is read as a finished request. */
-type ExchangeState = WrittenState | "other";
+type ExchangeState = WrittenState | "invalid_reply" | "other";
 
 export interface StateFile {
   formatVersion: 1;
@@ -156,7 +165,7 @@ export function parseStateFile(data: unknown): Loaded<StateFile> {
   if (!isRecord(data) || data.formatVersion !== FORMAT_VERSION || typeof data.state !== "string") {
     return UNREADABLE;
   }
-  const state = WRITTEN_STATES.includes(data.state) ? (data.state as WrittenState) : "other";
+  const state = KNOWN_STATES.includes(data.state) ? (data.state as ExchangeState) : "other";
   return {
     kind: "ok",
     value: {

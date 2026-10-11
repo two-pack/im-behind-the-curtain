@@ -5,6 +5,7 @@ import {
   createReplyReader,
   normalizeReply,
   type ReadResult,
+  type ServeStatus,
 } from "../src/answer/answer-console.js";
 import { ExchangeBroker } from "../src/broker/exchange-broker.js";
 import { Logger, Screen } from "../src/log.js";
@@ -52,13 +53,20 @@ function separator(n: number, total: number, shortId: string): string {
   return head + "-".repeat(60 - head.length);
 }
 
-function setup(steps: Step[], store = new FakeStore()) {
+const STORAGE_DIR = "/home/alice/.local/share/imbehind";
+
+function setup(
+  steps: Step[],
+  store = new FakeStore(),
+  serveStatus: ServeStatus = { kind: "running" },
+) {
   const clock = new FakeClock();
   const out: string[] = [];
   const err: string[] = [];
   const stdout = { write: (text: string) => out.push(text) };
   const stderr = { write: (text: string) => err.push(text) };
   const logger = new Logger({ out: stdout, err: stderr, clock });
+  let serveChecks = 0;
   const makeBroker = () => new ExchangeBroker({ store, clock, pollIntervalMs: 500 });
   const broker = makeBroker();
   const serveBroker = makeBroker();
@@ -71,9 +79,15 @@ function setup(steps: Step[], store = new FakeStore()) {
     clock,
     reader,
     pollIntervalMs: 500,
+    storageDir: STORAGE_DIR,
+    checkServe: async () => {
+      serveChecks += 1;
+      return serveStatus;
+    },
   });
   const controller = new AbortController();
   return {
+    serveChecks: () => serveChecks,
     store,
     clock,
     reader,
@@ -104,6 +118,55 @@ function setup(steps: Step[], store = new FakeStore()) {
     },
   };
 }
+
+describe("the check that a serve runs", () => {
+  it("ends with exit 1 and the two lines of A-10 on standard error when serve is not running", async () => {
+    const t = setup([], new FakeStore(), { kind: "not-running" });
+    t.addWaiting();
+    expect(await t.start()).toBe(1);
+    expect(t.stderr()).toEqual([
+      `Error: imbehind serve is not running for ${STORAGE_DIR}.`,
+      "Start it with: imbehind serve",
+    ]);
+    expect(t.stdout()).toEqual([]);
+  });
+
+  it("ends with exit 1 and one line when the storage directory cannot be read", async () => {
+    const t = setup([], new FakeStore(), { kind: "unreadable", detail: "permission denied" });
+    expect(await t.start()).toBe(1);
+    expect(t.stderr()).toEqual([`Error: cannot read ${STORAGE_DIR}: permission denied.`]);
+    expect(t.stdout()).toEqual([]);
+  });
+
+  it("keeps an unreadable serve.lock apart from a missing or foreign one: one line with the reason, never the not-running lines", async () => {
+    for (const detail of ["input/output error", "not a directory"]) {
+      const t = setup([], new FakeStore(), { kind: "unreadable", detail });
+      t.addWaiting();
+      expect(await t.start()).toBe(1);
+      expect(t.stderr()).toEqual([`Error: cannot read ${STORAGE_DIR}: ${detail}.`]);
+      expect(t.stdout()).toEqual([]);
+    }
+  });
+
+  it("looks at nothing in the storage when it ends, and asks only once", async () => {
+    const t = setup([], new FakeStore(), { kind: "not-running" });
+    await t.start();
+    expect(t.serveChecks()).toBe(1);
+    expect(t.store.count("listIds")).toBe(0);
+    expect(t.store.count("readState")).toBe(0);
+  });
+
+  it("shows the requests as before when serve is running, and asks only once", async () => {
+    const t = setup([]);
+    const running = t.start();
+    await settle();
+    t.controller.abort();
+    expect(await running).toBe(130);
+    expect(t.serveChecks()).toBe(1);
+    expect(t.stdout()).toEqual([WAITING]);
+    expect(t.stderr()).toEqual([]);
+  });
+});
 
 describe("when nothing is waiting", () => {
   it("shows one waiting line however long it waits, and exits 130 on Ctrl+C", async () => {

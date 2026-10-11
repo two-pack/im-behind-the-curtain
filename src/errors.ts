@@ -14,6 +14,9 @@ export const IO_REASONS = [
   "link failed",
   "unreadable",
   "failed",
+  "delete failed",
+  "kept unknown files",
+  "abandon failed",
 ] as const;
 export type IoReason = (typeof IO_REASONS)[number];
 
@@ -55,8 +58,8 @@ export class InvalidOptionError extends StartupError {
   }
 }
 
-/** Process exit codes. Success (0) is not used in this version. */
-export const EXIT = { failure: 1, invalidOption: 2, interrupted: 130 } as const;
+/** Process exit codes. */
+export const EXIT = { success: 0, failure: 1, invalidOption: 2, interrupted: 130 } as const;
 
 export function errorCode(error: unknown): string | undefined {
   if (typeof error === "object" && error !== null && "code" in error) {

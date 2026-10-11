@@ -1,6 +1,17 @@
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { ExchangeBroker } from "../src/broker/exchange-broker.js";
 import { AlreadyExistsError, IoFailure, StartupError } from "../src/errors.js";
 import {
   type ConversationRequest,
@@ -9,7 +20,8 @@ import {
   createStateFile,
   serializeFile,
 } from "../src/model.js";
-import { ExchangeStore, nodeFs, type StoreFs } from "../src/store/exchange-store.js";
+import { ExchangeStore, isOwnTempName, nodeFs, type StoreFs } from "../src/store/exchange-store.js";
+import { FakeClock } from "./helpers/fake-clock.js";
 import { errno, makeTempDir } from "./helpers/fs.js";
 
 const ID = "20261009T140512123Z-a1b2c3";
@@ -546,4 +558,760 @@ describe("accepting a reply", () => {
     expect(read?.bytes).toBe(replyText);
     expect(read?.parsed.kind === "ok" && read.parsed.value.body).toBe("Hi");
   });
+});
+
+async function modeOf(target: string): Promise<number> {
+  return (await stat(target)).mode & 0o777;
+}
+
+describe.skipIf(process.platform === "win32")("permissions on Linux and macOS", () => {
+  it("creates the storage directory, every missing parent and requests/ with mode 0700", async () => {
+    const parent = await makeTempDir();
+    const root = path.join(parent, "a", "b", "imbehind");
+    await new ExchangeStore({ rootDir: root, platform: "linux" }).prepare();
+    expect(await modeOf(path.join(parent, "a"))).toBe(0o700);
+    expect(await modeOf(path.join(parent, "a", "b"))).toBe(0o700);
+    expect(await modeOf(root)).toBe(0o700);
+    expect(await modeOf(path.join(root, "requests"))).toBe(0o700);
+  });
+
+  it("does not change the mode of a directory that already exists", async () => {
+    const root = await makeTempDir();
+    await chmod(root, 0o755);
+    await mkdir(path.join(root, "requests"), { mode: 0o750 });
+    await chmod(path.join(root, "requests"), 0o750);
+    await new ExchangeStore({ rootDir: root, platform: "linux" }).prepare();
+    expect(await modeOf(root)).toBe(0o755);
+    expect(await modeOf(path.join(root, "requests"))).toBe(0o750);
+  });
+
+  it("creates a request directory with 0700 and its files with 0600", async () => {
+    const root = await makeTempDir();
+    const store = new ExchangeStore({ rootDir: root, platform: "linux" });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    const dir = path.join(root, "requests", ID);
+    expect(await modeOf(dir)).toBe(0o700);
+    expect(await modeOf(path.join(dir, "request.json"))).toBe(0o600);
+    expect(await modeOf(path.join(dir, "state.json"))).toBe(0o600);
+  });
+
+  it("keeps 0600 on a rewritten state.json and on reply.json and reply.accepted.json", async () => {
+    const root = await makeTempDir();
+    const store = new ExchangeStore({ rootDir: root, platform: "linux" });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    await store.writeState(createStateFile(ID, "replied", NOW, NOW));
+    await store.placeReply(ID, serializeFile(createReplyFile("Hi", NOW)));
+    await store.acceptReply(ID);
+    const dir = path.join(root, "requests", ID);
+    for (const name of ["state.json", "reply.json", "reply.accepted.json"]) {
+      expect(await modeOf(path.join(dir, name)), name).toBe(0o600);
+    }
+  });
+
+  it("gives every file it writes the mode 0600, hidden files included", async () => {
+    const written: Array<[string, number | undefined]> = [];
+    const root = await makeTempDir();
+    const store = new ExchangeStore({
+      rootDir: root,
+      platform: "linux",
+      fs: {
+        ...nodeFs,
+        writeFile: (file, data, mode) => {
+          written.push([path.basename(file), mode]);
+          return nodeFs.writeFile(file, data, mode);
+        },
+      },
+    });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    await store.writeState(createStateFile(ID, "replied", NOW, NOW));
+    await store.placeReply(ID, serializeFile(createReplyFile("Hi", NOW)));
+    expect(written.length).toBeGreaterThanOrEqual(5);
+    for (const [name, mode] of written) {
+      expect(mode, name).toBe(0o600);
+    }
+    expect(written.some(([name]) => name.startsWith("."))).toBe(true);
+  });
+
+  it("does not change the mode of a reply.json that the user placed", async () => {
+    const root = await makeTempDir();
+    const store = new ExchangeStore({ rootDir: root, platform: "linux" });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    const reply = path.join(root, "requests", ID, "reply.json");
+    await writeFile(reply, serializeFile(createReplyFile("Hand written", NOW)));
+    await chmod(reply, 0o644);
+    await store.acceptReply(ID);
+    expect(await modeOf(reply)).toBe(0o644);
+    expect(await store.readReply(ID, "reply.json")).toBeDefined();
+    expect(await modeOf(reply)).toBe(0o644);
+  });
+});
+
+describe("no modes on Windows", () => {
+  it("passes no mode to directories or files when the platform is win32", async () => {
+    const modes: Array<number | undefined> = [];
+    const root = await makeTempDir();
+    const store = new ExchangeStore({
+      rootDir: path.join(root, "imbehind"),
+      platform: "win32",
+      fs: {
+        ...nodeFs,
+        mkdir: (dir, options) => {
+          modes.push(options.mode);
+          return nodeFs.mkdir(dir, options);
+        },
+        writeFile: (file, data, mode) => {
+          modes.push(mode);
+          return nodeFs.writeFile(file, data, mode);
+        },
+      },
+    });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    await store.writeState(createStateFile(ID, "replied", NOW, NOW));
+    expect(modes.length).toBeGreaterThanOrEqual(5);
+    expect(modes.every((mode) => mode === undefined)).toBe(true);
+  });
+});
+
+describe("files that the server did not make", () => {
+  it("does not list, read or remove hidden entries, unknown names and request folders without state.json", async () => {
+    const { root, store, requests } = await newStore();
+    await writeFile(path.join(root, "notes.txt"), "mine");
+    await writeFile(path.join(requests, ".half.tmp"), "x");
+    await mkdir(path.join(requests, ".hidden-dir"));
+    await writeFile(path.join(requests, "readme.txt"), "mine");
+    await mkdir(path.join(requests, "not-an-id"));
+    await store.prepare();
+    expect(await store.listIds()).toEqual([]);
+    expect(await names(requests)).toEqual([".half.tmp", ".hidden-dir", "not-an-id", "readme.txt"]);
+    expect(await names(root)).toEqual(["notes.txt", "requests"]);
+  });
+});
+
+describe("removing a request", () => {
+  const FOUR = ["reply.accepted.json", "reply.json", "request.json", "state.json"];
+
+  async function withFourFiles(overrides: Partial<StoreFs> = {}) {
+    const t = await newStore(overrides);
+    await t.store.createRequest(sampleRequest(), sampleState());
+    await t.store.placeReply(ID, serializeFile(createReplyFile("Hi", NOW)));
+    await t.store.acceptReply(ID);
+    return { ...t, dir: path.join(t.requests, ID) };
+  }
+
+  it("removes the four known files and then the folder", async () => {
+    const { store, dir, requests } = await withFourFiles();
+    expect(await names(dir)).toEqual(FOUR);
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("removes state.json last, so a stop in between leaves a request that can be swept again", async () => {
+    const order: string[] = [];
+    const { store } = await withFourFiles({
+      unlink: (file) => {
+        order.push(path.basename(file));
+        return nodeFs.unlink(file);
+      },
+    });
+    await store.removeRequest(ID);
+    expect(order[order.length - 1]).toBe("state.json");
+    expect([...order].sort()).toEqual(FOUR);
+  });
+
+  it("removes a leftover own temp file with the four known files, and state.json still goes last", async () => {
+    const order: string[] = [];
+    const { store, dir, requests } = await withFourFiles({
+      unlink: (file) => {
+        order.push(path.basename(file));
+        return nodeFs.unlink(file);
+      },
+    });
+    await writeFile(path.join(dir, LEFTOVER), "left over");
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+    expect(order).toContain(LEFTOVER);
+    expect(order[order.length - 1]).toBe("state.json");
+  });
+
+  it("keeps everything when an own temp file is next to a file that is not known", async () => {
+    const { store, dir } = await withFourFiles();
+    await writeFile(path.join(dir, LEFTOVER), "left over");
+    await writeFile(path.join(dir, "notes.txt"), "mine");
+    expect(await store.removeRequest(ID)).toBe("kept");
+    expect(await names(dir)).toEqual([...FOUR, LEFTOVER, "notes.txt"].sort());
+  });
+
+  it("removes a leftover temp file of each kind the store writes: state, reply and reply.accepted", async () => {
+    for (const kind of ["state", "reply", "reply.accepted"]) {
+      const { store, dir, requests } = await withFourFiles();
+      await writeFile(path.join(dir, `.${kind}.31337.12.0a1b2c3d.tmp`), "left over");
+      expect(await store.removeRequest(ID)).toBe("removed");
+      expect(await names(requests)).toEqual([]);
+    }
+  });
+
+  it("keeps everything when a dot file is not exactly of the temporary form", async () => {
+    const strangers = [
+      ".reply.accepted.tmp",
+      ".reply.accepted.123.4.tmp",
+      ".reply.accepted.x.4.0a1b2c3d.tmp",
+      ".reply.accepted.123.y.0a1b2c3d.tmp",
+      ".reply.accepted.123.4.0A1B2C3D.tmp",
+      ".reply.accepted.123.4.xyz.tmp",
+      ".reply.accepted.123.4.0a1b2c3d.tmp.bak",
+      "x.reply.accepted.123.4.0a1b2c3d.tmp",
+      "..reply.accepted.123.4.0a1b2c3d.tmp",
+      ".link-check.123.4.0a1b2c3d.tmp",
+      ".serve-lock.123.4.0a1b2c3d.tmp",
+      ".other.123.4.0a1b2c3d.tmp",
+    ];
+    for (const stranger of strangers) {
+      const { store, dir } = await withFourFiles();
+      await writeFile(path.join(dir, stranger), "mine");
+      expect(await store.removeRequest(ID)).toBe("kept");
+      expect(await names(dir)).toEqual([...FOUR, stranger].sort());
+    }
+  });
+
+  it("keeps everything when the folder holds any other file", async () => {
+    for (const stranger of ["notes.txt", ".half.tmp", "reply.json.bak"]) {
+      const { store, dir } = await withFourFiles();
+      await writeFile(path.join(dir, stranger), "mine");
+      expect(await store.removeRequest(ID)).toBe("kept");
+      expect(await names(dir)).toEqual([...FOUR, stranger].sort());
+    }
+  });
+
+  describe.skipIf(process.platform === "win32")("entries that are not regular files", () => {
+    const LINK_TARGET_NAME = "target.txt";
+
+    async function replaceWith(
+      dir: string,
+      name: string,
+      make: (full: string, outside: string) => Promise<void>,
+    ): Promise<string> {
+      const outside = path.join(await makeTempDir(), LINK_TARGET_NAME);
+      await writeFile(outside, "mine");
+      await rm(path.join(dir, name), { force: true });
+      await make(path.join(dir, name), outside);
+      return outside;
+    }
+
+    const TEMP_FORM = ".state.31337.1.0a1b2c3d.tmp";
+    const NAMES = ["reply.json", "request.json", TEMP_FORM];
+
+    for (const name of NAMES) {
+      it(`keeps everything when ${name} is a directory`, async () => {
+        const { store, dir } = await withFourFiles();
+        await replaceWith(dir, name, (full) => mkdir(full));
+        const before = await names(dir);
+        expect(await store.removeRequest(ID)).toBe("kept");
+        expect(await names(dir)).toEqual(before);
+        expect(await names(dir)).toContain("state.json");
+      });
+
+      it(`keeps everything, and does not follow it, when ${name} is a symbolic link`, async () => {
+        const { store, dir } = await withFourFiles();
+        const outside = await replaceWith(dir, name, (full, target) => symlink(target, full));
+        const before = await names(dir);
+        expect(await store.removeRequest(ID)).toBe("kept");
+        expect(await names(dir)).toEqual(before);
+        expect(await readFile(outside, "utf8")).toBe("mine");
+      });
+    }
+
+    it("keeps everything when a symbolic link has no target", async () => {
+      const { store, dir } = await withFourFiles();
+      await symlink(path.join(dir, "nowhere"), path.join(dir, ".state.31337.1.0a1b2c3d.tmp"));
+      expect(await store.removeRequest(ID)).toBe("kept");
+      expect(await names(dir)).toEqual([...FOUR, ".state.31337.1.0a1b2c3d.tmp"].sort());
+    });
+  });
+
+  it("keeps state.json when another file shows up while the others are being removed", async () => {
+    let listings = 0;
+    const { store, dir } = await withFourFiles({
+      readdir: async (target) => {
+        const found = await nodeFs.readdir(target);
+        listings += 1;
+        return listings === 2 && target.endsWith(ID) ? [...found, "late.txt"] : found;
+      },
+    });
+    expect(await store.removeRequest(ID)).toBe("kept");
+    expect(await names(dir)).toContain("state.json");
+  });
+
+  it("fails with an IoFailure of the reason delete failed when a file cannot be removed", async () => {
+    const { store, dir } = await withFourFiles({
+      unlink: () => Promise.reject(errno("EBUSY")),
+    });
+    const failure = store.removeRequest(ID);
+    await expect(failure).rejects.toBeInstanceOf(IoFailure);
+    await expect(failure).rejects.toMatchObject({
+      reason: "delete failed",
+      detail: "resource busy or locked",
+    });
+    expect(await names(dir)).toEqual(FOUR);
+  });
+
+  it("fails with delete failed when the folder cannot be removed", async () => {
+    const { store } = await withFourFiles({ rmdir: () => Promise.reject(errno("EPERM")) });
+    await expect(store.removeRequest(ID)).rejects.toMatchObject({ reason: "delete failed" });
+  });
+
+  it("treats a folder that is already gone as removed", async () => {
+    const { store } = await newStore();
+    expect(await store.removeRequest(ID)).toBe("removed");
+  });
+});
+
+/** What a stopped accept leaves: a hidden copy in the temporary form. */
+const LEFTOVER = ".reply.accepted.31337.12.0a1b2c3d.tmp";
+
+/** Stands for the name of the hidden copy that an accept made, wherever one is compared. */
+const ACCEPT_TMP = "<accept-tmp>";
+
+/** Whether a name is one of an accept's hidden copies, as the writer builds it. */
+function isAcceptTemp(name: string): boolean {
+  return /^\.reply\.accepted\.\d+\.\d+\.[0-9a-f]+\.tmp$/.test(name);
+}
+
+/** The names with every hidden copy of an accept written as ACCEPT_TMP, sorted. */
+function normalized(list: readonly string[]): string[] {
+  return list.map((name) => (isAcceptTemp(name) ? ACCEPT_TMP : name)).sort();
+}
+
+describe("accepting a reply through a hidden copy", () => {
+  const replyText = serializeFile(createReplyFile("Hi", NOW));
+
+  /** A store on Linux rules whose request already holds the reply.json of the user. */
+  async function withUserReply(overrides: Partial<StoreFs> = {}) {
+    const root = await makeTempDir();
+    const store = new ExchangeStore({
+      rootDir: root,
+      platform: "linux",
+      fs: { ...nodeFs, ...overrides },
+    });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    const dir = path.join(root, "requests", ID);
+    await writeFile(path.join(dir, "reply.json"), replyText);
+    return { root, store, dir };
+  }
+
+  describe.skipIf(process.platform === "win32")("modes", () => {
+    it("makes reply.accepted.json 0600 from a reply.json of mode 0644, and leaves reply.json alone", async () => {
+      const { store, dir } = await withUserReply();
+      await chmod(path.join(dir, "reply.json"), 0o644);
+      await store.acceptReply(ID);
+      expect(await modeOf(path.join(dir, "reply.accepted.json"))).toBe(0o600);
+      expect(await modeOf(path.join(dir, "reply.json"))).toBe(0o644);
+      expect(await readFile(path.join(dir, "reply.json"), "utf8")).toBe(replyText);
+      expect(await readFile(path.join(dir, "reply.accepted.json"), "utf8")).toBe(replyText);
+    });
+
+    it("does not link reply.json itself: the two files are different files", async () => {
+      const { store, dir } = await withUserReply();
+      await store.acceptReply(ID);
+      const accepted = await stat(path.join(dir, "reply.accepted.json"));
+      const original = await stat(path.join(dir, "reply.json"));
+      expect(accepted.ino).not.toBe(original.ino);
+      expect(accepted.nlink).toBe(1);
+    });
+
+    it("makes the hidden copy 0600 and leaves a leftover of another accept with a wider mode alone", async () => {
+      const { store, dir } = await withUserReply();
+      await writeFile(path.join(dir, LEFTOVER), "other");
+      await chmod(path.join(dir, LEFTOVER), 0o666);
+      await store.acceptReply(ID);
+      expect(await modeOf(path.join(dir, "reply.accepted.json"))).toBe(0o600);
+      expect(await modeOf(path.join(dir, LEFTOVER))).toBe(0o666);
+    });
+  });
+
+  it("reads reply.json, writes the hidden copy, links it, removes it, in that order", async () => {
+    const steps: string[] = [];
+    const { store, dir } = await withUserReply({
+      readFile: (file) => {
+        steps.push(`read ${path.basename(file)}`);
+        return nodeFs.readFile(file);
+      },
+      writeFile: (file, data, mode) => {
+        steps.push(`write ${path.basename(file)} ${mode?.toString(8)}`);
+        return nodeFs.writeFile(file, data, mode);
+      },
+      link: (existing, target) => {
+        steps.push(`link ${path.basename(existing)} ${path.basename(target)}`);
+        return nodeFs.link(existing, target);
+      },
+      rm: (target, options) => {
+        steps.push(`rm ${path.basename(target)}`);
+        return nodeFs.rm(target, options);
+      },
+      unlink: (file) => {
+        steps.push(`unlink ${path.basename(file)}`);
+        return nodeFs.unlink(file);
+      },
+    });
+    steps.length = 0;
+    await store.acceptReply(ID);
+    await store.removeReply(ID);
+    expect(steps.map((step) => step.replace(/\.reply\.accepted\.[^ ]+\.tmp/g, ACCEPT_TMP))).toEqual(
+      [
+        "read reply.json",
+        `write ${ACCEPT_TMP} 600`,
+        `link ${ACCEPT_TMP} reply.accepted.json`,
+        `rm ${ACCEPT_TMP}`,
+        "unlink reply.json",
+      ],
+    );
+    const named = steps
+      .filter((step) => step.includes(".reply.accepted."))
+      .map((step) => step.split(" "));
+    expect(new Set(named.flatMap((parts) => parts.filter(isAcceptTemp))).size).toBe(1);
+    expect(await names(dir)).toEqual(["reply.accepted.json", "request.json", "state.json"]);
+  });
+
+  it("does not remove or touch a hidden copy it did not make, whatever the outcome", async () => {
+    const removed: string[] = [];
+    const watch: Partial<StoreFs> = {
+      rm: (target, options) => {
+        removed.push(path.basename(target));
+        return nodeFs.rm(target, options);
+      },
+      unlink: (file) => {
+        removed.push(path.basename(file));
+        return nodeFs.unlink(file);
+      },
+    };
+    const { store, dir } = await withUserReply(watch);
+    await writeFile(path.join(dir, LEFTOVER), "left by a stopped serve");
+    await store.acceptReply(ID);
+    await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    expect(await readFile(path.join(dir, "reply.accepted.json"), "utf8")).toBe(replyText);
+    expect(await readFile(path.join(dir, LEFTOVER), "utf8")).toBe("left by a stopped serve");
+    expect(removed.filter((name) => name === LEFTOVER)).toEqual([]);
+    // One removal for each accept, and each is the accept's own copy.
+    expect(removed.filter(isAcceptTemp)).toHaveLength(2);
+    expect(await names(dir)).toEqual(
+      [LEFTOVER, "reply.accepted.json", "reply.json", "request.json", "state.json"].sort(),
+    );
+  });
+
+  it("uses a new name for every accept, of the form .reply.accepted.<pid>.<seq>.<hex>.tmp", async () => {
+    const written: string[] = [];
+    const { store } = await withUserReply({
+      writeFile: (file, data, mode) => {
+        written.push(path.basename(file));
+        return nodeFs.writeFile(file, data, mode);
+      },
+    });
+    written.length = 0;
+    await store.acceptReply(ID);
+    for (let i = 0; i < 4; i += 1) {
+      await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    }
+    expect(written).toHaveLength(5);
+    expect(written.every(isAcceptTemp)).toBe(true);
+    expect(new Set(written).size).toBe(5);
+    expect(written[0]).toMatch(
+      new RegExp(`^\\.reply\\.accepted\\.${process.pid}\\.\\d+\\.[0-9a-f]{8}\\.tmp$`),
+    );
+  });
+
+  it("gives two accepts different names even with the same random part, because of the counter", async () => {
+    const written: string[] = [];
+    const root = await makeTempDir();
+    const store = new ExchangeStore({
+      rootDir: root,
+      randomHex: () => "aaaaaaaa",
+      fs: {
+        ...nodeFs,
+        writeFile: (file, data, mode) => {
+          written.push(path.basename(file));
+          return nodeFs.writeFile(file, data, mode);
+        },
+      },
+    });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    await writeFile(path.join(root, "requests", ID, "reply.json"), replyText);
+    written.length = 0;
+    await store.acceptReply(ID);
+    await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    expect(written).toHaveLength(2);
+    expect(written[0]).not.toBe(written[1]);
+  });
+
+  it("accepts every name the writer can produce as a name that a delete may remove", async () => {
+    const written: string[] = [];
+    const { store, dir } = await withUserReply({
+      writeFile: (file, data, mode) => {
+        written.push(path.basename(file));
+        return nodeFs.writeFile(file, data, mode);
+      },
+    });
+    written.length = 0;
+    await store.writeState(sampleState());
+    await store.placeReply(ID, replyText).catch(() => undefined);
+    await store.acceptReply(ID);
+    expect(written.length).toBeGreaterThanOrEqual(3);
+    for (const name of written) {
+      expect(isOwnTempName(name)).toBe(true);
+    }
+    // And a folder that holds such a name next to the known files is deleted.
+    for (const name of written) {
+      await writeFile(path.join(dir, name), "left over");
+    }
+    await writeFile(path.join(dir, "reply.accepted.json"), replyText);
+    expect(await store.removeRequest(ID)).toBe("removed");
+  });
+
+  it("lets two accepts of one request run together: reply.accepted.json is never empty or partial", async () => {
+    const root = await makeTempDir();
+    const text = serializeFile(createReplyFile("x".repeat(20000), NOW));
+    const observed: string[] = [];
+    const inFlight = { stop: false };
+    // Both accepts write in pieces. The second one starts writing only after the first one has
+    // written two pieces, so a file that both write to would be cut off under the first one.
+    const progress = { pieces: 0 };
+    const slowFs = (isSecond: boolean): StoreFs => ({
+      ...nodeFs,
+      writeFile: async (file, data, mode) => {
+        for (let turns = 0; isSecond && progress.pieces < 2 && turns < 1000; turns += 1) {
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        const handle = await open(file, "w", mode);
+        try {
+          for (let at = 0; at < data.length; at += 5000) {
+            await handle.write(data.slice(at, at + 5000));
+            progress.pieces += isSecond ? 0 : 1;
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+        } finally {
+          await handle.close();
+        }
+      },
+    });
+    const first = new ExchangeStore({ rootDir: root, fs: slowFs(false) });
+    const second = new ExchangeStore({ rootDir: root, fs: slowFs(true) });
+    await first.prepare();
+    const observer = (async () => {
+      while (!inFlight.stop) {
+        for (const id of [ID, OTHER_ID]) {
+          try {
+            observed.push(
+              await readFile(path.join(root, "requests", id, "reply.accepted.json"), "utf8"),
+            );
+          } catch {
+            // Not there yet.
+          }
+        }
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+    for (const id of [ID, OTHER_ID]) {
+      await first.createRequest(sampleRequest(id), sampleState(id));
+      await writeFile(path.join(root, "requests", id, "reply.json"), text);
+      progress.pieces = 0;
+      const results = await Promise.allSettled([first.acceptReply(id), second.acceptReply(id)]);
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      expect(
+        results.filter((r) => r.status === "rejected" && r.reason instanceof AlreadyExistsError),
+      ).toHaveLength(1);
+      expect(await readFile(path.join(root, "requests", id, "reply.accepted.json"), "utf8")).toBe(
+        text,
+      );
+      expect(
+        (await names(path.join(root, "requests", id))).filter((n) => n.startsWith(".")),
+      ).toEqual([]);
+    }
+    inFlight.stop = true;
+    await observer;
+    expect(observed.length).toBeGreaterThan(0);
+    expect(observed.every((seen) => seen === text)).toBe(true);
+  });
+
+  it("removes the hidden copy when reply.accepted.json already exists, and keeps the old one", async () => {
+    const { store, dir } = await withUserReply();
+    await writeFile(path.join(dir, "reply.accepted.json"), "first");
+    await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    expect(await names(dir)).toEqual([
+      "reply.accepted.json",
+      "reply.json",
+      "request.json",
+      "state.json",
+    ]);
+    expect(await readFile(path.join(dir, "reply.accepted.json"), "utf8")).toBe("first");
+  });
+
+  it("removes the hidden copy when the link fails for another reason, and changes nothing else", async () => {
+    const { store, dir } = await withUserReply({
+      link: (existing, target) =>
+        path.basename(target) === "reply.accepted.json"
+          ? Promise.reject(errno("EPERM"))
+          : nodeFs.link(existing, target),
+    });
+    const failure = store.acceptReply(ID);
+    await expect(failure).rejects.toBeInstanceOf(IoFailure);
+    await expect(failure).rejects.toMatchObject({ reason: "link failed" });
+    expect(await names(dir)).toEqual(["reply.json", "request.json", "state.json"]);
+    expect(await readFile(path.join(dir, "reply.json"), "utf8")).toBe(replyText);
+  });
+
+  it("removes the hidden copy when writing it fails, and reports write failed", async () => {
+    const { store, dir } = await withUserReply({
+      writeFile: async (file, data, mode) => {
+        if (isAcceptTemp(path.basename(file))) {
+          await nodeFs.writeFile(file, data.slice(0, 3), mode);
+          throw errno("ENOSPC");
+        }
+        return nodeFs.writeFile(file, data, mode);
+      },
+    });
+    await expect(store.acceptReply(ID)).rejects.toMatchObject({ reason: "write failed" });
+    expect(await names(dir)).toEqual(["reply.json", "request.json", "state.json"]);
+  });
+
+  it("reports a reply.json that cannot be read as read failed", async () => {
+    const { store, dir } = await withUserReply({
+      readFile: (file) =>
+        path.basename(file) === "reply.json" ? Promise.reject(errno("EIO")) : nodeFs.readFile(file),
+    });
+    await expect(store.acceptReply(ID)).rejects.toMatchObject({ reason: "read failed" });
+    expect(await names(dir)).toEqual(["reply.json", "request.json", "state.json"]);
+  });
+});
+
+describe("a stop between the steps of accepting a reply", () => {
+  const replyText = serializeFile(createReplyFile("Hi", NOW));
+
+  /** A store whose operations fail the way a stop between two steps leaves the files. */
+  /**
+   * Operations that leave the hidden copy in place once the link was tried, as a stop right after
+   * the link would. `link` replaces the link itself when given.
+   */
+  function keepsHiddenCopyAfterLink(link?: () => Promise<void>): Partial<StoreFs> {
+    let linkTried = false;
+    return {
+      link: (existing, target) => {
+        linkTried = true;
+        return link ? link() : nodeFs.link(existing, target);
+      },
+      rm: (target, options) =>
+        linkTried && isAcceptTemp(path.basename(target))
+          ? Promise.reject(errno("EIO"))
+          : nodeFs.rm(target, options),
+    };
+  }
+
+  const stops: Array<[string, () => Partial<StoreFs>, string[]]> = [
+    [
+      "after the hidden copy was written, before the link",
+      () => keepsHiddenCopyAfterLink(() => Promise.reject(errno("EIO"))),
+      ["reply.json", "request.json", "state.json", ACCEPT_TMP],
+    ],
+    [
+      "after the link, before the hidden copy was removed",
+      () => ({
+        ...keepsHiddenCopyAfterLink(),
+        unlink: () => Promise.reject(errno("EIO")),
+      }),
+      ["reply.accepted.json", "reply.json", "request.json", "state.json", ACCEPT_TMP],
+    ],
+    [
+      "after the hidden copy was removed, before reply.json was removed",
+      () => ({ unlink: () => Promise.reject(errno("EIO")) }),
+      ["reply.accepted.json", "reply.json", "request.json", "state.json"],
+    ],
+    [
+      "after reply.json was removed, before state.json was written",
+      () => ({ rename: () => Promise.reject(errno("EIO")) }),
+      ["reply.accepted.json", "request.json", "state.json"],
+    ],
+  ];
+
+  for (const [when, failing, expected] of stops) {
+    it(`finishes the request on the next poll of a new serve: ${when}`, async () => {
+      const root = await makeTempDir();
+      const dir = path.join(root, "requests", ID);
+      const first = new ExchangeStore({ rootDir: root, fs: { ...nodeFs } });
+      await first.prepare();
+      await first.createRequest(sampleRequest(), sampleState());
+      await writeFile(path.join(dir, "reply.json"), replyText);
+
+      // The first serve is stopped by failures of the file operations after the one that counts.
+      const crashing = new ExchangeStore({ rootDir: root, fs: { ...nodeFs, ...failing() } });
+      const crashed = new ExchangeBroker({
+        store: crashing,
+        clock: new FakeClock(),
+        pollIntervalMs: 500,
+      });
+      await crashed.pollOnce();
+      expect(normalized(await names(dir))).toEqual(normalized(expected));
+      const waiting = await first.readState(ID);
+      expect(waiting.kind === "ok" && waiting.value.state).toBe("waiting");
+
+      const next = new ExchangeBroker({
+        store: new ExchangeStore({ rootDir: root }),
+        clock: new FakeClock(),
+        pollIntervalMs: 500,
+      });
+      await next.pollOnce();
+      const state = await first.readState(ID);
+      expect(state.kind === "ok" && state.value.state).toBe("replied");
+      expect(await readFile(path.join(dir, "reply.accepted.json"), "utf8")).toBe(replyText);
+      expect(await names(dir)).not.toContain("reply.json");
+    });
+  }
+
+  it("tries again on the next poll when the link fails for a reason other than 'exists'", async () => {
+    const root = await makeTempDir();
+    let failures = 1;
+    const store = new ExchangeStore({
+      rootDir: root,
+      fs: {
+        ...nodeFs,
+        link: (existing, target) => {
+          if (path.basename(target) === "reply.accepted.json" && failures-- > 0) {
+            return Promise.reject(errno("EIO"));
+          }
+          return nodeFs.link(existing, target);
+        },
+      },
+    });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    const dir = path.join(root, "requests", ID);
+    await writeFile(path.join(dir, "reply.json"), replyText);
+    const broker = new ExchangeBroker({ store, clock: new FakeClock(), pollIntervalMs: 500 });
+    await broker.pollOnce();
+    expect((await store.readState(ID)).kind === "ok").toBe(true);
+    const waiting = await store.readState(ID);
+    expect(waiting.kind === "ok" && waiting.value.state).toBe("waiting");
+    expect(await names(dir)).toEqual(["reply.json", "request.json", "state.json"]);
+    await broker.pollOnce();
+    const replied = await store.readState(ID);
+    expect(replied.kind === "ok" && replied.value.state).toBe("replied");
+  });
+});
+
+describe("request folders that are not real directories", () => {
+  it.skipIf(process.platform === "win32")(
+    "does not list a symbolic link that is named like a request id",
+    async () => {
+      const { store, requests } = await newStore();
+      await store.createRequest(sampleRequest(), sampleState());
+      const elsewhere = await makeTempDir();
+      await writeFile(path.join(elsewhere, "state.json"), "{}");
+      await symlink(elsewhere, path.join(requests, OTHER_ID));
+      expect(await store.listIds()).toEqual([ID]);
+      expect(await store.maxId()).toBe(ID);
+    },
+  );
 });

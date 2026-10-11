@@ -45,6 +45,9 @@ const TEXT = {
   requiredShape: "Required shape:",
   anyJson: "Any JSON value is accepted as long as it is valid JSON.",
   notJson: (reason: string) => `Not sent: your reply is not valid JSON (${reason}).`,
+  serveNotRunning: (dir: string) => `Error: imbehind serve is not running for ${dir}.`,
+  startServe: "Start it with: imbehind serve",
+  cannotRead: (dir: string, detail: string) => `Error: cannot read ${dir}: ${detail}.`,
 } as const;
 
 /** The word shown after "Reply:" for each kind of reply. */
@@ -270,6 +273,15 @@ function formatReceived(iso: string): string {
   return `${day} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+/**
+ * What a look at the lock of the storage directory found: a serve runs, no serve
+ * runs, or the directory cannot be read (the reason is a short fixed phrase).
+ */
+export type ServeStatus =
+  | { kind: "running" }
+  | { kind: "not-running" }
+  | { kind: "unreadable"; detail: string };
+
 export interface AnswerConsoleOptions {
   broker: ExchangeBroker;
   /** Where requests and notices go. */
@@ -280,6 +292,10 @@ export interface AnswerConsoleOptions {
   clock: Clock;
   reader: ReplyReader;
   pollIntervalMs: number;
+  /** The storage directory, for the sentences about it. */
+  storageDir: string;
+  /** Looks at the lock of the storage directory once, when the screen starts. */
+  checkServe: () => Promise<ServeStatus>;
 }
 
 /** What a request that ended while the person was busy tells: the client left, or time ran out. */
@@ -327,14 +343,33 @@ export class AnswerConsole {
     this.options = options;
   }
 
-  /** Runs until Ctrl+C (the signal aborts) or until the input is closed. Returns the exit code. */
+  /**
+   * Runs until Ctrl+C (the signal aborts) or until the input is closed. Returns the exit code.
+   * It ends at once with exit code 1 when no serve runs for the storage directory.
+   */
   async run(signal: AbortSignal): Promise<number> {
+    if (!(await this.serveIsRunning())) {
+      return EXIT.failure;
+    }
     const unsubscribe = this.options.broker.subscribe((event) => this.relay(event));
     try {
       return await this.loop(signal);
     } finally {
       unsubscribe();
     }
+  }
+
+  /** Checks that a serve is running. A sentence goes to standard error when it fails. */
+  private async serveIsRunning(): Promise<boolean> {
+    const { checkServe, errorScreen, storageDir } = this.options;
+    const status = await checkServe();
+    if (status.kind === "unreadable") {
+      errorScreen.line(TEXT.cannotRead(storageDir, status.detail));
+    } else if (status.kind === "not-running") {
+      errorScreen.line(TEXT.serveNotRunning(storageDir));
+      errorScreen.line(TEXT.startServe);
+    }
+    return status.kind === "running";
   }
 
   private async loop(signal: AbortSignal): Promise<number> {

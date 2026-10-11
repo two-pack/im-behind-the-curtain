@@ -1285,3 +1285,210 @@ describe("what a screen learns about the reply it placed", () => {
     expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "pending" });
   });
 });
+
+describe("abandoning the requests an earlier run left waiting (BR22)", () => {
+  const A = "20261009T100000000Z-aaaaaa";
+  const B = "20261009T100001000Z-bbbbbb";
+  const C = "20261009T100002000Z-cccccc";
+
+  function addRequest(
+    store: FakeStore,
+    id: string,
+    state: "waiting" | "replied" | "skipped" = "waiting",
+  ) {
+    store.addRaw(id, {
+      request: createRequestFile(id, NOW, request),
+      state: createStateFile(id, state, NOW, state === "waiting" ? null : NOW),
+    });
+  }
+
+  it("lists the ids of the requests that wait, in id order, and no others", async () => {
+    const { store, broker } = setup();
+    addRequest(store, C);
+    addRequest(store, A);
+    addRequest(store, B, "replied");
+    store.addRaw("20261009T100003000Z-dddddd", { request: "unreadable", state: "unreadable" });
+    store.addRaw("20261009T100004000Z-eeeeee", { request: "unreadable", state: "missing" });
+    expect(await broker.snapshotWaiting()).toEqual([A, C]);
+  });
+
+  it("fails with an IoFailure when the storage cannot be read", async () => {
+    const { store, broker } = setup();
+    store.fail("listIds");
+    await expect(broker.snapshotWaiting()).rejects.toBeInstanceOf(IoFailure);
+  });
+
+  it("sets state, endedAt, updatedAt and endReason, one request at a time in the given order", async () => {
+    const { store, broker, events, clock } = setup();
+    addRequest(store, A);
+    addRequest(store, B);
+    await broker.abandon([A, B]);
+    const expected = createStateFile(
+      A,
+      "abandoned",
+      clock.now().toISOString(),
+      clock.now().toISOString(),
+      "server restarted",
+    );
+    expect(store.entries.get(A)?.state).toEqual(expected);
+    expect(store.entries.get(B)?.state).toEqual({ ...expected, id: B });
+    expect(events).toEqual([
+      { type: "abandoned", id: A },
+      { type: "abandoned", id: B },
+    ]);
+  });
+
+  it("reads the state again and leaves a request that is no longer waiting", async () => {
+    const { store, broker, events } = setup();
+    addRequest(store, A, "replied");
+    await broker.abandon([A]);
+    expect(stateOf(store, A)).toBe("replied");
+    expect(events).toEqual([]);
+  });
+
+  it("abandons a request that has a reply file without reading the reply", async () => {
+    const { store, broker } = setup();
+    addRequest(store, A);
+    store.putFile(A, "reply.json", replyBytes("late"));
+    await broker.abandon([A]);
+    expect(stateOf(store, A)).toBe("abandoned");
+    expect(store.count("readReply")).toBe(0);
+    await broker.pollOnce();
+    expect(stateOf(store, A)).toBe("abandoned");
+    expect(store.count("readReply")).toBe(0);
+  });
+
+  it("does not touch a request that arrives after the list was made", async () => {
+    const { store, broker } = setup();
+    addRequest(store, A);
+    const snapshot = await broker.snapshotWaiting();
+    const later = await submitWaiting(broker);
+    await broker.abandon(snapshot);
+    expect(stateOf(store, A)).toBe("abandoned");
+    expect(stateOf(store, later.id)).toBe("waiting");
+  });
+
+  it("keeps a request out of the poll when it could not be abandoned, and says so once", async () => {
+    const { store, broker, events } = setup();
+    addRequest(store, A);
+    store.putFile(A, "reply.json", replyBytes("late"));
+    store.fail("writeState", 2);
+    await broker.abandon([A]);
+    expect(stateOf(store, A)).toBe("waiting");
+    expect(events).toEqual([{ type: "error", id: A, reason: "abandon failed" }]);
+    await broker.pollOnce();
+    expect(stateOf(store, A)).toBe("waiting");
+    expect(events.some((event) => event.type === "replied")).toBe(false);
+    expect(store.count("readReply")).toBe(0);
+  });
+
+  it("tries again every 5 seconds, and stops keeping the request out when it works", async () => {
+    const { store, broker, events, clock } = setup();
+    addRequest(store, A);
+    store.fail("writeState", 1);
+    await broker.abandon([A]);
+    expect(store.count("writeState")).toBe(1);
+    await clock.advance(4999);
+    await broker.pollOnce();
+    expect(store.count("writeState")).toBe(1);
+    await clock.advance(1);
+    await broker.pollOnce();
+    expect(store.count("writeState")).toBe(2);
+    expect(stateOf(store, A)).toBe("abandoned");
+    expect(events.filter((event) => event.type === "abandoned")).toEqual([
+      { type: "abandoned", id: A },
+    ]);
+    await clock.advance(10000);
+    await broker.pollOnce();
+    expect(store.count("writeState")).toBe(2);
+  });
+
+  it("goes on trying while it keeps failing, and says the failure only once", async () => {
+    const { store, broker, events, clock } = setup();
+    addRequest(store, A);
+    store.fail("writeState", 3);
+    await broker.abandon([A]);
+    await clock.advance(5000);
+    await broker.pollOnce();
+    await clock.advance(5000);
+    await broker.pollOnce();
+    expect(store.count("writeState")).toBe(3);
+    expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+    await clock.advance(5000);
+    await broker.pollOnce();
+    expect(stateOf(store, A)).toBe("abandoned");
+  });
+
+  it("still shows the kept-out request in the list for answer", async () => {
+    const { store, broker } = setup();
+    addRequest(store, A);
+    store.fail("writeState", 1);
+    await broker.abandon([A]);
+    const listing = await broker.listWaiting(new Set());
+    expect(listing.waiting.map((item) => item.id)).toEqual([A]);
+  });
+
+  it("does not list an abandoned request for answer", async () => {
+    const { store, broker } = setup();
+    addRequest(store, A);
+    addRequest(store, B);
+    await broker.abandon([A]);
+    const listing = await broker.listWaiting(new Set());
+    expect(listing.waiting.map((item) => item.id)).toEqual([B]);
+  });
+});
+
+describe("what the sweeper learns about a request", () => {
+  const ID_1 = "20261009T100000000Z-aaaaaa";
+
+  it("gives the time a request ended for every known state except waiting", async () => {
+    for (const state of [
+      "replied",
+      "skipped",
+      "cancelled",
+      "timed_out",
+      "abandoned",
+      "invalid_reply",
+    ]) {
+      const { store, broker } = setup();
+      store.addRaw(ID_1, {
+        request: createRequestFile(ID_1, NOW, request),
+        state: { ...createStateFile(ID_1, "replied", NOW, NOW), state } as never,
+      });
+      expect(await broker.finishedAt(ID_1), state).toBe(Date.parse(NOW));
+    }
+  });
+
+  it("gives nothing for waiting, unreadable, unknown or missing states and for a bad endedAt", async () => {
+    const cases: Array<ReturnType<typeof createStateFile> | "unreadable" | "missing"> = [
+      createStateFile(ID_1, "waiting", NOW, null),
+      "unreadable",
+      "missing",
+      { ...createStateFile(ID_1, "replied", NOW, NOW), state: "other" },
+      createStateFile(ID_1, "replied", NOW, null),
+      createStateFile(ID_1, "replied", NOW, "yesterday"),
+    ];
+    for (const state of cases) {
+      const { store, broker } = setup();
+      store.addRaw(ID_1, { request: createRequestFile(ID_1, NOW, request), state });
+      expect(await broker.finishedAt(ID_1)).toBeUndefined();
+    }
+  });
+
+  it("passes the failure to read the state on", async () => {
+    const { store, broker } = setup();
+    store.fail("readState");
+    await expect(broker.finishedAt(ID_1)).rejects.toBeInstanceOf(IoFailure);
+  });
+
+  it("lists the request ids and removes a request through the store", async () => {
+    const { store, broker } = setup();
+    store.addRaw(ID_1, {
+      request: createRequestFile(ID_1, NOW, request),
+      state: createStateFile(ID_1, "replied", NOW, NOW),
+    });
+    expect(await broker.listRequestIds()).toEqual([ID_1]);
+    expect(await broker.removeRequest(ID_1)).toBe("removed");
+    expect(await broker.listRequestIds()).toEqual([]);
+  });
+});

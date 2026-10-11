@@ -1,13 +1,18 @@
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { link, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { AlreadyExistsError, IoFailure } from "../src/errors.js";
 import {
+  absolutePath,
   ctrlZEndsInput,
   currentPlatformInfo,
   defaultStorageDir,
+  directoryMode,
   endOfInputHint,
+  fileMode,
+  isProcessAlive,
   linkExclusive,
   missingStorageBaseMessage,
   onFatalError,
@@ -117,6 +122,49 @@ describe("interrupt handling", () => {
     expect(target.listenerCount("SIGINT")).toBe(0);
     target.emit("SIGINT");
     expect(calls).toBe(1);
+  });
+});
+
+describe("modes of what the program creates", () => {
+  it("is 0700 for directories and 0600 for files on Linux and macOS, and none on Windows", () => {
+    for (const platform of ["linux", "darwin"] as const) {
+      expect(directoryMode(platform)).toBe(0o700);
+      expect(fileMode(platform)).toBe(0o600);
+    }
+    expect(directoryMode("win32")).toBeUndefined();
+    expect(fileMode("win32")).toBeUndefined();
+  });
+});
+
+describe("whether a process exists", () => {
+  it("is true for this process and false for an id that no process has", async () => {
+    expect(isProcessAlive(process.pid)).toBe(true);
+    const child = spawn(process.execPath, ["-e", ""]);
+    await new Promise((resolve) => child.on("close", resolve));
+    expect(isProcessAlive(child.pid ?? 0)).toBe(false);
+  });
+
+  it("is false for an id that cannot be a process", () => {
+    expect(isProcessAlive(0)).toBe(false);
+    expect(isProcessAlive(-5)).toBe(false);
+    expect(isProcessAlive(1.5)).toBe(false);
+  });
+});
+
+describe("absolute paths", () => {
+  it("resolves against the working directory with the rules of the platform in the information", () => {
+    const linux = { platform: "linux", env: {}, homedir: "/h", cwd: "/work" } as const;
+    expect(absolutePath(linux, "a/../b")).toBe("/work/b");
+    expect(absolutePath(linux, "/abs")).toBe("/abs");
+    const windows = { platform: "win32", env: {}, homedir: "C:\\h", cwd: "C:\\work" } as const;
+    expect(absolutePath(windows, "b")).toBe("C:\\work\\b");
+  });
+
+  it("falls back to the working directory of the process when the information has none", () => {
+    expect(absolutePath({ platform: "linux", env: {}, homedir: undefined }, "x")).toBe(
+      path.resolve("x"),
+    );
+    expect(currentPlatformInfo().cwd).toBe(process.cwd());
   });
 });
 

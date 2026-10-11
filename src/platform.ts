@@ -11,6 +11,8 @@ export interface PlatformInfo {
   platform: NodeJS.Platform;
   env: Readonly<Record<string, string | undefined>>;
   homedir: string | undefined;
+  /** The working directory, for making a relative path absolute. Tests set it. */
+  cwd?: string;
 }
 
 function tryHomedir(): string | undefined {
@@ -22,9 +24,23 @@ function tryHomedir(): string | undefined {
   }
 }
 
-/** The platform, environment and home directory of this process. */
+/** The platform, environment, home directory and working directory of this process. */
 export function currentPlatformInfo(): PlatformInfo {
-  return { platform: process.platform, env: process.env, homedir: tryHomedir() };
+  return {
+    platform: process.platform,
+    env: process.env,
+    homedir: tryHomedir(),
+    cwd: process.cwd(),
+  };
+}
+
+/**
+ * A path made absolute from the working directory and cleaned up, with the path rules of the
+ * platform in `info`. Symbolic links are not resolved.
+ */
+export function absolutePath(info: PlatformInfo, target: string): string {
+  const rules = info.platform === "win32" ? path.win32 : path.posix;
+  return rules.resolve(info.cwd ?? process.cwd(), target);
 }
 
 /**
@@ -46,6 +62,35 @@ export function defaultStorageDir(info: PlatformInfo): string | undefined {
     return path.posix.join(xdg, "imbehind");
   }
   return info.homedir ? path.posix.join(info.homedir, ".local", "share", "imbehind") : undefined;
+}
+
+/**
+ * The mode of a directory this program creates: only the user may use it. Windows has no such
+ * mode, so there the default permissions of the profile apply and no mode is set.
+ */
+export function directoryMode(platform: NodeJS.Platform): number | undefined {
+  return platform === "win32" ? undefined : 0o700;
+}
+
+/** The mode of a file this program creates: only the user may read or write it. */
+export function fileMode(platform: NodeJS.Platform): number | undefined {
+  return platform === "win32" ? undefined : 0o600;
+}
+
+/**
+ * Whether the process exists. No signal is sent. A process we may not signal still exists, so it
+ * counts as alive.
+ */
+export function isProcessAlive(processId: number): boolean {
+  if (!Number.isInteger(processId) || processId <= 0) {
+    return false;
+  }
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) !== "ESRCH";
+  }
 }
 
 /** The sentence for the startup error when `defaultStorageDir` finds no base directory. */

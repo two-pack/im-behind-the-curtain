@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildCompletion,
+  buildModelList,
   buildStreamEvents,
   errorBody,
   MESSAGES,
@@ -660,5 +661,20 @@ describe("building the stream", () => {
       (chunk.choices as { delta: { content?: string } }[]).map((choice) => choice.delta.content),
     );
     expect(contents.filter((content) => content === "a".repeat(5000))).toHaveLength(1);
+  });
+});
+
+describe("the model list", () => {
+  it("is one model called imbehind with the fixed created time", () => {
+    expect(buildModelList()).toEqual({
+      object: "list",
+      data: [{ id: "imbehind", object: "model", created: 1791800000, owned_by: "imbehind" }],
+    });
+  });
+
+  it("is a new object each time, so a caller cannot change the next answer", () => {
+    const first = buildModelList();
+    first.data.length = 0;
+    expect(buildModelList().data).toHaveLength(1);
   });
 });

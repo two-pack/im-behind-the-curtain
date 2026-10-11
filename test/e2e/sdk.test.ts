@@ -229,3 +229,27 @@ describe("many requests, skipping and waiting too long with the OpenAI SDK", () 
     expect(serve.stdout()).toMatch(/cancelled {2}[0-9a-f]{6} {2}client disconnected\n/);
   });
 });
+
+describe("the model list with the official OpenAI SDK", () => {
+  it("reads the list of models without an error", async () => {
+    const serve = await startServe();
+    const client = new OpenAI({
+      apiKey: "any-key-is-accepted",
+      baseURL: `${serve.baseUrl}/v1`,
+      maxRetries: 0,
+      timeout: 20_000,
+    });
+
+    const page = await client.models.list();
+    expect(page.data).toEqual([
+      { id: "imbehind", object: "model", created: 1791800000, owned_by: "imbehind" },
+    ]);
+
+    const seen: string[] = [];
+    for await (const model of client.models.list()) {
+      seen.push(model.id);
+    }
+    expect(seen).toEqual(["imbehind"]);
+    expect(await storedStates(serve.storageDir).catch(() => [])).toEqual([]);
+  });
+});

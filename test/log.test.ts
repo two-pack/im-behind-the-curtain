@@ -170,6 +170,38 @@ describe("the received line supplement", () => {
   });
 });
 
+describe("the lines for listening, invalid replies and abandoned requests", () => {
+  it("writes the listening line of an IPv6 address with brackets", () => {
+    const { out, logger } = setup();
+    logger.listening("::1", 3000, "/data");
+    logger.listening("127.0.0.2", 3100, "/data");
+    expect(out).toEqual([
+      "Listening on http://[::1]:3000 (storage: /data)\n",
+      "Listening on http://127.0.0.2:3100 (storage: /data)\n",
+    ]);
+  });
+
+  it("writes the abandoned line in the usual form", () => {
+    const { out, logger } = setup();
+    logger.abandoned("c9d0e1");
+    expect(out).toEqual(["14:05:12 abandoned  c9d0e1  server restarted\n"]);
+  });
+
+  it("writes the fixed reasons of the sweeper and of the abandon retry, once for each request", () => {
+    const { out, logger } = setup();
+    for (const reason of ["kept unknown files", "delete failed", "abandon failed"] as const) {
+      expect(IO_REASONS).toContain(reason);
+      logger.failure("a1b2c3", reason);
+      logger.failure("a1b2c3", reason);
+    }
+    expect(out).toEqual([
+      "14:05:12 error      a1b2c3  kept unknown files\n",
+      "14:05:12 error      a1b2c3  delete failed\n",
+      "14:05:12 error      a1b2c3  abandon failed\n",
+    ]);
+  });
+});
+
 describe("screen writer (NFR14.1)", () => {
   it("writes one line per call, with no color codes", () => {
     const out: string[] = [];

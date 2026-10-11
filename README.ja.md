@@ -32,7 +32,7 @@ node dist/bin.js answer   # 端末2: リクエストを表示して、返答を�
 5. 返答を打ち込み、Ctrl+Dで終えます。Windowsでは、Ctrl+Zを押してからEnterを押します。改行は `\n` にそろえ、末尾の改行は取り除きます。空の返答は送りません。
 6. `curl` は、打ち込んだ文章を `choices[0].message.content` に入れたChat Completions形式の応答を受け取ります。`imbehind answer` には `Sent.` と表示されます。
 
-どちらのコマンドも、Ctrl+Cで終えられます。誰も返答していないリクエストは保存先に残り、次に `imbehind answer` を起動したときにもう一度表示されます。
+どちらのコマンドも、Ctrl+Cで終えられます。`imbehind serve` を終えたとき、誰も返答していないリクエストは保存先にそのまま残り、次の `imbehind serve` が `abandoned` で終えます（「保存先」の節を見てください）。`imbehind answer` は、`imbehind serve` が動いている間だけ起動できます。
 
 ### 構造化出力
 
@@ -54,9 +54,9 @@ node dist/bin.js answer   # 端末2: リクエストを表示して、返答を�
 
 `imbehind answer` は、`system` と `developer` の発言をすべて、それ以外は最後の3件を表示します。発言を省いたときは、`(3 earlier messages omitted. Full conversation: <path>)` のような行を1つ表示します。`<path>` は、会話の全体を入れた `request.json` の場所です。200行を超える発言は、200行で切り、同じような行を足します。改行とタブ以外の制御文字は、`\xNN`（たとえば `\x1b`）の形で表示します。
 
-リクエストはOSごとの利用者のデータ用ディレクトリに保存されます。Linuxは `$XDG_DATA_HOME/imbehind`、未設定なら `~/.local/share/imbehind` です。macOSは `~/Library/Application Support/imbehind`、Windowsは `%LOCALAPPDATA%\imbehind` です。保存先はハードリンクを作れる必要があります。
+リクエストは保存先に保存されます（「保存先」の節を見てください）。保存先はハードリンクを作れる必要があります。
 
-この版の `imbehind serve` は、`127.0.0.1:3000` だけで待ち受けます。受け付けるのは、`POST /v1/chat/completions` に届く文章のメッセージです。ブラウザが付ける `Origin` ヘッダーのあるリクエストと、`Host` ヘッダーが `127.0.0.1` でも `localhost` でもないリクエストは断ります。
+`imbehind serve` が受け付けるのは、`POST /v1/chat/completions` に届く文章のメッセージです。`GET /v1/models` にも答えます。ブラウザが付ける `Origin` ヘッダーのあるリクエストと、`Host` ヘッダーが手元の名前でないリクエストは断ります。手元の名前とは、`127.0.0.0/8` の範囲のアドレス（`127.0.0.1` など）、`[::1]`、`localhost` です。大文字と小文字は区別せず、ポートはあってもなくてもかまいません。
 
 ### 依頼を飛ばす
 
@@ -97,6 +97,48 @@ const client = new OpenAI({
   timeout: 1800 * 1000,
 });
 ```
+
+## 設定
+
+`imbehind serve` には6つの設定があります。それぞれ、起動時の指定があればそれを使い、なければ環境変数、それもなければ既定値を使います。空の環境変数は、指定なしとして扱います。起動時の指定は `--port 3100` でも `--port=3100` でも書けます。
+
+| 起動時の指定 | 環境変数 | 既定値 | 意味 |
+|---|---|---|---|
+| `--host` | `IMBEHIND_HOST` | `127.0.0.1` | 待ち受けるアドレス。手元のアドレスだけが使えます。`127.0.0.0/8` の範囲のアドレス、`::1`（`[::1]` とも書けます）、そして、名前に当たるアドレスがすべて手元のものである `localhost` です。 |
+| `--port` | `IMBEHIND_PORT` | `3000` | ポート。1から65535まで。 |
+| `--dir` | `IMBEHIND_DIR` | OSごとの保存先。「保存先」の節を見てください | 保存先のディレクトリ。相対パスは、コマンドを起動した場所からの絶対パスにします。 |
+| `--timeout` | `IMBEHIND_TIMEOUT` | `1800` | 返答を待つ上限の秒数。0から2147483まで。`0` は上限なし。 |
+| `--retention` | `IMBEHIND_RETENTION` | `86400` | 終わった依頼を残す秒数。0から315360000まで。`0` は消さない。 |
+| `--sweep-interval` | `IMBEHIND_SWEEP_INTERVAL` | `600` | 古い依頼を探す間隔の秒数。1から2147483まで。 |
+
+`imbehind answer` と `imbehind path` が受け取るのは `--dir` と `IMBEHIND_DIR` だけです。`imbehind serve` と同じ保存先を使います。`--port` など `imbehind serve` だけの指定を渡すと、使い方の行を表示して終わります。
+
+`--retention` と `--timeout` がどちらも0でないときは、`--retention` を `--timeout` より短くできません。待っている間に依頼が消えるおそれがあるためです。値の確認は、何かを作ったり開いたりする前に、次の順で行います。コマンドの書き方、`--host`、`--port`、`--timeout`、`--retention`、`--sweep-interval`、`--dir`、最後に保存期間と待つ上限の組み合わせです。最初に見つかった問題を1行だけ表示し、ほかには何もしません。
+
+```
+Error: 0.0.0.0 is not a local address. imbehind only listens on this machine (127.0.0.0/8, ::1, localhost).
+Error: --port must be a number from 1 to 65535 (got "abc").
+Error: --retention (600 seconds) must not be shorter than --timeout (1800 seconds).
+```
+
+終了コードは次のとおりです。0は成功で、`imbehind path` が返します。1は、起動できないとき、または保存先を読めないときです。使われているポート、使えないアドレス、別の `imbehind serve` が使っている保存先、`imbehind answer` に対して `imbehind serve` が動いていない場合がこれに当たります。2は、コマンドの書き方の誤りと、認められない値です。130はCtrl+Cです。
+
+## 保存先
+
+既定の保存先は、Linuxでは `$XDG_DATA_HOME/imbehind`、`XDG_DATA_HOME` が未設定なら `~/.local/share/imbehind` です。macOSでは `~/Library/Application Support/imbehind`、Windowsでは `%LOCALAPPDATA%\imbehind` です。`imbehind path` は、そのときの指定と環境変数で決まる保存先を1行で表示し、終了コード0で終わります。何も作らず、何も読まないので、最初の起動より前にも使えます。
+
+```sh
+imbehind path
+IMBEHIND_DIR=/data/imbehind imbehind path
+```
+
+保存先を作るのは `imbehind serve` だけです。`imbehind answer` は作りません。
+
+- **権限** LinuxとmacOSでは、`imbehind serve` が作るフォルダはすべてモード `0700`、ファイルはすべてモード `0600` にします。使えるのは自分だけです。すでにあるフォルダの権限は変えません。自分で置いた `reply.json` の権限も変えません。Windowsではモードを設定せず、利用者のプロファイルの権限がそのまま使われます。
+- **1つの保存先に1つのserve** `imbehind serve` は、保存先に `serve.lock` を書き、5秒ごとに書き直します。同じ保存先で2つ目の `imbehind serve` を起動すると、`Error: <保存先> is already used by another imbehind serve.` と表示して止まります。強制終了された `imbehind serve` が残した印は、そのプロセスがなくなったとき、または最後の書き直しが15秒より前のときに、次の起動が自分で引き継ぎます。このプログラムの印として読めない `serve.lock` は、読まず、消しません。どの `imbehind serve` も使っていないなら自分で消すよう案内して止まります。
+- **再起動** `imbehind serve` の起動の前から待っていた依頼は、たとえば前のserveをCtrl+Cで止めた場合などですが、最初の行のすぐあとに `abandoned` で終えます。1件につき1行で、`14:00:00 abandoned  c9d0e1  server restarted` の形です。クライアントはもういないので、`imbehind answer` には出ません。
+- **古い依頼** 終わった依頼は、終わってから `--retention` 秒が過ぎると、フォルダごと消えます。既定は24時間です。確認は起動のときに1回と、そのあと `--sweep-interval` 秒ごとに行います。既定は10分です。待っている依頼は消しません。フォルダの中が `request.json`、`state.json`、`reply.json`、`reply.accepted.json` だけのときに限って消します。ほかのファイルが1つでもあれば、そのまま残し、`imbehind serve` がその依頼について `14:05:12 error      a1b2c3  kept unknown files` の形の行を1回表示します。`--retention 0` では何も消しません。点で始まる名前のファイルとフォルダ、このプログラムが作っていないファイルは、読まず、消しません。
+- **serveが動いていないとき** `imbehind serve` が動いていないと、`imbehind answer` は終了コード1で終わり、`Error: imbehind serve is not running for <保存先>.` と `Start it with: imbehind serve` を表示します。保存先を読めないときは `Error: cannot read <保存先>: <理由>.` を表示します。確かめるのは起動のときの1回です。
 
 ## 開発
 

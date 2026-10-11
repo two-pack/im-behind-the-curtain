@@ -28,7 +28,14 @@ const UNEXPECTED_FAILURE = "unexpected failure.";
 
 /** The width of the event column in a serve line. */
 const EVENT_WIDTH = 10;
-type EventWord = "received" | "replied" | "skipped" | "cancelled" | "timed_out" | "error";
+type EventWord =
+  | "received"
+  | "replied"
+  | "skipped"
+  | "cancelled"
+  | "timed_out"
+  | "abandoned"
+  | "error";
 
 const NO_ID = "------";
 const SHORT_ID = /^[0-9a-f]{6}$/;
@@ -58,8 +65,10 @@ export class Logger {
     this.clock = options.clock;
   }
 
+  /** The first line of serve. An IPv6 address is written in brackets, as in a URL. */
   listening(host: string, port: number, storageDir: string): void {
-    this.out.write(`Listening on http://${host}:${port} (storage: ${storageDir})\n`);
+    const shown = host.includes(":") ? `[${host}]` : host;
+    this.out.write(`Listening on http://${shown}:${port} (storage: ${storageDir})\n`);
   }
 
   /**
@@ -90,6 +99,11 @@ export class Logger {
 
   timedOut(shortId: string): void {
     this.event("timed_out", shortId);
+  }
+
+  /** A request left waiting by an earlier run was ended at start. */
+  abandoned(shortId: string): void {
+    this.event("abandoned", shortId, "server restarted");
   }
 
   /** Writes a failure once for each pair of request and reason, until the request recovers. */

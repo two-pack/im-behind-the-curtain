@@ -18,7 +18,7 @@ import { checkReply, type ReplyCheck } from "./reply-check.js";
 
 /** What the broker tells the outside. The log lines are made elsewhere. */
 export type BrokerEvent =
-  | { type: "replied" | "skipped" | "cancelled" | "timed_out"; id: string }
+  | { type: "replied" | "skipped" | "cancelled" | "timed_out" | "abandoned"; id: string }
   /** `id` is missing when the failure is not about one request, such as a failed listing. */
   | { type: "error"; id: string | undefined; reason: IoReason }
   | { type: "recovered"; id: string | undefined };
@@ -87,6 +87,9 @@ export interface Polling {
   stop(): Promise<void>;
 }
 
+/** How long after a failed try the broker tries again to abandon a request. */
+const ABANDON_RETRY_MS = 5000;
+
 /**
  * Owns the life of a request: assigning ids, saving, ending it exactly once (a reply, a skip,
  * a disconnect or the wait limit, whichever comes first), and listing what is waiting. serve and
@@ -121,6 +124,12 @@ export class ExchangeBroker {
   private readonly failing = new Set<string>();
   /** True while the listing of the storage directory is failing. */
   private listFailing = false;
+  /**
+   * Requests that were waiting at start and could not be abandoned. The poll leaves
+   * them alone for the rest of this run, and the abandon is tried again every 5 seconds.
+   */
+  private readonly excluded = new Set<string>();
+  private lastAbandonTryMs = 0;
 
   constructor(options: BrokerOptions) {
     this.store = options.store;
@@ -195,11 +204,65 @@ export class ExchangeBroker {
     return this.store.requestFilePath(id);
   }
 
+  /**
+   * The ids of the requests that wait now, in id order. serve makes this list
+   * before it listens, so that a request which arrives later is never in it.
+   */
+  async snapshotWaiting(): Promise<string[]> {
+    const waiting: string[] = [];
+    for (const id of await this.store.listIds()) {
+      const state = await this.store.readState(id);
+      if (state.kind === "ok" && state.value.state === "waiting") {
+        waiting.push(id);
+      }
+    }
+    return waiting;
+  }
+
+  /**
+   * Ends the listed requests as `abandoned`, one at a time in the given order. A
+   * request that no longer waits is left as it is. The reply file is not read. One that cannot be
+   * written is kept out of the poll and tried again later.
+   */
+  async abandon(ids: readonly string[]): Promise<void> {
+    for (const id of ids) {
+      await this.abandonOne(id);
+    }
+  }
+
+  /** The ids of all request folders, in id order. The sweeper goes through them. */
+  listRequestIds(): Promise<string[]> {
+    return this.store.listIds();
+  }
+
+  /**
+   * When a request ended, in milliseconds since the epoch. Nothing for a request that waits, whose
+   * state cannot be read or is not known, or whose `endedAt` is empty or not a time.
+   */
+  async finishedAt(id: string): Promise<number | undefined> {
+    const state = await this.store.readState(id);
+    if (state.kind !== "ok") {
+      return undefined;
+    }
+    const { state: name, endedAt } = state.value;
+    if (name === "waiting" || name === "other" || endedAt === null) {
+      return undefined;
+    }
+    const time = Date.parse(endedAt);
+    return Number.isNaN(time) ? undefined : time;
+  }
+
+  /** Deletes a request folder when it holds only the files this server makes. */
+  removeRequest(id: string): Promise<"removed" | "kept"> {
+    return this.store.removeRequest(id);
+  }
+
   /** Looks at every request that is still waiting and accepts the replies that arrived. */
   async pollOnce(): Promise<void> {
     if (this.stopped) {
       return;
     }
+    await this.retryAbandon();
     let ids: string[];
     try {
       ids = await this.store.listIds();
@@ -219,10 +282,42 @@ export class ExchangeBroker {
       if (this.stopped) {
         return;
       }
-      if (this.finished.has(id)) {
+      if (this.finished.has(id) || this.excluded.has(id)) {
         continue;
       }
       await this.attempt(id, () => this.serveOne(id));
+    }
+  }
+
+  private async abandonOne(id: string): Promise<void> {
+    try {
+      const state = await this.store.readState(id);
+      if (state.kind === "ok" && state.value.state === "waiting") {
+        const now = this.clock.now().toISOString();
+        await this.store.writeState(createStateFile(id, "abandoned", now, now, "server restarted"));
+        this.emit({ type: "abandoned", id });
+      }
+      this.finished.add(id);
+      this.excluded.delete(id);
+    } catch {
+      if (!this.excluded.has(id)) {
+        this.emit({ type: "error", id, reason: "abandon failed" });
+      }
+      this.excluded.add(id);
+      this.lastAbandonTryMs = this.clock.now().getTime();
+    }
+  }
+
+  /** Tries again the requests that could not be abandoned, once 5 seconds have passed. */
+  private async retryAbandon(): Promise<void> {
+    if (
+      this.excluded.size === 0 ||
+      this.clock.now().getTime() - this.lastAbandonTryMs < ABANDON_RETRY_MS
+    ) {
+      return;
+    }
+    for (const id of [...this.excluded].sort()) {
+      await this.abandonOne(id);
     }
   }
 

@@ -2,11 +2,20 @@ import { spawn } from "node:child_process";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { main } from "../../src/cli.js";
 import { BarrierReader } from "../helpers/barrier-reader.js";
 import { FakeClock } from "../helpers/fake-clock.js";
-import { waitFor } from "../helpers/io.js";
+import { makeTempDir } from "../helpers/fs.js";
+import { makeIo, waitFor } from "../helpers/io.js";
 import { ScriptedReader } from "../helpers/scripted-reader.js";
-import { answerEverything, startAnswer, startServe, storedStates } from "../helpers/system.js";
+import {
+  answerEverything,
+  freePort,
+  postChat,
+  startAnswer,
+  startServe,
+  storedStates,
+} from "../helpers/system.js";
 
 interface CurlResult {
   code: number | null;
@@ -530,5 +539,204 @@ describe("many requests, skipping, leaving and waiting too long with curl", () =
     const winner = answerA.stdout().includes("Sent.") ? "from A" : "from B";
     expect(reply.body.choices?.[0]?.message.content).toBe(winner);
     expect(await storedStates(serve.storageDir)).toEqual(["replied"]);
+  });
+});
+
+describe("the model list with curl", () => {
+  it("returns the model list to a plain GET without an API key", async () => {
+    const serve = await startServe();
+    const result = await curl([
+      "--silent",
+      "--show-error",
+      "--max-time",
+      "20",
+      "-i",
+      `${serve.baseUrl}/v1/models`,
+    ]);
+    expect(result.code).toBe(0);
+    const [head = "", body = ""] = result.stdout.split("\r\n\r\n");
+    expect(head.split("\r\n")[0]).toBe("HTTP/1.1 200 OK");
+    expect(head.toLowerCase()).toContain("content-type: application/json");
+    expect(JSON.parse(body)).toEqual({
+      object: "list",
+      data: [{ id: "imbehind", object: "model", created: 1791800000, owned_by: "imbehind" }],
+    });
+    expect(
+      serve
+        .stdout()
+        .split("\n")
+        .filter((line) => line !== ""),
+    ).toHaveLength(1);
+  });
+});
+
+describe("choosing the port and the host", () => {
+  async function listensOn(serve: Awaited<ReturnType<typeof startServe>>, port: number) {
+    expect(serve.port).toBe(port);
+    const result = await curl(["--silent", "--max-time", "20", `${serve.baseUrl}/v1/models`]);
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout).data[0].id).toBe("imbehind");
+  }
+
+  it("listens on the port of --port, in both ways of writing it", async () => {
+    for (const style of ["split", "equals"]) {
+      const port = await freePort();
+      const dir = await makeTempDir();
+      const args = style === "split" ? ["--port", String(port)] : [`--port=${port}`];
+      const serve = await startServe({ raw: true, args: [...args, "--dir", dir] });
+      await listensOn(serve, port);
+      expect(serve.storageDir).toBe(dir);
+      await serve.stop();
+    }
+  });
+
+  it("listens on the port of IMBEHIND_PORT, and --port wins when both are given", async () => {
+    const dir = await makeTempDir();
+    const fromEnv = await freePort();
+    const byEnvironment = await startServe({
+      raw: true,
+      env: { IMBEHIND_PORT: String(fromEnv), IMBEHIND_DIR: dir },
+    });
+    await listensOn(byEnvironment, fromEnv);
+    await byEnvironment.stop();
+
+    const wanted = await freePort();
+    const both = await startServe({
+      raw: true,
+      args: ["--port", String(wanted)],
+      env: { IMBEHIND_PORT: String(fromEnv), IMBEHIND_DIR: dir },
+    });
+    await listensOn(both, wanted);
+  });
+
+  it("uses the storage directory of IMBEHIND_DIR and prints it in the first line", async () => {
+    const dir = await makeTempDir();
+    const port = await freePort();
+    const serve = await startServe({
+      raw: true,
+      args: ["--port", String(port)],
+      env: { IMBEHIND_DIR: dir },
+    });
+    expect(serve.stdout()).toContain(`(storage: ${dir})`);
+    await serve.stop();
+  });
+
+  it("stops for --host 0.0.0.0 with exit 2 and the sentence, and listens nowhere", async () => {
+    const t = makeIo();
+    const port = await freePort();
+    const dir = path.join(await makeTempDir(), "never-created");
+    const exit = await main(
+      ["serve", "--host", "0.0.0.0", "--port", String(port), "--dir", dir],
+      t.io,
+    );
+    expect(exit).toBe(2);
+    expect(t.err.lines()).toEqual([
+      "Error: 0.0.0.0 is not a local address. imbehind only listens on this machine (127.0.0.0/8, ::1, localhost).",
+    ]);
+    expect(t.out.text()).toBe("");
+    const probe = await curl(["--silent", "--max-time", "2", `http://127.0.0.1:${port}/v1/models`]);
+    expect(probe.code).not.toBe(0);
+  });
+});
+
+describe("old requests are deleted", () => {
+  it("deletes a request that ended, within about two seconds of its retention, every second", async () => {
+    const serve = await startServe({
+      args: ["--timeout", "1", "--retention", "1", "--sweep-interval", "1"],
+    });
+    const reply = await curlPost(serve.baseUrl, chatBody("Hello"));
+    expect(reply.status).toBe(504);
+    const endedAt = Date.now();
+    await waitFor(
+      async () => (await readdir(path.join(serve.storageDir, "requests"))).length === 0,
+      8000,
+    );
+    expect(Date.now() - endedAt).toBeLessThan(4500);
+  });
+
+  it("keeps a request that still waits and deletes the one that was answered", async () => {
+    const serve = await startServe({
+      args: ["--timeout", "0", "--retention", "1", "--sweep-interval", "1"],
+    });
+    const answering = answerEverything(serve.storageDir, 1);
+    const first = await curlPost(serve.baseUrl, chatBody("first"));
+    await answering;
+    expect(first.status).toBe(200);
+    const second = fetch(`${serve.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: chatBody("second"),
+    }).catch(() => undefined);
+    await waitFor(async () => (await storedStates(serve.storageDir)).length >= 1);
+    await new Promise((resolve) => setTimeout(resolve, 3500));
+    expect(await storedStates(serve.storageDir)).toEqual(["waiting"]);
+    await serve.stop();
+    await second;
+  });
+});
+
+describe("a restart and a second serve", () => {
+  it("ends the requests that waited, prints abandoned lines after the first line, and hides them from answer", async () => {
+    const first = await startServe();
+    const dropped = fetch(`${first.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: chatBody("left behind"),
+    }).catch(() => "dropped");
+    await waitFor(async () => (await storedStates(first.storageDir)).length === 1);
+    expect(await first.stop()).toBe(130);
+    await dropped;
+    expect(await storedStates(first.storageDir)).toEqual(["waiting"]);
+
+    const second = await startServe({ storageDir: first.storageDir });
+    await waitFor(() => second.stdout().includes("server restarted"));
+    const lines = second
+      .stdout()
+      .split("\n")
+      .filter((line) => line !== "");
+    expect(lines[0]).toMatch(/^Listening on /);
+    expect(lines[1]).toMatch(/^\d\d:\d\d:\d\d abandoned {2}[0-9a-f]{6} {2}server restarted$/);
+    expect(await storedStates(first.storageDir)).toEqual(["abandoned"]);
+    const answer = startAnswer(first.storageDir, new ScriptedReader([]));
+    await waitFor(() => answer.stdout().includes("Waiting for requests..."));
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(answer.stdout()).not.toContain("Request 1 of");
+  });
+
+  it("stops a second serve on the same storage directory and leaves the first one working", async () => {
+    const first = await startServe();
+    const t = makeIo();
+    const exit = await main(["serve"], t.io, {
+      settings: { port: 0, storageDir: first.storageDir },
+    });
+    expect(exit).toBe(1);
+    expect(t.err.lines()).toEqual([
+      `Error: ${first.storageDir} is already used by another imbehind serve.`,
+    ]);
+    expect(t.out.text()).toBe("");
+    startAnswer(first.storageDir, new ScriptedReader(["Hi"]));
+    const reply = await postChat(first.baseUrl, "Hello");
+    expect(reply.status).toBe(200);
+  });
+});
+
+describe("answer when no serve runs", () => {
+  it("works while serve runs, and ends with exit 1 and a reason once serve has stopped", async () => {
+    const serve = await startServe();
+    const running = makeIo();
+    const answering = main(["answer"], running.io, { settings: { storageDir: serve.storageDir } });
+    await waitFor(() => running.out.text().includes("Waiting for requests..."));
+    running.interrupt();
+    expect(await answering).toBe(130);
+
+    await serve.stop();
+    const stopped = makeIo();
+    const exit = await main(["answer"], stopped.io, { settings: { storageDir: serve.storageDir } });
+    expect(exit).toBe(1);
+    expect(stopped.err.lines()).toEqual([
+      `Error: imbehind serve is not running for ${serve.storageDir}.`,
+      "Start it with: imbehind serve",
+    ]);
+    expect(stopped.out.text()).toBe("");
   });
 });
