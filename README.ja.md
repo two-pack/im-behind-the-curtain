@@ -53,6 +53,8 @@ npm run audit    # npm audit。ネットワークが必要
 npm run hooks:install    # このcloneの core.hooksPath を .githooks にする
 ```
 
+`core.hooksPath` を設定すると、このcloneでは `.git/hooks/` の下にあるフックが動かなくなります。すでにそこにフックを置いている場合は、`.githooks/` へ移すか、この手順を省いてください。
+
 ## エンドポイント
 
 | 使う場面 | エンドポイント |

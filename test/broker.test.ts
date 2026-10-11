@@ -582,6 +582,16 @@ describe("placing and confirming a reply", () => {
     });
     expect(await broker.confirmReply(id, "x")).toBe("not-ours");
   });
+
+  it("answers unreadable when the state.json content cannot be read", async () => {
+    const { store, broker } = setup();
+    const id = "20260101T000001000Z-000001";
+    store.addRaw(id, {
+      request: createRequestFile(id, NOW, request),
+      state: "unreadable",
+    });
+    expect(await broker.confirmReply(id, "x")).toBe("unreadable");
+  });
 });
 
 describe("subscribing to events", () => {

@@ -53,6 +53,8 @@ Installing the dependencies does not touch your git hooks. If you want `npm run 
 npm run hooks:install    # sets core.hooksPath to .githooks for this clone
 ```
 
+Setting `core.hooksPath` stops the hooks under `.git/hooks/` from running in this clone. If you already use hooks there, move them to `.githooks/` or skip this step.
+
 ## Endpoints
 
 | Use with | Endpoint |

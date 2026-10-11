@@ -1,4 +1,4 @@
 #!/bin/sh
-# Runs the same checks as CI before each commit. It needs no network.
+# Runs the project's offline check, `npm run check`, before each commit. It needs no network.
 # Install it with `npm run hooks:install`. Skip it once with `git commit --no-verify`.
 npm run check

@@ -63,6 +63,17 @@ describe("the pre-commit check is opt-in (NFR5.4)", () => {
     expect(text).toMatch(/^npm run check$/m);
   });
 
+  it("forces LF line endings for the hooks and shell scripts through .gitattributes", async () => {
+    const text = await readFile(path.join(ROOT, ".gitattributes"), "utf8");
+    const rules = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "" && !line.startsWith("#"));
+    expect(rules).toContain(".githooks/* text eol=lf");
+    expect(rules).toContain("*.sh text eol=lf");
+    expect(rules.some((rule) => rule.startsWith("* "))).toBe(false);
+  });
+
   // File modes do not exist on Windows. The mode is checked on Linux and macOS, where the CI
   // also checks the file out with its executable bit.
   it.skipIf(process.platform === "win32")("makes the pre-commit hook executable", async () => {
