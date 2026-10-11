@@ -33,11 +33,11 @@ function replyBytes(body: string): string {
   return serializeFile(createReplyFile(body, NOW));
 }
 
-function setup() {
+function setup(waitLimitSeconds?: number) {
   const store = new FakeStore();
   const clock = new FakeClock();
   const events: BrokerEvent[] = [];
-  const broker = new ExchangeBroker({ store, clock, pollIntervalMs: 500 });
+  const broker = new ExchangeBroker({ store, clock, pollIntervalMs: 500, waitLimitSeconds });
   broker.subscribe((event) => events.push(event));
   return { store, clock, events, broker };
 }
@@ -155,7 +155,7 @@ describe("accepting a reply", () => {
     expect(store.count("removeReply")).toBe(0);
   });
 
-  it("recovers when writing state.json fails after the link was made (NFR13.3)", async () => {
+  it("answers the client from memory and retries state.json when the write fails after the link (NFR13.3)", async () => {
     const { store, broker, events } = setup();
     const { id, outcomeOf } = await submitWaiting(broker);
     store.putFile(id, "reply.json", replyBytes("Hi"));
@@ -163,16 +163,16 @@ describe("accepting a reply", () => {
     await broker.pollOnce();
     await settle();
     expect(stateOf(store, id)).toBe("waiting");
-    expect(outcomeOf()).toBeUndefined();
-    expect(events).toEqual([{ type: "error", id, reason: "write failed" }]);
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(events).toEqual([
+      { type: "replied", id },
+      { type: "error", id, reason: "write failed" },
+    ]);
     await broker.pollOnce();
     await settle();
     expect(stateOf(store, id)).toBe("replied");
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
-    expect(events.slice(1)).toEqual([
-      { type: "recovered", id },
-      { type: "replied", id },
-    ]);
+    expect(store.count("acceptReply")).toBe(1);
+    expect(events.slice(2)).toEqual([{ type: "recovered", id }]);
   });
 
   it("recovers when serve stopped between the link and the removal (NFR13.9)", async () => {
@@ -194,7 +194,7 @@ describe("accepting a reply", () => {
   it("does not accept a reply of a kind it does not know", async () => {
     const { store, broker, events } = setup();
     const { id } = await submitWaiting(broker);
-    store.putFile(id, "reply.json", serializeFile({ formatVersion: 1, kind: "skip", body: "{}" }));
+    store.putFile(id, "reply.json", serializeFile({ formatVersion: 1, kind: "sing", body: "la" }));
     await broker.pollOnce();
     expect(stateOf(store, id)).toBe("waiting");
     expect(store.count("acceptReply")).toBe(0);
@@ -566,21 +566,11 @@ describe("placing and confirming a reply", () => {
     if (placed.kind !== "placed") {
       throw new Error("expected the reply to be placed");
     }
-    expect(await broker.confirmReply(id, placed.bytes)).toBe("pending");
+    expect(await broker.confirmReply(id, placed.bytes)).toEqual({ kind: "pending" });
     await broker.pollOnce();
-    expect(await broker.confirmReply(id, placed.bytes)).toBe("confirmed");
-    expect(await broker.confirmReply(id, `${placed.bytes} `)).toBe("not-ours");
+    expect(await broker.confirmReply(id, placed.bytes)).toEqual({ kind: "sent" });
+    expect(await broker.confirmReply(id, `${placed.bytes} `)).toEqual({ kind: "elsewhere" });
     expect(stateOf(store, id)).toBe("replied");
-  });
-
-  it("answers not-ours when the state is something else", async () => {
-    const { store, broker } = setup();
-    const id = "20260101T000001000Z-000001";
-    store.addRaw(id, {
-      request: createRequestFile(id, NOW, request),
-      state: { ...createStateFile(id, "replied", NOW, NOW), state: "other" },
-    });
-    expect(await broker.confirmReply(id, "x")).toBe("not-ours");
   });
 
   it("answers unreadable when the state.json content cannot be read", async () => {
@@ -590,7 +580,14 @@ describe("placing and confirming a reply", () => {
       request: createRequestFile(id, NOW, request),
       state: "unreadable",
     });
-    expect(await broker.confirmReply(id, "x")).toBe("unreadable");
+    expect(await broker.confirmReply(id, "x")).toEqual({ kind: "unreadable" });
+  });
+
+  it("answers pending while state.json is missing", async () => {
+    const { store, broker } = setup();
+    const id = "20260101T000001000Z-000001";
+    store.addRaw(id, { request: createRequestFile(id, NOW, request), state: "missing" });
+    expect(await broker.confirmReply(id, "x")).toEqual({ kind: "pending" });
   });
 });
 
@@ -665,5 +662,626 @@ describe("subscribing to events", () => {
     store.putFile(id, "reply.json", replyBytes("Hi"));
     await broker.pollOnce();
     expect(received).toEqual([]);
+  });
+});
+
+describe("how a request ends", () => {
+  const skipBytes = serializeFile(createReplyFile("", NOW, "skip"));
+
+  it("ends a request as skipped when the accepted reply is a skip, with no body", async () => {
+    const { store, broker, events, clock } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", skipBytes);
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "skipped", id });
+    expect(store.entries.get(id)?.state).toEqual({
+      formatVersion: 1,
+      id,
+      state: "skipped",
+      updatedAt: clock.now().toISOString(),
+      endedAt: clock.now().toISOString(),
+      endReason: "skipped by the human",
+    });
+    expect(store.entries.get(id)?.files.get("reply.accepted.json")).toBe(skipBytes);
+    expect(store.entries.get(id)?.files.has("reply.json")).toBe(false);
+    expect(events).toEqual([{ type: "skipped", id }]);
+  });
+
+  it("writes a null end reason when a request is replied", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    await broker.pollOnce();
+    expect(store.entries.get(id)?.state).toMatchObject({ state: "replied", endReason: null });
+  });
+
+  it("places a skip reply with an empty body when asked", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    const result = await broker.placeReply(id, "", "skip");
+    expect(result.kind).toBe("placed");
+    expect(JSON.parse(store.entries.get(id)?.files.get("reply.json") ?? "{}")).toMatchObject({
+      kind: "skip",
+      body: "",
+    });
+  });
+
+  it("does not use a reply.json it cannot read, leaves the claim free and tries again later", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", "{broken");
+    await broker.pollOnce();
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(store.count("acceptReply")).toBe(0);
+    expect(events).toEqual([]);
+    store.putFile(id, "reply.json", replyBytes("fixed"));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "fixed" });
+  });
+
+  it("lets a disconnect win when the only reply.json is unreadable", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", "{broken");
+    await broker.pollOnce();
+    await broker.cancel(id);
+    expect(stateOf(store, id)).toBe("cancelled");
+    expect(outcomeOf()).toEqual({ kind: "cancelled", id });
+  });
+
+  it("ends a request as cancelled when the client disconnects", async () => {
+    const { store, broker, events, clock } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    await broker.cancel(id);
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "cancelled", id });
+    expect(store.entries.get(id)?.state).toMatchObject({
+      state: "cancelled",
+      endedAt: clock.now().toISOString(),
+      endReason: "client disconnected",
+    });
+    expect(events).toEqual([{ type: "cancelled", id }]);
+  });
+
+  it("does not use a reply file that arrives after the disconnect", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    await broker.cancel(id);
+    store.putFile(id, "reply.json", replyBytes("too late"));
+    await broker.pollOnce();
+    expect(store.count("acceptReply")).toBe(0);
+    expect(stateOf(store, id)).toBe("cancelled");
+  });
+
+  it("ignores a disconnect for a request it does not wait for, and a second disconnect", async () => {
+    const { store, broker, events } = setup();
+    await broker.cancel("20260101T000009000Z-000009");
+    const { id } = await submitWaiting(broker);
+    await broker.cancel(id);
+    await broker.cancel(id);
+    expect(store.count("writeState")).toBe(1);
+    expect(events).toEqual([{ type: "cancelled", id }]);
+  });
+
+  it("ends a request as timed_out when the wait limit passes on the injected clock", async () => {
+    const { store, broker, events, clock } = setup(3);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    await clock.advance(2999);
+    expect(outcomeOf()).toBeUndefined();
+    expect(stateOf(store, id)).toBe("waiting");
+    await clock.advance(1);
+    expect(outcomeOf()).toEqual({ kind: "timed_out", id, limitSeconds: 3 });
+    expect(store.entries.get(id)?.state).toMatchObject({
+      state: "timed_out",
+      endedAt: clock.now().toISOString(),
+      endReason: "wait limit of 3 seconds reached",
+    });
+    expect(events).toEqual([{ type: "timed_out", id }]);
+  });
+
+  it("counts the limit from the time the request arrived, not from when it was stored", async () => {
+    const { clock } = setup(1);
+    const slow = new FakeStore();
+    const original = slow.createRequest.bind(slow);
+    slow.createRequest = async (...args) => {
+      await clock.advance(400);
+      await original(...args);
+    };
+    const late = new ExchangeBroker({
+      store: slow,
+      clock,
+      pollIntervalMs: 500,
+      waitLimitSeconds: 1,
+    });
+    const { id } = await submitWaiting(late);
+    await clock.advance(599);
+    expect(slow.entries.get(id)?.state).toMatchObject({ state: "waiting" });
+    await clock.advance(1);
+    expect(slow.entries.get(id)?.state).toMatchObject({ state: "timed_out" });
+  });
+
+  it("places no timer when the limit is 0 or not given, and the request stays waiting", async () => {
+    for (const limit of [0, undefined]) {
+      const { store, broker, clock } = setup(limit);
+      const { id, outcomeOf } = await submitWaiting(broker);
+      expect(clock.sleeping).toBe(0);
+      await clock.advance(31 * 60 * 1000);
+      expect(outcomeOf()).toBeUndefined();
+      expect(stateOf(store, id)).toBe("waiting");
+    }
+  });
+
+  it("does not time out a request that was not stored", async () => {
+    const { store, broker, clock } = setup(5);
+    store.fail("createRequest");
+    await expect(broker.submit(request)).rejects.toBeInstanceOf(IoFailure);
+    expect(clock.sleeping).toBe(0);
+  });
+
+  it("removes the timer of a request once it has ended, whichever way it ended", async () => {
+    const { store, broker, clock } = setup(60);
+    const replied = await submitWaiting(broker);
+    const cancelled = await submitWaiting(broker);
+    const skipped = await submitWaiting(broker);
+    expect(clock.sleeping).toBe(3);
+    store.putFile(replied.id, "reply.json", replyBytes("Hi"));
+    store.putFile(skipped.id, "reply.json", skipBytes);
+    await broker.pollOnce();
+    expect(clock.sleeping).toBe(1);
+    await broker.cancel(cancelled.id);
+    expect(clock.sleeping).toBe(0);
+    const writes = store.count("writeState");
+    await clock.advance(120_000);
+    expect(store.count("writeState")).toBe(writes);
+  });
+
+  it("removes the timer of a timed out request and forgets the waiter", async () => {
+    const { store, broker, clock } = setup(1);
+    const { id } = await submitWaiting(broker);
+    await clock.advance(1000);
+    expect(clock.sleeping).toBe(0);
+    await broker.cancel(id);
+    expect(store.count("writeState")).toBe(1);
+  });
+
+  it("on shutdown cancels every timer, answers nobody and leaves the files waiting", async () => {
+    const { store, broker, clock, events } = setup(60);
+    const first = await submitWaiting(broker);
+    const second = await submitWaiting(broker);
+    broker.shutdown();
+    expect(clock.sleeping).toBe(0);
+    await broker.cancel(first.id);
+    await clock.advance(120_000);
+    expect(first.outcomeOf()).toBeUndefined();
+    expect(second.outcomeOf()).toBeUndefined();
+    expect(stateOf(store, first.id)).toBe("waiting");
+    expect(stateOf(store, second.id)).toBe("waiting");
+    expect(events).toEqual([]);
+  });
+});
+
+describe("a poll after or during shutdown accepts nothing", () => {
+  function waitingWithReply(store: FakeStore, id: string): void {
+    const entry = store.entries.get(id);
+    entry?.files.set("reply.json", replyBytes("late"));
+  }
+
+  it("does not accept a reply.json that is there when the poll starts after shutdown", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    waitingWithReply(store, id);
+    broker.shutdown();
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(store.entries.get(id)?.files.has("reply.accepted.json")).toBe(false);
+    expect(store.entries.get(id)?.files.has("reply.json")).toBe(true);
+    expect(store.count("writeState")).toBe(0);
+    expect(outcomeOf()).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it("does not accept a reply when shutdown comes while the poll is reading the files", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    waitingWithReply(store, id);
+    let release: () => void = () => {};
+    store.gate(
+      "readReply",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const poll = broker.pollOnce();
+    for (let round = 0; round < 100 && store.count("readReply") < 1; round += 1) {
+      await settle();
+    }
+    expect(store.count("readReply")).toBe(1);
+    broker.shutdown();
+    store.gate("readReply", undefined);
+    release();
+    await poll;
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(store.entries.get(id)?.files.has("reply.accepted.json")).toBe(false);
+    expect(store.count("acceptReply")).toBe(0);
+    expect(store.count("writeState")).toBe(0);
+    expect(outcomeOf()).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+
+  it("does not finish an ending when shutdown comes after the reply was linked", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    waitingWithReply(store, id);
+    let release: () => void = () => {};
+    store.gate(
+      "acceptReply",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const poll = broker.pollOnce();
+    for (let round = 0; round < 100 && store.count("acceptReply") < 1; round += 1) {
+      await settle();
+    }
+    broker.shutdown();
+    store.gate("acceptReply", undefined);
+    release();
+    await poll;
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(store.count("writeState")).toBe(0);
+    expect(outcomeOf()).toBeUndefined();
+    expect(events).toEqual([]);
+  });
+});
+
+describe("only the first ending counts", () => {
+  /** Makes an operation of the store wait. Returns the function that lets it go on. */
+  function hold(store: FakeStore, operation: string): () => void {
+    let release: () => void = () => {};
+    store.gate(
+      operation,
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    return () => {
+      store.gate(operation, undefined);
+      release();
+    };
+  }
+
+  async function reached(store: FakeStore, operation: string, times = 1): Promise<void> {
+    for (let round = 0; round < 100 && store.count(operation) < times; round += 1) {
+      await settle();
+    }
+    expect(store.count(operation)).toBeGreaterThanOrEqual(times);
+  }
+
+  it("keeps the reply when the client disconnects after the reply claimed the request", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "acceptReply");
+    const polling = broker.pollOnce();
+    await reached(store, "acceptReply");
+    await broker.cancel(id);
+    release();
+    await polling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(stateOf(store, id)).toBe("replied");
+    expect(store.count("writeState")).toBe(1);
+    expect(events).toEqual([{ type: "replied", id }]);
+  });
+
+  it("keeps the disconnect when it claimed the request before the reply was claimed", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "readReply");
+    const polling = broker.pollOnce();
+    await reached(store, "readReply");
+    await broker.cancel(id);
+    release();
+    await polling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "cancelled", id });
+    expect(stateOf(store, id)).toBe("cancelled");
+    expect(store.count("acceptReply")).toBe(0);
+    expect(events).toEqual([{ type: "cancelled", id }]);
+  });
+
+  it("writes the state once when the disconnect comes during the state write", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "writeState");
+    const polling = broker.pollOnce();
+    await reached(store, "writeState");
+    await broker.cancel(id);
+    release();
+    await polling;
+    await settle();
+    expect(store.count("writeState")).toBe(1);
+    expect(stateOf(store, id)).toBe("replied");
+    expect(outcomeOf()).toMatchObject({ kind: "replied" });
+  });
+
+  it("keeps the reply when the wait limit passes after the reply claimed the request", async () => {
+    const { store, broker, clock } = setup(10);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "acceptReply");
+    const polling = broker.pollOnce();
+    await reached(store, "acceptReply");
+    await clock.advance(10_000);
+    release();
+    await polling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(stateOf(store, id)).toBe("replied");
+    expect(store.count("writeState")).toBe(1);
+  });
+
+  it("keeps the wait limit when it claimed the request before the reply was claimed", async () => {
+    const { store, broker, clock } = setup(10);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "readReply");
+    const polling = broker.pollOnce();
+    await reached(store, "readReply");
+    await clock.advance(10_000);
+    release();
+    await polling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "timed_out", id, limitSeconds: 10 });
+    expect(store.count("acceptReply")).toBe(0);
+    expect(store.count("writeState")).toBe(1);
+  });
+
+  it("lets the wait limit win over a disconnect that comes during its state write", async () => {
+    const { store, broker, clock } = setup(10);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    const release = hold(store, "writeState");
+    const advancing = clock.advance(10_000);
+    await reached(store, "writeState");
+    await broker.cancel(id);
+    release();
+    await advancing;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "timed_out", id, limitSeconds: 10 });
+    expect(stateOf(store, id)).toBe("timed_out");
+    expect(store.count("writeState")).toBe(1);
+  });
+
+  it("lets the disconnect win over a wait limit that comes during its state write", async () => {
+    const { store, broker, clock } = setup(10);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    const release = hold(store, "writeState");
+    const cancelling = broker.cancel(id);
+    await reached(store, "writeState");
+    await clock.advance(10_000);
+    release();
+    await cancelling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "cancelled", id });
+    expect(stateOf(store, id)).toBe("cancelled");
+    expect(store.count("writeState")).toBe(1);
+  });
+
+  it("gives the claim back when the work fails before reply.accepted.json exists, and tries again", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    store.fail("acceptReply");
+    await broker.pollOnce();
+    expect(outcomeOf()).toBeUndefined();
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(events).toEqual([{ type: "error", id, reason: "link failed" }]);
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(events.slice(1)).toEqual([
+      { type: "replied", id },
+      { type: "recovered", id },
+    ]);
+  });
+
+  it("applies a disconnect that came while the claim was held and then given back", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "acceptReply");
+    store.fail("acceptReply");
+    const polling = broker.pollOnce();
+    await reached(store, "acceptReply");
+    await broker.cancel(id);
+    release();
+    await polling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "cancelled", id });
+    expect(stateOf(store, id)).toBe("cancelled");
+    expect(store.count("acceptReply")).toBe(1);
+  });
+
+  it("applies a wait limit that came while the claim was held and then given back", async () => {
+    const { store, broker, clock } = setup(10);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "acceptReply");
+    store.fail("acceptReply");
+    const polling = broker.pollOnce();
+    await reached(store, "acceptReply");
+    await clock.advance(10_000);
+    release();
+    await polling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "timed_out", id, limitSeconds: 10 });
+    expect(stateOf(store, id)).toBe("timed_out");
+  });
+
+  it("keeps the claim and retries the state write when a cancelled state cannot be written", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.fail("writeState");
+    await broker.cancel(id);
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(events).toEqual([
+      { type: "cancelled", id },
+      { type: "error", id, reason: "write failed" },
+    ]);
+    store.putFile(id, "reply.json", replyBytes("late"));
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("cancelled");
+    expect(store.count("acceptReply")).toBe(0);
+    expect(outcomeOf()).toEqual({ kind: "cancelled", id });
+    expect(events.slice(2)).toEqual([{ type: "recovered", id }]);
+  });
+
+  it("answers a timed out client at once and retries the state write when it fails", async () => {
+    const { store, broker, clock } = setup(1);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.fail("writeState", 2);
+    await clock.advance(1000);
+    expect(outcomeOf()).toEqual({ kind: "timed_out", id, limitSeconds: 1 });
+    expect(stateOf(store, id)).toBe("waiting");
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("waiting");
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("timed_out");
+    expect(store.entries.get(id)?.state).toMatchObject({
+      endReason: "wait limit of 1 seconds reached",
+    });
+  });
+
+  it("finishes removing reply.json and writing the state after the client was answered", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    store.fail("removeReply");
+    await broker.pollOnce();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(stateOf(store, id)).toBe("waiting");
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("replied");
+    expect(store.entries.get(id)?.files.has("reply.json")).toBe(false);
+  });
+
+  it("does not use a reply when the request was claimed after the poll had read its state", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "readState");
+    const polling = broker.pollOnce();
+    await reached(store, "readState");
+    await broker.cancel(id);
+    release();
+    await polling;
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "cancelled", id });
+    expect(store.count("acceptReply")).toBe(0);
+    expect(stateOf(store, id)).toBe("cancelled");
+  });
+
+  it("does not claim a request twice when two polls overlap its ending", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "acceptReply");
+    const first = broker.pollOnce();
+    await reached(store, "acceptReply");
+    const second = broker.pollOnce();
+    await settle();
+    release();
+    await Promise.all([first, second]);
+    expect(store.count("acceptReply")).toBe(1);
+    expect(store.count("writeState")).toBe(1);
+  });
+});
+
+describe("what a screen learns about the reply it placed", () => {
+  const ID = "20260101T000001000Z-000001";
+  const placedBytes = replyBytes("mine");
+
+  function endedWith(
+    store: FakeStore,
+    state: Parameters<typeof createStateFile>[1] | "other",
+    reason: string | null,
+    accepted?: string,
+  ) {
+    store.addRaw(ID, {
+      request: createRequestFile(ID, NOW, request),
+      state: {
+        ...createStateFile(ID, state === "other" ? "replied" : state, NOW, NOW, reason),
+        state,
+      },
+    });
+    if (accepted !== undefined) {
+      store.putFile(ID, "reply.accepted.json", accepted);
+    }
+  }
+
+  it("is sent or skipped when the accepted bytes are the ones it placed", async () => {
+    const a = setup();
+    endedWith(a.store, "replied", null, placedBytes);
+    expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "sent" });
+    const skip = serializeFile(createReplyFile("", NOW, "skip"));
+    const b = setup();
+    endedWith(b.store, "skipped", "skipped by the human", skip);
+    expect(await b.broker.confirmReply(ID, skip)).toEqual({ kind: "skipped" });
+  });
+
+  it("is elsewhere when the accepted bytes differ, or when it placed nothing", async () => {
+    const a = setup();
+    endedWith(a.store, "replied", null, replyBytes("theirs"));
+    expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "elsewhere" });
+    expect(await a.broker.confirmReply(ID, undefined)).toEqual({ kind: "elsewhere" });
+    const b = setup();
+    endedWith(b.store, "skipped", "skipped by the human", replyBytes("theirs"));
+    expect(await b.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "elsewhere" });
+  });
+
+  it("is elsewhere when no accepted reply can be found for a replied request", async () => {
+    const a = setup();
+    endedWith(a.store, "replied", null);
+    expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "elsewhere" });
+  });
+
+  it("is cancelled for a cancelled request", async () => {
+    const a = setup();
+    endedWith(a.store, "cancelled", "client disconnected");
+    expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "cancelled" });
+  });
+
+  it("is timed out with the limit read from the end reason, or without it when it cannot be read", async () => {
+    const a = setup();
+    endedWith(a.store, "timed_out", "wait limit of 5 seconds reached");
+    expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({
+      kind: "timed_out",
+      limitSeconds: 5,
+    });
+    for (const reason of [null, "something else", "wait limit of x seconds reached"]) {
+      const b = setup();
+      endedWith(b.store, "timed_out", reason);
+      expect(await b.broker.confirmReply(ID, placedBytes)).toEqual({
+        kind: "timed_out",
+        limitSeconds: undefined,
+      });
+    }
+  });
+
+  it("is ended for any other state that is not waiting", async () => {
+    const a = setup();
+    endedWith(a.store, "other", null);
+    expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "ended" });
+  });
+
+  it("is pending while the request waits", async () => {
+    const a = setup();
+    endedWith(a.store, "waiting", null);
+    expect(await a.broker.confirmReply(ID, placedBytes)).toEqual({ kind: "pending" });
   });
 });

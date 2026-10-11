@@ -3,16 +3,10 @@ import { describe, expect, it } from "vitest";
 import { ExchangeBroker } from "../../src/broker/exchange-broker.js";
 import { systemClock } from "../../src/clock.js";
 import { createIdGenerator } from "../../src/ids.js";
-import {
-  type ConversationRequest,
-  createReplyFile,
-  createRequestFile,
-  createStateFile,
-  serializeFile,
-} from "../../src/model.js";
+import { type ConversationRequest, createRequestFile, createStateFile } from "../../src/model.js";
 import { ExchangeStore } from "../../src/store/exchange-store.js";
 import { makeTempDir } from "../helpers/fs.js";
-import { postChat, startServe } from "../helpers/system.js";
+import { answerEverything, postChat, startServe } from "../helpers/system.js";
 
 const NOW = "2026-10-09T14:05:12.000Z";
 
@@ -27,24 +21,6 @@ function conversation(content: string): ConversationRequest {
     conversation: [{ role: "user", content }],
     originalRequest: { model: "m" },
   };
-}
-
-/** Plays the human: answers every waiting request with "answer to <question>". */
-async function answerEverything(storageDir: string, count: number): Promise<void> {
-  const store = new ExchangeStore({ rootDir: storageDir });
-  const done = new Set<string>();
-  while (done.size < count) {
-    for (const id of await store.listIds()) {
-      const request = await store.readRequest(id);
-      if (done.has(id) || request.kind !== "ok") {
-        continue;
-      }
-      const question = request.value.conversation[0]?.content ?? "";
-      await store.placeReply(id, serializeFile(createReplyFile(`answer to ${question}`, NOW)));
-      done.add(id);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
 }
 
 describe("ten requests at the same time (NFR8.1, NFR8.3)", () => {

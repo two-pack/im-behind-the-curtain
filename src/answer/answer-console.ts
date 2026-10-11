@@ -1,15 +1,21 @@
 /**
  * The screen of `imbehind answer`: shows the oldest waiting request, reads the person's
- * reply, places it, and tells whether it was used.
+ * reply (or the wish to skip the request), places it, and tells how the request ended.
  */
-import { createInterface } from "node:readline";
+import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
-import type { BrokerEvent, ExchangeBroker, WaitingExchange } from "../broker/exchange-broker.js";
+import type {
+  BrokerEvent,
+  Confirmation,
+  ExchangeBroker,
+  WaitingExchange,
+  WaitingListing,
+} from "../broker/exchange-broker.js";
 import type { Clock } from "../clock.js";
 import { EXIT, IoFailure } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger, Screen } from "../log.js";
-import type { ReplyKind } from "../model.js";
+import type { ReplyFileKind, ReplyKind } from "../model.js";
 import { endOfInputHint } from "../platform.js";
 import { conversationLines, escapeAllControls, escapeControls } from "./conversation-view.js";
 
@@ -18,8 +24,17 @@ const TEXT = {
   waiting: "Waiting for requests... (press Ctrl+C to quit)",
   emptyReply: "The reply is empty. Type a reply, or press Ctrl+C to quit.",
   sent: "Sent.",
+  skipped: "Skipped.",
+  skipPrompt: "Skip this request? The client will receive an error. [y/N] ",
   notSent: "Not sent: this request was already answered in another window.",
-  inputClosed: "Error: input closed.",
+  ended: "Not sent: this request has already ended.",
+  cancelled: "Cancelled: the client disconnected. Your reply will not be sent.",
+  timedOut: (limitSeconds: number | undefined) =>
+    `Timed out: the request waited longer than ${
+      limitSeconds === undefined ? "the wait limit" : `${limitSeconds} seconds`
+    }. Your reply will not be sent.`,
+  newRequests: (count: number) => `New request received. ${count} requests are waiting.`,
+  inputEnded: "Error: input ended. Nothing was sent; the request is still waiting.",
   writeFailed: (detail: string) => `Error: could not write the reply. ${detail}.`,
   quit: (id: string) => `Quit. Request ${shortId(id)} is still waiting.`,
   unsupported: (id: string) =>
@@ -42,15 +57,23 @@ export type ReadResult =
   | { kind: "reply"; text: string; gotInput: boolean }
   | { kind: "interrupted" };
 
-/** Reads one reply: the lines the person types, until they end the input. */
+/** The answer to one question: a line, the end of the input, or Ctrl+C. */
+export type LineResult = { kind: "line"; text: string } | { kind: "end" } | { kind: "interrupted" };
+
+/** Reads what the person types. */
 export interface ReplyReader {
+  /** Reads one reply: the lines the person types, until they end the input. */
   readReply(signal: AbortSignal): Promise<ReadResult>;
+  /** Shows `prompt` and reads the one line that answers it. */
+  readLine(prompt: string, signal: AbortSignal): Promise<LineResult>;
+  /** Writes one line above what the person is typing, and draws the typed text again. */
+  notify(text: string): void;
 }
 
 /**
- * A reader that opens a fresh line reader for every reply, so that ending one reply with
- * the end-of-input key does not stop the next one. Standard input that has already ended
- * gives an empty reply at once.
+ * A reader that opens a fresh line reader for every reply and every question, so that ending
+ * one reply with the end-of-input key does not stop the next one. Standard input that has
+ * already ended gives an empty reply, or the end of the input, at once.
  */
 export function createReplyReader(
   input: Readable,
@@ -58,7 +81,13 @@ export function createReplyReader(
   terminal: boolean,
   options: ReplyReaderOptions = {},
 ): ReplyReader {
-  const reader = { input, output, terminal, ctrlZEnds: options.ctrlZEnds === true };
+  const reader: ReaderSetup = {
+    input,
+    output,
+    terminal,
+    ctrlZEnds: options.ctrlZEnds === true,
+    active: undefined,
+  };
   return {
     readReply: (signal) => {
       if (signal.aborted) {
@@ -69,6 +98,16 @@ export function createReplyReader(
       }
       return readOneReply(reader, signal);
     },
+    readLine: (prompt, signal) => {
+      if (signal.aborted) {
+        return Promise.resolve<LineResult>({ kind: "interrupted" });
+      }
+      if (input.readableEnded) {
+        return Promise.resolve<LineResult>({ kind: "end" });
+      }
+      return readOneLine(reader, prompt, signal);
+    },
+    notify: (text) => showAboveInput(reader, text),
   };
 }
 
@@ -82,6 +121,8 @@ interface ReaderSetup {
   output: Writable;
   terminal: boolean;
   ctrlZEnds: boolean;
+  /** The line reader that is open now, if the person is typing. */
+  active: Interface | undefined;
 }
 
 interface KeyPress {
@@ -89,21 +130,66 @@ interface KeyPress {
   name?: string;
 }
 
+/**
+ * On Windows "Ctrl+Z, then Enter" ends the input, but Node's line reader ignores it. This
+ * watches the keys, so the caller can tell that the Enter that just came followed Ctrl+Z.
+ */
+function watchCtrlZ(setup: ReaderSetup, rl: Interface) {
+  let pressed = false;
+  const onKeypress = (_text: string | undefined, key: KeyPress | undefined): void => {
+    if (key?.ctrl === true && key.name === "z") {
+      pressed = true;
+    } else if (key?.name !== "return" && key?.name !== "enter") {
+      pressed = false;
+    }
+  };
+  if (setup.ctrlZEnds) {
+    // A listener keeps Node from suspending the program on Ctrl+Z (a non-Windows habit).
+    rl.on("SIGTSTP", () => undefined);
+    setup.input.on("keypress", onKeypress);
+  }
+  return {
+    pressed: () => pressed,
+    stop: () => {
+      setup.input.off("keypress", onKeypress);
+    },
+  };
+}
+
+/** Writes a line above the one the person is typing. The typed text and the prompt stay. */
+function showAboveInput(setup: ReaderSetup, text: string): void {
+  const { output, active, terminal } = setup;
+  if (active === undefined) {
+    output.write(`${text}\n`);
+    return;
+  }
+  if (terminal) {
+    clearLine(output, 0);
+    cursorTo(output, 0);
+  } else {
+    output.write("\n");
+  }
+  output.write(`${text}\n`);
+  active.prompt(true);
+}
+
 /** Reads the lines of one reply with a new line reader, and closes it at the end. */
 function readOneReply(setup: ReaderSetup, signal: AbortSignal): Promise<ReadResult> {
-  const { input, output, terminal, ctrlZEnds } = setup;
+  const { input, output, terminal } = setup;
   return new Promise<ReadResult>((resolve) => {
     const lines: string[] = [];
     const rl = createInterface({ input, output, terminal, prompt: "> " });
+    setup.active = rl;
+    const ctrlZ = watchCtrlZ(setup, rl);
     let settled = false;
-    let ctrlZPressed = false;
     const finish = (result: ReadResult): void => {
       if (settled) {
         return;
       }
       settled = true;
       signal.removeEventListener("abort", onAbort);
-      input.off("keypress", onKeypress);
+      ctrlZ.stop();
+      setup.active = undefined;
       rl.close();
       // The last "> " prompt has no line break. End the line so later text starts on a new one.
       output.write("\n");
@@ -112,16 +198,9 @@ function readOneReply(setup: ReaderSetup, signal: AbortSignal): Promise<ReadResu
     const finishWithLines = (): void =>
       finish({ kind: "reply", text: lines.join("\n"), gotInput: lines.length > 0 });
     const onAbort = (): void => finish({ kind: "interrupted" });
-    const onKeypress = (_text: string | undefined, key: KeyPress | undefined): void => {
-      if (key?.ctrl === true && key.name === "z") {
-        ctrlZPressed = true;
-      } else if (key?.name !== "return" && key?.name !== "enter") {
-        ctrlZPressed = false;
-      }
-    };
     signal.addEventListener("abort", onAbort, { once: true });
     rl.on("line", (line) => {
-      if (ctrlZPressed) {
+      if (ctrlZ.pressed()) {
         // Ctrl+Z then Enter ends the input. Text typed before Ctrl+Z on this line is kept.
         if (line !== "") {
           lines.push(line);
@@ -134,11 +213,40 @@ function readOneReply(setup: ReaderSetup, signal: AbortSignal): Promise<ReadResu
     });
     rl.on("SIGINT", onAbort);
     rl.on("close", finishWithLines);
-    if (ctrlZEnds) {
-      // A listener keeps Node from suspending the program on Ctrl+Z (a non-Windows habit).
-      rl.on("SIGTSTP", () => undefined);
-      input.on("keypress", onKeypress);
-    }
+    rl.prompt();
+  });
+}
+
+/** Asks one question with a new line reader and reads the one line that answers it. */
+function readOneLine(setup: ReaderSetup, prompt: string, signal: AbortSignal): Promise<LineResult> {
+  const { input, output, terminal } = setup;
+  return new Promise<LineResult>((resolve) => {
+    const rl = createInterface({ input, output, terminal, prompt });
+    setup.active = rl;
+    const ctrlZ = watchCtrlZ(setup, rl);
+    let settled = false;
+    const finish = (result: LineResult): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      ctrlZ.stop();
+      setup.active = undefined;
+      rl.close();
+      // A terminal shows the answer and its line break. Otherwise the question has none.
+      if (result.kind !== "line" || !terminal) {
+        output.write("\n");
+      }
+      resolve(result);
+    };
+    const onAbort = (): void => finish({ kind: "interrupted" });
+    signal.addEventListener("abort", onAbort, { once: true });
+    rl.on("line", (line) =>
+      finish(ctrlZ.pressed() ? { kind: "end" } : { kind: "line", text: line }),
+    );
+    rl.on("SIGINT", onAbort);
+    rl.on("close", () => finish({ kind: "end" }));
     rl.prompt();
   });
 }
@@ -174,17 +282,46 @@ export interface AnswerConsoleOptions {
   pollIntervalMs: number;
 }
 
-type Typed = { kind: "text"; text: string } | { kind: "exit"; code: number };
+/** What a request that ended while the person was busy tells: the client left, or time ran out. */
+type Closed = Extract<Confirmation, { kind: "cancelled" | "timed_out" }>;
+
+type Typed =
+  | { kind: "text"; text: string }
+  | { kind: "skip" }
+  | { kind: "closed"; closed: Closed }
+  | { kind: "exit"; code: number };
+
+/** The sentence for how a request ended, or undefined while it still waits. */
+function endingLine(result: Confirmation): string | undefined {
+  switch (result.kind) {
+    case "sent":
+      return TEXT.sent;
+    case "skipped":
+      return TEXT.skipped;
+    case "elsewhere":
+      return TEXT.notSent;
+    case "cancelled":
+      return TEXT.cancelled;
+    case "timed_out":
+      return TEXT.timedOut(result.limitSeconds);
+    case "ended":
+      return TEXT.ended;
+    default:
+      return undefined;
+  }
+}
+
+const NO_REQUESTS: WaitingListing = { waiting: [], unsupported: [] };
 
 export class AnswerConsole {
   private readonly options: AnswerConsoleOptions;
   /** Requests this answer already put a reply on, or lost to another window. */
   private readonly placed = new Set<string>();
   private readonly noticed = new Set<string>();
+  /** The ids of the waiting requests the last look saw, to tell the new ones. */
+  private seen: ReadonlySet<string> = new Set();
   private waitingShown = false;
   private listFailed = false;
-  /** How many times in a row the input ended without any text. */
-  private emptyStreak = 0;
 
   constructor(options: AnswerConsoleOptions) {
     this.options = options;
@@ -202,15 +339,15 @@ export class AnswerConsole {
 
   private async loop(signal: AbortSignal): Promise<number> {
     while (!signal.aborted) {
-      const listing = await this.list();
-      this.noticeUnsupported(listing.unsupported);
+      const listing = (await this.list()) ?? NO_REQUESTS;
+      this.noticeUnsupported(listing.unsupported, (text) => this.options.screen.line(text));
       const first = listing.waiting[0];
       if (first === undefined) {
         await this.idle(signal);
         continue;
       }
       this.waitingShown = false;
-      const exit = await this.answerOne(first, listing.waiting.length, signal);
+      const exit = await this.answerOne(first, listing.waiting, signal);
       if (exit !== undefined) {
         return exit;
       }
@@ -227,7 +364,8 @@ export class AnswerConsole {
     }
   }
 
-  private async list() {
+  /** The waiting requests in id order, or undefined when the storage could not be read. */
+  private async list(): Promise<WaitingListing | undefined> {
     try {
       const listing = await this.options.broker.listWaiting(this.placed);
       if (this.listFailed) {
@@ -241,15 +379,16 @@ export class AnswerConsole {
       }
       this.listFailed = true;
       this.options.logger.failure(undefined, error.reason);
-      return { waiting: [], unsupported: [] };
+      return undefined;
     }
   }
 
-  private noticeUnsupported(ids: readonly string[]): void {
+  /** Tells once for each request this version cannot show. `write` is where the line goes. */
+  private noticeUnsupported(ids: readonly string[], write: (text: string) => void): void {
     for (const id of ids) {
       if (!this.noticed.has(id)) {
         this.noticed.add(id);
-        this.options.screen.line(TEXT.unsupported(id));
+        write(TEXT.unsupported(id));
       }
     }
   }
@@ -265,15 +404,23 @@ export class AnswerConsole {
   /** Shows one request and carries it through. Returns an exit code when the program must end. */
   private async answerOne(
     item: WaitingExchange,
-    total: number,
+    waiting: readonly WaitingExchange[],
     signal: AbortSignal,
   ): Promise<number | undefined> {
-    this.show(item, total);
+    this.show(item, waiting.length);
+    this.seen = new Set(waiting.map((other) => other.id));
     const typed = await this.collect(item, signal);
-    if (typed.kind === "exit") {
-      return typed.code;
+    switch (typed.kind) {
+      case "exit":
+        return typed.code;
+      case "closed":
+        this.options.screen.line(endingLine(typed.closed) ?? TEXT.ended);
+        return undefined;
+      case "skip":
+        return this.send(item.id, "", "skip", signal);
+      default:
+        return this.send(item.id, typed.text, item.request.replyKind, signal);
     }
-    return this.send(item.id, typed.text, item.request.replyKind, signal);
   }
 
   private show(item: WaitingExchange, total: number): void {
@@ -309,28 +456,136 @@ export class AnswerConsole {
     screen.line("");
   }
 
-  /** Reads until there is a reply that is not empty, or until the program must end. */
+  /** Reads until there is a reply, or a wish to skip, or until the request or the program ends. */
   private async collect(item: WaitingExchange, signal: AbortSignal): Promise<Typed> {
     for (;;) {
-      const read = await this.options.reader.readReply(signal);
-      if (read.kind === "interrupted") {
-        this.options.screen.line(TEXT.quit(item.id));
-        return { kind: "exit", code: EXIT.interrupted };
+      const typed = await this.typeOnce(item, signal);
+      if (typed !== undefined) {
+        return typed;
       }
-      this.emptyStreak = read.gotInput ? 0 : this.emptyStreak + 1;
-      if (this.emptyStreak >= 2) {
-        this.options.errorScreen.line(TEXT.inputClosed);
-        return { kind: "exit", code: EXIT.failure };
+    }
+  }
+
+  /** One round of typing. Undefined means the same request asks again. */
+  private async typeOnce(item: WaitingExchange, signal: AbortSignal): Promise<Typed | undefined> {
+    const { reader, screen } = this.options;
+    const read = await this.watched(item.id, signal, (stop) => reader.readReply(stop));
+    if ("closed" in read) {
+      return { kind: "closed", closed: read.closed };
+    }
+    if (read.value.kind === "interrupted") {
+      return this.quit(item);
+    }
+    if (!read.value.gotInput) {
+      return this.confirmSkip(item, signal);
+    }
+    const text = normalizeReply(read.value.text);
+    if (text === "") {
+      screen.line(TEXT.emptyReply);
+      return undefined;
+    }
+    return this.accepts(item.request.replyKind, text) ? { kind: "text", text } : undefined;
+  }
+
+  /** Nothing was typed: asks whether to skip. Only y or Y skips. */
+  private async confirmSkip(
+    item: WaitingExchange,
+    signal: AbortSignal,
+  ): Promise<Typed | undefined> {
+    const { reader, errorScreen } = this.options;
+    const asked = await this.watched(item.id, signal, (stop) =>
+      reader.readLine(TEXT.skipPrompt, stop),
+    );
+    if ("closed" in asked) {
+      return { kind: "closed", closed: asked.closed };
+    }
+    const { value } = asked;
+    if (value.kind === "interrupted") {
+      return this.quit(item);
+    }
+    if (value.kind === "end") {
+      errorScreen.line(TEXT.inputEnded);
+      return { kind: "exit", code: EXIT.failure };
+    }
+    return value.text === "y" || value.text === "Y" ? { kind: "skip" } : undefined;
+  }
+
+  private quit(item: WaitingExchange): Typed {
+    this.options.screen.line(TEXT.quit(item.id));
+    return { kind: "exit", code: EXIT.interrupted };
+  }
+
+  /**
+   * Runs a read while the request is watched. When the client leaves or
+   * the wait limit passes, the read is stopped at once and `closed` tells why.
+   */
+  private async watched<T>(
+    id: string,
+    signal: AbortSignal,
+    read: (stop: AbortSignal) => Promise<T>,
+  ): Promise<{ value: T } | { closed: Closed }> {
+    const stop = new AbortController();
+    const either = AbortSignal.any([signal, stop.signal]);
+    const result: { closed?: Closed } = {};
+    const watching = this.watch(id, either, (closed) => {
+      result.closed = closed;
+      stop.abort();
+    });
+    try {
+      const value = await read(either);
+      return result.closed === undefined ? { value } : { closed: result.closed };
+    } finally {
+      stop.abort();
+      await watching;
+    }
+  }
+
+  /** Looks at the request every poll interval until `signal` aborts or the request is closed. */
+  private async watch(
+    id: string,
+    signal: AbortSignal,
+    onClosed: (closed: Closed) => void,
+  ): Promise<void> {
+    const { clock, pollIntervalMs } = this.options;
+    for (;;) {
+      await clock.sleep(pollIntervalMs, signal);
+      if (signal.aborted) {
+        return;
       }
-      const text = normalizeReply(read.text);
-      if (text === "") {
-        this.options.screen.line(TEXT.emptyReply);
-      } else {
-        this.emptyStreak = 0;
-        if (this.accepts(item.request.replyKind, text)) {
-          return { kind: "text", text };
-        }
+      const state = await this.confirm(id, undefined);
+      if (signal.aborted) {
+        return;
       }
+      if (state.kind === "cancelled" || state.kind === "timed_out") {
+        onClosed(state);
+        return;
+      }
+      await this.noticeNewRequests(id, state.kind === "pending", signal);
+    }
+  }
+
+  /** Tells the count when a request came that the last look had not seen. */
+  private async noticeNewRequests(
+    shownId: string,
+    shownStillWaiting: boolean,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const listing = await this.list();
+    if (listing === undefined || signal.aborted) {
+      return;
+    }
+    // A request that cannot be shown is told about only once, so it must not be lost here.
+    this.noticeUnsupported(listing.unsupported, (text) => this.options.reader.notify(text));
+    const ids = listing.waiting.map((item) => item.id);
+    // The listing leaves out a request that already has a reply file, so the shown request is
+    // counted here for as long as its state is waiting.
+    if (shownStillWaiting && !ids.includes(shownId)) {
+      ids.push(shownId);
+    }
+    const hasNew = ids.some((id) => !this.seen.has(id));
+    this.seen = new Set(ids);
+    if (hasNew && ids.length > 1) {
+      this.options.reader.notify(TEXT.newRequests(ids.length));
     }
   }
 
@@ -350,10 +605,10 @@ export class AnswerConsole {
   private async send(
     id: string,
     text: string,
-    kind: ReplyKind,
+    kind: ReplyFileKind,
     signal: AbortSignal,
   ): Promise<number | undefined> {
-    const { broker, screen, errorScreen, clock, pollIntervalMs } = this.options;
+    const { broker, errorScreen, clock, pollIntervalMs } = this.options;
     let placed: Awaited<ReturnType<ExchangeBroker["placeReply"]>>;
     try {
       placed = await broker.placeReply(id, text, kind);
@@ -366,28 +621,23 @@ export class AnswerConsole {
       return undefined;
     }
     this.placed.add(id);
-    if (placed.kind === "too-late") {
-      screen.line(TEXT.notSent);
-      return undefined;
-    }
-    return this.awaitConfirmation(id, placed.bytes, signal);
+    return this.awaitEnding(id, placed.kind === "placed" ? placed.bytes : undefined, signal);
   }
 
-  /** Waits until serve has accepted a reply, then tells whether it was this answer's reply. */
-  private async awaitConfirmation(
+  /**
+   * Waits until the request is no longer waiting, then tells how it ended. With
+   * no `bytes` this answer placed nothing, so a reply that was used is another window's.
+   */
+  private async awaitEnding(
     id: string,
-    bytes: string,
+    bytes: string | undefined,
     signal: AbortSignal,
   ): Promise<number | undefined> {
     const { screen, clock, pollIntervalMs } = this.options;
     while (!signal.aborted) {
-      const result = await this.confirm(id, bytes);
-      if (result === "confirmed") {
-        screen.line(TEXT.sent);
-        return undefined;
-      }
-      if (result === "not-ours") {
-        screen.line(TEXT.notSent);
+      const line = endingLine(await this.confirm(id, bytes));
+      if (line !== undefined) {
+        screen.line(line);
         return undefined;
       }
       await clock.sleep(pollIntervalMs, signal);
@@ -399,13 +649,13 @@ export class AnswerConsole {
    * One look at the outcome. A state file that cannot be read, or a read that throws, is written
    * once with its fixed reason, and the next poll tries again.
    */
-  private async confirm(id: string, bytes: string) {
+  private async confirm(id: string, bytes: string | undefined): Promise<Confirmation> {
     const { broker, logger } = this.options;
     try {
       const result = await broker.confirmReply(id, bytes);
-      if (result === "unreadable") {
+      if (result.kind === "unreadable") {
         logger.failure(shortId(id), "unreadable");
-        return "pending" as const;
+        return { kind: "pending" };
       }
       logger.recovered(shortId(id));
       return result;
@@ -414,7 +664,7 @@ export class AnswerConsole {
         throw error;
       }
       logger.failure(shortId(id), error.reason);
-      return "pending" as const;
+      return { kind: "pending" };
     }
   }
 }

@@ -16,7 +16,9 @@ export type ErrorCode =
   | "request_too_large"
   | "not_found"
   | "method_not_allowed"
-  | "storage_error";
+  | "storage_error"
+  | "skipped_by_human"
+  | "reply_timeout";
 
 /** The fixed English sentences of this API. A request value is never copied into them. */
 export const MESSAGES = {
@@ -30,6 +32,7 @@ export const MESSAGES = {
   notFound: "Not found.",
   methodNotAllowed: "Method not allowed.",
   storage: "The request could not be stored.",
+  skipped: "The human skipped this request.",
   crossOrigin: "Cross-origin requests are not accepted.",
   unexpectedHost: "Unexpected Host header.",
 } as const;
@@ -318,7 +321,19 @@ export function buildStreamEvents(input: StreamInput): string[] {
   return [...chunks.map(event), "data: [DONE]\n\n"];
 }
 
+/** The message of the 504 answer. The limit is the number of seconds the server waited. */
+export function replyTimeoutMessage(limitSeconds: number): string {
+  return `No reply within ${limitSeconds} seconds. Increase the server timeout or reply sooner.`;
+}
+
+/** The codes of the answers with status 500 and above. All others are the client's mistakes. */
+const SERVER_ERROR_CODES: readonly ErrorCode[] = [
+  "storage_error",
+  "skipped_by_human",
+  "reply_timeout",
+];
+
 export function errorBody(code: ErrorCode, message: string): ErrorBody {
-  const type = code === "storage_error" ? "server_error" : "invalid_request_error";
+  const type = SERVER_ERROR_CODES.includes(code) ? "server_error" : "invalid_request_error";
   return { error: { message, type, code } };
 }

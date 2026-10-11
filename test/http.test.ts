@@ -15,10 +15,14 @@ afterEach(async () => {
   await Promise.all(started.splice(0, started.length).map((server) => server.close()));
 });
 
-async function startServer(port = 0, makeLogger?: (options: LoggerOptions) => Logger) {
+async function startServer(
+  port = 0,
+  makeLogger?: (options: LoggerOptions) => Logger,
+  waitLimitSeconds?: number,
+) {
   const store = new FakeStore();
   const clock = new FakeClock();
-  const broker = new ExchangeBroker({ store, clock, pollIntervalMs: 500 });
+  const broker = new ExchangeBroker({ store, clock, pollIntervalMs: 500, waitLimitSeconds });
   const out: string[] = [];
   const err: string[] = [];
   const loggerOptions: LoggerOptions = {
@@ -529,6 +533,221 @@ function eventsOf(text: string): string[] {
       return block.slice("data: ".length);
     });
 }
+
+/** Sends a chat request that the test can drop later. The client ignores every answer. */
+function sendDroppable(port: number, body: string): http.ClientRequest {
+  const request = http.request({
+    host: "127.0.0.1",
+    port,
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: { "Content-Type": "application/json" },
+  });
+  request.on("error", () => {});
+  request.end(body);
+  return request;
+}
+
+function stateName(context: Awaited<ReturnType<typeof startServer>>, id: string): string {
+  const state = context.store.entries.get(id)?.state;
+  return typeof state === "object" ? state.state : String(state);
+}
+
+describe("a request the human skipped", () => {
+  const skip = serializeFile(createReplyFile("", "2026-10-09T14:05:12.000Z", "skip"));
+
+  it("answers 503 skipped_by_human and writes the skipped line", async () => {
+    const context = await startServer();
+    const held = await holdOneRequest(context, "Hello");
+    context.store.putFile(held.id, "reply.json", skip);
+    await context.broker.pollOnce();
+    const reply = await held.pending;
+    expect(reply.status).toBe(503);
+    expect(reply.headers["content-type"]).toContain("application/json");
+    expect(reply.json()).toEqual({
+      error: {
+        message: "The human skipped this request.",
+        type: "server_error",
+        code: "skipped_by_human",
+      },
+    });
+    const short = held.id.slice(-6);
+    expect(context.out[1]).toMatch(new RegExp(`^\\d\\d:\\d\\d:\\d\\d skipped {4}${short}\\n$`));
+    expect(stateName(context, held.id)).toBe("skipped");
+  });
+
+  it("answers the same error without starting a stream when stream is true", async () => {
+    const context = await startServer();
+    const pending = send(context.port, { body: chat("Hello", { stream: true }) });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()];
+    context.store.putFile(id as string, "reply.json", skip);
+    await context.broker.pollOnce();
+    const reply = await pending;
+    expect(reply.status).toBe(503);
+    expect(reply.headers["content-type"]).toContain("application/json");
+    expect(reply.text).not.toContain("data:");
+    expect(reply.json().error.code).toBe("skipped_by_human");
+  });
+});
+
+describe("a request that waited too long", () => {
+  it("answers 504 reply_timeout once the wait limit has passed, and writes the timed_out line", async () => {
+    const context = await startServer(0, undefined, 1);
+    const held = await holdOneRequest(context, "Hello");
+    await context.clock.advance(999);
+    expect(stateName(context, held.id)).toBe("waiting");
+    await context.clock.advance(1);
+    const reply = await held.pending;
+    expect(reply.status).toBe(504);
+    expect(reply.json()).toEqual({
+      error: {
+        message: "No reply within 1 seconds. Increase the server timeout or reply sooner.",
+        type: "server_error",
+        code: "reply_timeout",
+      },
+    });
+    const short = held.id.slice(-6);
+    expect(context.out[1]).toMatch(new RegExp(`^\\d\\d:\\d\\d:\\d\\d timed_out {2}${short}\\n$`));
+    expect(stateName(context, held.id)).toBe("timed_out");
+  });
+
+  it("answers a streaming request with the JSON error, not a stream", async () => {
+    const context = await startServer(0, undefined, 1);
+    const pending = send(context.port, { body: chat("Hello", { stream: true }) });
+    await waitFor(() => context.store.entries.size === 1);
+    await context.clock.advance(1000);
+    const reply = await pending;
+    expect(reply.status).toBe(504);
+    expect(reply.headers["content-type"]).toContain("application/json");
+  });
+
+  it("keeps waiting for ever when the limit is 0", async () => {
+    const context = await startServer(0, undefined, 0);
+    const held = await holdOneRequest(context, "Hello");
+    await context.clock.advance(31 * 60 * 1000);
+    expect(stateName(context, held.id)).toBe("waiting");
+    await answer(context, held.id, "still here");
+    expect((await held.pending).json().choices[0]?.message.content).toBe("still here");
+  });
+});
+
+describe("a client that goes away", () => {
+  it("ends the request as cancelled, writes the cancelled line and writes no answer", async () => {
+    const context = await startServer();
+    const client = sendDroppable(context.port, chat("Hello"));
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as string[];
+    client.destroy();
+    await waitFor(() => stateName(context, id as string) === "cancelled");
+    expect(context.out).toHaveLength(2);
+    expect(context.out[1]).toMatch(
+      new RegExp(
+        `^\\d\\d:\\d\\d:\\d\\d cancelled {2}${(id as string).slice(-6)} {2}client disconnected\\n$`,
+      ),
+    );
+    expect(context.unexpected).toEqual([]);
+    expect(context.store.entries.get(id as string)?.state).toMatchObject({
+      endReason: "client disconnected",
+    });
+  });
+
+  it("ends the request as cancelled when the client leaves while it is being stored", async () => {
+    const context = await startServer();
+    let release: () => void = () => {};
+    context.store.gate(
+      "createRequest",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const client = sendDroppable(context.port, chat("Hello"));
+    await waitFor(() => context.store.count("createRequest") === 1);
+    client.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    context.store.gate("createRequest", undefined);
+    release();
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as string[];
+    await waitFor(() => stateName(context, id as string) === "cancelled");
+    expect(context.unexpected).toEqual([]);
+  });
+
+  it("does not leave a request waiting when the client leaves during storing and there is no limit", async () => {
+    const context = await startServer(0, undefined, 0);
+    let release: () => void = () => {};
+    context.store.gate(
+      "createRequest",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const client = sendDroppable(context.port, chat("Hello"));
+    await waitFor(() => context.store.count("createRequest") === 1);
+    client.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    context.store.gate("createRequest", undefined);
+    release();
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as string[];
+    await waitFor(() => stateName(context, id as string) === "cancelled");
+  });
+
+  it("does not take a finished request body for a disconnect: the response close counts, not the request close", async () => {
+    // Node emits the close of a request as soon as its body has been read.
+    const context = await startServer();
+    const held = await holdOneRequest(context, "body read");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(stateName(context, held.id)).toBe("waiting");
+    expect(context.out).toHaveLength(1);
+    await answer(context, held.id, "still connected");
+    expect((await held.pending).json().choices[0]?.message.content).toBe("still connected");
+    expect(stateName(context, held.id)).toBe("replied");
+  });
+
+  it("does not cancel a request that was answered, when its connection closes later", async () => {
+    const context = await startServer();
+    const held = await holdOneRequest(context, "Hello");
+    await answer(context, held.id, "done");
+    await held.pending;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(context.store.count("writeState")).toBe(1);
+    expect(stateName(context, held.id)).toBe("replied");
+  });
+
+  it("goes on with the other requests", async () => {
+    const context = await startServer();
+    const gone = sendDroppable(context.port, chat("gone"));
+    await waitFor(() => context.store.entries.size === 1);
+    const other = await holdOneRequest(context, "other");
+    gone.destroy();
+    const [goneId] = [...context.store.entries.keys()] as string[];
+    await waitFor(() => stateName(context, goneId as string) === "cancelled");
+    await answer(context, other.id, "still served");
+    expect((await other.pending).json().choices[0]?.message.content).toBe("still served");
+    expect(context.unexpected).toEqual([]);
+  });
+});
+
+describe("stopping serve with requests that wait", () => {
+  it("closes their connections without an answer, cancels their timers and leaves them waiting", async () => {
+    const context = await startServer(0, undefined, 60);
+    const held = await holdOneRequest(context, "Hello");
+    const outcome = held.pending.then(
+      () => "answered",
+      () => "dropped",
+    );
+    expect(context.clock.sleeping).toBe(1);
+    await context.server.close();
+    expect(await outcome).toBe("dropped");
+    expect(context.clock.sleeping).toBe(0);
+    expect(stateName(context, held.id)).toBe("waiting");
+    expect(context.store.count("writeState")).toBe(0);
+    expect(context.out).toHaveLength(1);
+    await context.clock.advance(120_000);
+    expect(stateName(context, held.id)).toBe("waiting");
+  });
+});
 
 describe("streaming", () => {
   async function streamed(extra: Record<string, unknown>, content = "Hi") {

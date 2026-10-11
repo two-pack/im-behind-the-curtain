@@ -2,9 +2,11 @@ import { spawn } from "node:child_process";
 import { readdir } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { BarrierReader } from "../helpers/barrier-reader.js";
+import { FakeClock } from "../helpers/fake-clock.js";
 import { waitFor } from "../helpers/io.js";
 import { ScriptedReader } from "../helpers/scripted-reader.js";
-import { startAnswer, startServe } from "../helpers/system.js";
+import { answerEverything, startAnswer, startServe, storedStates } from "../helpers/system.js";
 
 interface CurlResult {
   code: number | null;
@@ -187,7 +189,10 @@ describe("a round trip with curl (NFR4.1)", () => {
 
 interface CurlReply {
   status: number;
-  body: { error?: { message: string; type: string; code: string } };
+  body: {
+    error?: { message: string; type: string; code: string };
+    choices?: { message: { content: string } }[];
+  };
 }
 
 /** POSTs a body with curl and returns the status and the JSON body. Write errors are tolerated. */
@@ -287,5 +292,171 @@ describe("requests that are turned away or let through", () => {
     await waitFor(() => answer.stdout().includes("Sent."));
     expect(answer.stdout()).toContain("User:\n  Hello\n");
     expect(answer.stdout()).not.toContain("foo");
+  });
+});
+
+/** A body with one user message. */
+function chatBody(content: string): string {
+  return JSON.stringify({ model: "m", messages: [{ role: "user", content }] });
+}
+
+describe("many requests, skipping, leaving and waiting too long with curl", () => {
+  it("returns each of ten simultaneous requests its own answer (NFR8.1)", async () => {
+    const serve = await startServe();
+    const answering = answerEverything(serve.storageDir, 10);
+    const questions = Array.from({ length: 10 }, (_, index) => `question ${index}`);
+
+    const replies = await Promise.all(
+      questions.map((question) => curlPost(serve.baseUrl, chatBody(question))),
+    );
+    await answering;
+
+    replies.forEach((reply, index) => {
+      expect(reply.status).toBe(200);
+      expect(reply.body.choices?.[0]?.message.content).toBe(`answer to question ${index}`);
+    });
+    expect(await storedStates(serve.storageDir)).toEqual(Array(10).fill("replied"));
+  });
+
+  it("answers 503 when the human skips, and the screen says Skipped.", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["EOF", "y"]));
+
+    const reply = await curlPost(serve.baseUrl, chatBody("Hello"));
+
+    expect(reply.status).toBe(503);
+    expect(reply.body.error).toEqual({
+      message: "The human skipped this request.",
+      type: "server_error",
+      code: "skipped_by_human",
+    });
+    await waitFor(() => answer.stdout().includes("Skipped."));
+    expect(answer.stdout()).not.toContain("Sent.");
+    expect(serve.stdout()).toMatch(/skipped {4}[0-9a-f]{6}\n/);
+    expect(await storedStates(serve.storageDir)).toEqual(["skipped"]);
+  });
+
+  it("ends the request as cancelled when curl goes away, and the screen says so while typing", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["WAIT"]));
+
+    const result = await curl(
+      [
+        "--silent",
+        "--max-time",
+        "2",
+        "-X",
+        "POST",
+        `${serve.baseUrl}/v1/chat/completions`,
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+        "@-",
+      ],
+      chatBody("Hello"),
+    );
+
+    expect(result.code).toBe(28);
+    await waitFor(() => answer.stdout().includes("Cancelled: the client disconnected."), 10_000);
+    expect(serve.stdout()).toMatch(/cancelled {2}[0-9a-f]{6} {2}client disconnected\n/);
+    expect(await storedStates(serve.storageDir)).toEqual(["cancelled"]);
+    expect(serve.stderr()).toBe("");
+  });
+
+  it("answers 504 after the wait limit of one second, and the request is gone from the list", async () => {
+    const serve = await startServe({ args: ["--timeout", "1"] });
+
+    const reply = await curlPost(serve.baseUrl, chatBody("Hello"));
+
+    expect(reply.status).toBe(504);
+    expect(reply.body.error).toEqual({
+      message: "No reply within 1 seconds. Increase the server timeout or reply sooner.",
+      type: "server_error",
+      code: "reply_timeout",
+    });
+    expect(await storedStates(serve.storageDir)).toEqual(["timed_out"]);
+    expect(serve.stdout()).toMatch(/timed_out {2}[0-9a-f]{6}\n/);
+    const answer = startAnswer(serve.storageDir, new ScriptedReader([]));
+    await waitFor(() => answer.stdout().includes("Waiting for requests..."));
+    expect(answer.stdout()).not.toContain("Request 1 of");
+  });
+
+  it("also takes the wait limit written as --timeout=1", async () => {
+    const serve = await startServe({ args: ["--timeout=1"] });
+    const reply = await curlPost(serve.baseUrl, chatBody("Hello"));
+    expect(reply.status).toBe(504);
+  });
+
+  it("waits 1800 seconds by default and then answers 504", async () => {
+    const clock = new FakeClock();
+    const serve = await startServe({ clock });
+    const pending = curlPost(serve.baseUrl, chatBody("Hello"));
+    await waitFor(async () => (await storedStates(serve.storageDir)).length === 1);
+
+    await clock.advance(1799 * 1000);
+    expect(await storedStates(serve.storageDir)).toEqual(["waiting"]);
+    await clock.advance(1000);
+
+    const reply = await pending;
+    expect(reply.status).toBe(504);
+    expect(reply.body.error?.message).toBe(
+      "No reply within 1800 seconds. Increase the server timeout or reply sooner.",
+    );
+    expect(await storedStates(serve.storageDir)).toEqual(["timed_out"]);
+  });
+
+  it("keeps the request waiting for ever when the limit is 0, even after 30 minutes", async () => {
+    const clock = new FakeClock();
+    const serve = await startServe({ clock, args: ["--timeout", "0"] });
+    let answered = false;
+    const pending = curlPost(serve.baseUrl, chatBody("Hello")).then((reply) => {
+      answered = true;
+      return reply;
+    });
+    await waitFor(async () => (await storedStates(serve.storageDir)).length === 1);
+
+    for (let minute = 0; minute < 31; minute += 1) {
+      await clock.advance(60 * 1000);
+    }
+
+    expect(answered).toBe(false);
+    expect(await storedStates(serve.storageDir)).toEqual(["waiting"]);
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["late but welcome"]));
+    // The clock of serve only moves when the test moves it, so the polls need pushes.
+    await waitFor(async () => {
+      await clock.advance(500);
+      return answered;
+    });
+    const reply = await pending;
+    expect(reply.status).toBe(200);
+    expect(reply.body.choices?.[0]?.message.content).toBe("late but welcome");
+    await waitFor(() => answer.stdout().includes("Sent."));
+  });
+
+  it("uses only the first of two screens that answer the same request", async () => {
+    const serve = await startServe();
+    let open: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    const readerA = new BarrierReader("from A", gate);
+    const readerB = new BarrierReader("from B", gate);
+    const answerA = startAnswer(serve.storageDir, readerA);
+    const answerB = startAnswer(serve.storageDir, readerB);
+    const pending = curlPost(serve.baseUrl, chatBody("Hello"));
+    await waitFor(() => readerA.arrived && readerB.arrived);
+
+    open();
+    const reply = await pending;
+
+    const both = () => [answerA.stdout(), answerB.stdout()];
+    await waitFor(
+      () =>
+        both().some((text) => text.includes("Not sent:")) &&
+        both().some((text) => text.includes("Sent.")),
+    );
+    const winner = answerA.stdout().includes("Sent.") ? "from A" : "from B";
+    expect(reply.body.choices?.[0]?.message.content).toBe(winner);
+    expect(await storedStates(serve.storageDir)).toEqual(["replied"]);
   });
 });

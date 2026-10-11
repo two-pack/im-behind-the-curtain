@@ -57,6 +57,92 @@ describe("choosing the command", () => {
   });
 });
 
+describe("the wait limit option", () => {
+  async function runWith(argv: string[], env: Record<string, string | undefined> = {}) {
+    const t = makeIo({ platform: "linux", env, homedir: "/home/alice" });
+    const exit = await main(argv, t.io, {
+      settings: { port: 0, storageDir: await makeTempDir() },
+    });
+    return { exit, err: t.err.lines(), out: t.out.text() };
+  }
+
+  it("accepts --timeout for serve, as separate words or with =", async () => {
+    for (const argv of [
+      ["serve", "--timeout", "5"],
+      ["serve", "--timeout=5"],
+    ]) {
+      const t = makeIo();
+      const exit = main(argv, t.io, { settings: { port: 0, storageDir: await makeTempDir() } });
+      stopped.push(async () => {
+        t.interrupt();
+        await exit;
+      });
+      await Promise.race([waitFor(() => t.out.text().includes("Listening on")), exit]);
+      expect(t.out.text()).toContain("Listening on");
+      expect(t.err.text()).toBe("");
+      t.interrupt();
+      expect(await exit).toBe(130);
+    }
+  });
+
+  it("ends with exit 2 and one Error line for a bad option value, before it touches storage", async () => {
+    const dir = path.join(await makeTempDir(), "never-created");
+    const t = makeIo();
+    const exit = await main(["serve", "--timeout", "abc"], t.io, {
+      settings: { port: 0, storageDir: dir },
+    });
+    expect(exit).toBe(2);
+    expect(t.err.lines()).toEqual([
+      'Error: --timeout must be a whole number of seconds from 0 to 2147483 (got "abc").',
+    ]);
+    expect(t.out.text()).toBe("");
+    await expect(stat(dir)).rejects.toThrow();
+  });
+
+  it("ends with exit 2 for a bad value of IMBEHIND_TIMEOUT and for an empty --timeout", async () => {
+    const fromEnv = await runWith(["serve"], { IMBEHIND_TIMEOUT: "-5" });
+    expect(fromEnv.exit).toBe(2);
+    expect(fromEnv.err).toEqual([
+      'Error: IMBEHIND_TIMEOUT must be a whole number of seconds from 0 to 2147483 (got "-5").',
+    ]);
+    const empty = await runWith(["serve", "--timeout", ""]);
+    expect(empty.exit).toBe(2);
+    expect(empty.err).toEqual([
+      'Error: --timeout must be a whole number of seconds from 0 to 2147483 (got "").',
+    ]);
+    const missing = await runWith(["serve", "--timeout"]);
+    expect(missing.exit).toBe(2);
+  });
+
+  it("does not accept --timeout for answer, and ignores IMBEHIND_TIMEOUT there", async () => {
+    const refused = await runWith(["answer", "--timeout", "5"]);
+    expect(refused.exit).toBe(1);
+    expect(refused.err).toEqual(["Error: usage: imbehind serve | imbehind answer"]);
+    const t = makeIo({ platform: "linux", env: { IMBEHIND_TIMEOUT: "abc" }, homedir: "/h" });
+    const exit = main(["answer"], t.io, { settings: { storageDir: await makeTempDir() } });
+    stopped.push(async () => {
+      t.interrupt();
+      await exit;
+    });
+    await waitFor(() => t.out.text().includes("Waiting for requests"));
+    t.interrupt();
+    expect(await exit).toBe(130);
+    expect(t.err.text()).toBe("");
+  });
+
+  it("keeps the usage line and exit 1 for other unknown arguments", async () => {
+    for (const argv of [
+      ["serve", "--bogus"],
+      ["serve", "5"],
+      ["serve", "--timeout", "5", "x"],
+    ]) {
+      const result = await runWith(argv);
+      expect(result.exit).toBe(1);
+      expect(result.err).toEqual(["Error: usage: imbehind serve | imbehind answer"]);
+    }
+  });
+});
+
 describe("imbehind serve", () => {
   it("prints the listening line, serves requests, and exits 130 on Ctrl+C", async () => {
     const t = await startServe();

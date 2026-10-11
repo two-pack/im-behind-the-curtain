@@ -58,6 +58,46 @@ node dist/bin.js answer   # 端末2: リクエストを表示して、返答を�
 
 この版の `imbehind serve` は、`127.0.0.1:3000` だけで待ち受けます。受け付けるのは、`POST /v1/chat/completions` に届く文章のメッセージです。ブラウザが付ける `Origin` ヘッダーのあるリクエストと、`Host` ヘッダーが `127.0.0.1` でも `localhost` でもないリクエストは断ります。
 
+### 依頼を飛ばす
+
+何も打ち込まずに入力を終えると（たとえば最初にCtrl+Dを押すと）、`imbehind answer` は `Skip this request? The client will receive an error. [y/N]` と聞きます。`y` か `Y` だけが、その依頼を飛ばします。クライアントには、コードが `skipped_by_human` の `503` のエラーが届き、`imbehind answer` は `Skipped.` と表示し、`imbehind serve` は `skipped` の行を表示します。Enterだけの場合を含め、ほかの答えでは飛ばさず、返答の入力に戻ります。この質問の途中で入力が終わったときは、何も送りません。`imbehind answer` は `Error: input ended. Nothing was sent; the request is still waiting.` と表示し、終了コード1で終わります。
+
+### 複数の依頼
+
+複数のクライアントが同時に待てます。`imbehind answer` は、古い依頼から1件ずつ表示し、そのたびに件数を数え直します。たとえば `--- Request 1 of 3 (...)` です。打ち込み中に新しい依頼が届くと、`New request received. 2 requests are waiting.` と表示します。件数には、いま返答している依頼も含めます。打ち込んだ内容は失われません。
+
+`imbehind answer` は、2つの端末で動かせます。両方が同じ依頼に返答したときは、先の返答だけが使われ、もう一方は `Not sent: this request was already answered in another window.` と表示します。
+
+### クライアントが切れたとき、待つ上限
+
+返答の前にクライアントが接続を閉じると、その依頼は `cancelled` で終わります。`imbehind answer` は、打ち込み中でもすぐに知らせます（`Cancelled: the client disconnected. Your reply will not be sent.`）。打ち込んだ内容は捨て、次の依頼へ進みます。`imbehind serve` は `cancelled  <id>  client disconnected` と表示します。
+
+`imbehind serve` は、既定で1800秒（30分）、返答を待ちます。`--timeout <秒>` か環境変数 `IMBEHIND_TIMEOUT` で変えられます。両方あるときは起動時の指定が優先で、空の環境変数は指定なしとして扱います。値は0から2147483までの整数の秒数で、`0` は上限なしです。指定できるのは `imbehind serve` だけです。
+
+```sh
+imbehind serve --timeout 600
+IMBEHIND_TIMEOUT=600 imbehind serve
+```
+
+上限に達すると、クライアントには、コードが `reply_timeout` の `504` のエラーと、`No reply within <limit> seconds. Increase the server timeout or reply sooner.` というメッセージが届きます。`imbehind serve` は `timed_out` の行を表示し、その依頼に返答していた `imbehind answer` は `Timed out: the request waited longer than <limit> seconds. Your reply will not be sent.` と表示します。認められない値は、`Error: --timeout must be a whole number of seconds from 0 to 2147483 (got "abc").` のような行を表示して起動をやめ、終了コード2で終わります。
+
+### クライアント側の待ち時間と送り直し
+
+サーバーは自分の上限まで待ちますが、クライアントはそれより先にあきらめることがあります。クライアントの待ち時間は、`imbehind serve` の待つ上限以上にし、自動の送り直しは切ってください。PythonとNodeの公式OpenAI SDKは、待ち時間が既定で600秒です。`408`、`409`、`429`、`5xx` の応答と、接続の失敗のあとに、最大2回、同じ依頼を送り直します。既定のままだと、飛ばした依頼（`503`）や時間切れの依頼（`504`）が送り直され、新しい依頼として現れます。600秒より長く待つ依頼は、SDKが先に切って `cancelled` で終わり、これも送り直されます。次の設定にすると、1件の依頼を30分待ち、送るのは1回だけです。
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:3000/v1", api_key="any", max_retries=0, timeout=1800)
+```
+
+```js
+const client = new OpenAI({
+  baseURL: "http://127.0.0.1:3000/v1",
+  apiKey: "any",
+  maxRetries: 0,
+  timeout: 1800 * 1000,
+});
+```
+
 ## 開発
 
 ```sh

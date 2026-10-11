@@ -152,12 +152,35 @@ describe("reading a state file", () => {
     expect(replied.kind === "ok" && replied.value.state).toBe("replied");
   });
 
-  it("treats an unknown state value as a finished request", () => {
-    const parsed = parseStateFile({
-      ...createStateFile(ID, "waiting", RECEIVED_AT, null),
-      state: "skipped",
+  it("reads skipped, cancelled and timed_out as themselves", () => {
+    for (const state of ["skipped", "cancelled", "timed_out"] as const) {
+      const parsed = parseStateFile(createStateFile(ID, state, RECEIVED_AT, RECEIVED_AT, "why"));
+      expect(parsed.kind === "ok" && parsed.value.state).toBe(state);
+    }
+  });
+
+  it("writes and reads the end time and the end reason of a finished request", () => {
+    const ended = createStateFile(ID, "cancelled", RECEIVED_AT, RECEIVED_AT, "client disconnected");
+    expect(ended).toEqual({
+      formatVersion: 1,
+      id: ID,
+      state: "cancelled",
+      updatedAt: RECEIVED_AT,
+      endedAt: RECEIVED_AT,
+      endReason: "client disconnected",
     });
-    expect(parsed.kind === "ok" && parsed.value.state).toBe("other");
+    const parsed = parseStateFile(JSON.parse(serializeFile(ended)));
+    expect(parsed.kind === "ok" && parsed.value).toEqual(ended);
+  });
+
+  it("treats an unknown state value as a finished request", () => {
+    for (const state of ["abandoned", "invalid_reply", "future"]) {
+      const parsed = parseStateFile({
+        ...createStateFile(ID, "waiting", RECEIVED_AT, null),
+        state,
+      });
+      expect(parsed.kind === "ok" && parsed.value.state).toBe("other");
+    }
   });
 
   it("treats a file whose formatVersion is not 1 as unreadable", () => {
@@ -182,8 +205,22 @@ describe("reading a reply file", () => {
     expect(parsed.kind === "ok" && parsed.value.body).toBe('{"passed":   true}');
   });
 
+  it("accepts a skip reply whose body is an empty string", () => {
+    const written = createReplyFile("", RECEIVED_AT, "skip");
+    expect(written).toMatchObject({ kind: "skip", body: "", source: "imbehind-answer" });
+    const parsed = parseReplyFile(written);
+    expect(parsed.kind === "ok" && parsed.value.kind).toBe("skip");
+    expect(parsed.kind === "ok" && parsed.value.body).toBe("");
+  });
+
+  it("does not read a skip reply with a body, or a text or json reply with an empty body", () => {
+    expect(parseReplyFile({ formatVersion: 1, kind: "skip", body: "{}" }).kind).toBe("unreadable");
+    expect(parseReplyFile({ formatVersion: 1, kind: "text", body: "" }).kind).toBe("unreadable");
+    expect(parseReplyFile({ formatVersion: 1, kind: "json", body: "" }).kind).toBe("unreadable");
+  });
+
   it("does not accept a reply of an unknown kind or version in this version", () => {
-    expect(parseReplyFile({ formatVersion: 1, kind: "skip", body: "{}" }).kind).toBe("unsupported");
+    expect(parseReplyFile({ formatVersion: 1, kind: "sing", body: "la" }).kind).toBe("unsupported");
     expect(parseReplyFile({ formatVersion: 2, kind: "text", body: "x" }).kind).toBe("unreadable");
     expect(parseReplyFile({ formatVersion: 1, kind: "text", body: 5 }).kind).toBe("unreadable");
     expect(parseReplyFile("nope").kind).toBe("unreadable");

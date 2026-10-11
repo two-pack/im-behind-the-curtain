@@ -47,8 +47,16 @@ export class StartupError extends Error {
   }
 }
 
+/** An option or environment variable has a value that is not allowed. The exit code is 2. */
+export class InvalidOptionError extends StartupError {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidOptionError";
+  }
+}
+
 /** Process exit codes. Success (0) is not used in this version. */
-export const EXIT = { failure: 1, interrupted: 130 } as const;
+export const EXIT = { failure: 1, invalidOption: 2, interrupted: 130 } as const;
 
 export function errorCode(error: unknown): string | undefined {
   if (typeof error === "object" && error !== null && "code" in error) {

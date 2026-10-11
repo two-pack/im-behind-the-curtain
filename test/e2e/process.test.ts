@@ -107,16 +107,16 @@ describe("the real program (dist/bin.js)", () => {
     },
   );
 
-  it("stops with Error: input closed. when standard input is closed", async () => {
+  it("stops with Error: input ended. when standard input is closed at the skip question", async () => {
     const home = await makeTempDir();
     await addWaitingRequest(storageFor(home));
     const program = run(["answer"], envFor(home));
     program.child.stdin?.end();
     expect(await program.exit).toBe(1);
-    expect(program.stderr()).toBe("Error: input closed.\n");
-    expect(program.stdout()).toContain(
-      "The reply is empty. Type a reply, or press Ctrl+C to quit.",
+    expect(program.stderr()).toBe(
+      "Error: input ended. Nothing was sent; the request is still waiting.\n",
     );
+    expect(program.stdout()).toContain("Request 1 of 1");
   });
 
   // Skipped on Windows on purpose. A closed pipe does not give the child process an EPIPE error

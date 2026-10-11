@@ -1,6 +1,6 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import type { BrokerEvent, ExchangeBroker } from "../broker/exchange-broker.js";
+import type { BrokerEvent, ExchangeBroker, ExchangeOutcome } from "../broker/exchange-broker.js";
 import {
   buildCompletion,
   buildStreamEvents,
@@ -8,6 +8,7 @@ import {
   errorBody,
   MESSAGES,
   parseChatCompletionsRequest,
+  replyTimeoutMessage,
 } from "../chat-completions/adapter.js";
 import { describeFsError, StartupError } from "../errors.js";
 import { shortId } from "../ids.js";
@@ -232,8 +233,13 @@ export class HttpServer {
     return { host: address.address, port: address.port };
   }
 
-  /** Stops accepting requests and drops the connections that are still waiting. */
+  /**
+   * Stops accepting requests and drops the connections that are still waiting, without an
+   * answer. Those requests stay `waiting`: the broker stops first, so the closing connections
+   * are not taken for clients that left.
+   */
   async close(): Promise<void> {
+    this.options.broker.shutdown();
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     await new Promise<void>((resolve) => {
@@ -244,12 +250,25 @@ export class HttpServer {
 
   private logEvent(event: BrokerEvent): void {
     const id = event.id === undefined ? undefined : shortId(event.id);
-    if (event.type === "replied" && id !== undefined) {
-      this.options.logger.replied(id);
-    } else if (event.type === "error") {
+    if (event.type === "error") {
       this.options.logger.failure(id, event.reason);
     } else if (event.type === "recovered") {
       this.options.logger.recovered(id);
+    } else if (id !== undefined) {
+      this.logEnding(event.type, id);
+    }
+  }
+
+  private logEnding(type: "replied" | "skipped" | "cancelled" | "timed_out", id: string): void {
+    const { logger } = this.options;
+    if (type === "replied") {
+      logger.replied(id);
+    } else if (type === "skipped") {
+      logger.skipped(id);
+    } else if (type === "cancelled") {
+      logger.cancelled(id);
+    } else {
+      logger.timedOut(id);
     }
   }
 
@@ -293,20 +312,79 @@ export class HttpServer {
   }
 
   private async serve(response: http.ServerResponse, request: ConversationRequest): Promise<void> {
-    let submitted: Awaited<ReturnType<ExchangeBroker["submit"]>>;
+    // The close of the response is watched from here on, before the request is stored.
+    const connection = this.watchConnection(response);
     try {
-      submitted = await this.options.broker.submit(request);
-    } catch {
-      respond(response, 500, errorBody("storage_error", MESSAGES.storage));
-      return;
+      let submitted: Awaited<ReturnType<ExchangeBroker["submit"]>>;
+      try {
+        submitted = await this.options.broker.submit(request);
+      } catch {
+        respond(response, 500, errorBody("storage_error", MESSAGES.storage));
+        return;
+      }
+      connection.stored(submitted.id);
+      this.options.logger.received(shortId(submitted.id), request.replyKind, request.stream);
+      respondTo(response, request, await submitted.outcome, this.options.nowSeconds());
+    } finally {
+      connection.stop();
     }
-    this.options.logger.received(shortId(submitted.id), request.replyKind, request.stream);
-    const outcome = await submitted.outcome;
+  }
+
+  /**
+   * Tells the broker when the client of a request goes away. It listens to the
+   * close of the response, as long as the response is not finished. The close of the request
+   * is no sign of a disconnect: it also comes when the body has been read. A disconnect that
+   * comes while the request is being stored is passed on as soon as it is stored.
+   */
+  private watchConnection(response: http.ServerResponse) {
+    let id: string | undefined;
+    let gone = response.destroyed;
+    const cancel = (requestId: string): void => {
+      this.options.broker.cancel(requestId).catch((error: unknown) => {
+        this.options.onUnexpectedFailure(error);
+      });
+    };
+    const onClose = (): void => {
+      if (response.writableEnded) {
+        return;
+      }
+      gone = true;
+      if (id !== undefined) {
+        cancel(id);
+      }
+    };
+    response.on("close", onClose);
+    return {
+      stored: (requestId: string): void => {
+        id = requestId;
+        if (gone) {
+          cancel(requestId);
+        }
+      },
+      stop: (): void => {
+        response.off("close", onClose);
+      },
+    };
+  }
+}
+
+/** The answer for how a request ended. A cancelled request gets none. */
+function respondTo(
+  response: http.ServerResponse,
+  request: ConversationRequest,
+  outcome: ExchangeOutcome,
+  nowSeconds: number,
+): void {
+  if (outcome.kind === "skipped") {
+    respond(response, 503, errorBody("skipped_by_human", MESSAGES.skipped));
+  } else if (outcome.kind === "timed_out") {
+    respond(response, 504, errorBody("reply_timeout", replyTimeoutMessage(outcome.limitSeconds)));
+  } else if (outcome.kind === "replied") {
     const input = {
       requestId: outcome.id,
       model: request.model,
       content: outcome.body,
-      nowSeconds: this.options.nowSeconds(),
+      nowSeconds,
     };
     if (request.stream) {
       respondStream(response, buildStreamEvents({ ...input, includeUsage: request.includeUsage }));

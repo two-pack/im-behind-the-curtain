@@ -11,7 +11,11 @@ export type Role = (typeof ROLES)[number];
 /** What a human reply must be: free text, or text that reads as JSON. */
 export type ReplyKind = "text" | "json";
 
+/** The kinds a reply file can have. `skip` carries no text and ends the request. */
+export type ReplyFileKind = ReplyKind | "skip";
+
 const REPLY_KINDS: readonly ReplyKind[] = ["text", "json"];
+const REPLY_FILE_KINDS: readonly ReplyFileKind[] = ["text", "json", "skip"];
 
 export interface Message {
   role: Role;
@@ -36,8 +40,19 @@ export interface RequestFile extends ConversationRequest {
   receivedAt: string;
 }
 
+/** The states this version writes. A request leaves `waiting` once, for one of the others. */
+export type WrittenState = "waiting" | "replied" | "skipped" | "cancelled" | "timed_out";
+
+const WRITTEN_STATES: readonly string[] = [
+  "waiting",
+  "replied",
+  "skipped",
+  "cancelled",
+  "timed_out",
+];
+
 /** `other` stands for any state this version does not know. It is read as a finished request. */
-type ExchangeState = "waiting" | "replied" | "other";
+type ExchangeState = WrittenState | "other";
 
 export interface StateFile {
   formatVersion: 1;
@@ -50,7 +65,8 @@ export interface StateFile {
 
 export interface ReplyFile {
   formatVersion: 1;
-  kind: ReplyKind;
+  kind: ReplyFileKind;
+  /** Empty for a `skip` reply. At least one character for the other kinds. */
   body: string;
   source?: string;
   writtenAt?: string;
@@ -72,6 +88,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isReplyKind(value: unknown): value is ReplyKind {
   return typeof value === "string" && (REPLY_KINDS as readonly string[]).includes(value);
+}
+
+function isReplyFileKind(value: unknown): value is ReplyFileKind {
+  return typeof value === "string" && (REPLY_FILE_KINDS as readonly string[]).includes(value);
 }
 
 function isRole(value: unknown): value is Role {
@@ -136,8 +156,7 @@ export function parseStateFile(data: unknown): Loaded<StateFile> {
   if (!isRecord(data) || data.formatVersion !== FORMAT_VERSION || typeof data.state !== "string") {
     return UNREADABLE;
   }
-  const state: ExchangeState =
-    data.state === "waiting" || data.state === "replied" ? data.state : "other";
+  const state = WRITTEN_STATES.includes(data.state) ? (data.state as WrittenState) : "other";
   return {
     kind: "ok",
     value: {
@@ -151,13 +170,20 @@ export function parseStateFile(data: unknown): Loaded<StateFile> {
   };
 }
 
-/** A text or json reply is accepted. Other kinds are `unsupported`. */
+/**
+ * A text, json or skip reply is accepted. Other kinds are `unsupported`. A skip reply with a
+ * body, and a text or json reply without one, are `unreadable`.
+ */
 export function parseReplyFile(data: unknown): Loaded<ReplyFile> {
   if (!isRecord(data) || data.formatVersion !== FORMAT_VERSION || typeof data.body !== "string") {
     return UNREADABLE;
   }
-  if (!isReplyKind(data.kind)) {
+  if (!isReplyFileKind(data.kind)) {
     return UNSUPPORTED;
+  }
+  // Only a skip reply has an empty body.
+  if ((data.kind === "skip") !== (data.body === "")) {
+    return UNREADABLE;
   }
   const reply: ReplyFile = { formatVersion: FORMAT_VERSION, kind: data.kind, body: data.body };
   if (typeof data.source === "string") {
@@ -191,17 +217,18 @@ export function createRequestFile(
 
 export function createStateFile(
   id: string,
-  state: "waiting" | "replied",
+  state: WrittenState,
   updatedAt: string,
   endedAt: string | null,
+  endReason: string | null = null,
 ): StateFile {
-  return { formatVersion: FORMAT_VERSION, id, state, updatedAt, endedAt, endReason: null };
+  return { formatVersion: FORMAT_VERSION, id, state, updatedAt, endedAt, endReason };
 }
 
 export function createReplyFile(
   body: string,
   writtenAt: string,
-  kind: ReplyKind = "text",
+  kind: ReplyFileKind = "text",
 ): ReplyFile {
   return {
     formatVersion: FORMAT_VERSION,

@@ -49,6 +49,28 @@ describe("serve log lines (NFR10.4)", () => {
     ]);
   });
 
+  it("writes the skipped, cancelled and timed_out lines", () => {
+    const { out, logger } = setup();
+    logger.skipped("e0f1a2");
+    logger.cancelled("d4e5f6");
+    logger.timedOut("b7c8d9");
+    expect(out).toEqual([
+      "14:05:12 skipped    e0f1a2\n",
+      "14:05:12 cancelled  d4e5f6  client disconnected\n",
+      "14:05:12 timed_out  b7c8d9\n",
+    ]);
+  });
+
+  it("puts the short id of the new lines in the same column, and replaces a bad id", () => {
+    const { out, logger } = setup();
+    logger.skipped("a1b2c3");
+    logger.cancelled("a1b2c3");
+    logger.timedOut("a1b2c3");
+    expect(out.map((line) => line.indexOf("a1b2c3"))).toEqual([20, 20, 20]);
+    logger.skipped("not-an-id");
+    expect(out[3]).toBe("14:05:12 skipped    ------\n");
+  });
+
   it("uses the time of the clock for each line", async () => {
     const { out, clock, logger } = setup();
     await clock.advance(61_000);

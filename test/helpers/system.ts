@@ -1,10 +1,13 @@
+import { readdir, readFile } from "node:fs/promises";
+import path from "node:path";
 import { afterEach } from "vitest";
 import { AnswerConsole, type ReplyReader } from "../../src/answer/answer-console.js";
 import { ExchangeBroker } from "../../src/broker/exchange-broker.js";
 import { main } from "../../src/cli.js";
-import { systemClock } from "../../src/clock.js";
+import { type Clock, systemClock } from "../../src/clock.js";
 import { POLL_INTERVAL_MS } from "../../src/config.js";
 import { Logger, Screen } from "../../src/log.js";
+import { createReplyFile, serializeFile } from "../../src/model.js";
 import { ExchangeStore, type StoreFs } from "../../src/store/exchange-store.js";
 import { makeTempDir } from "./fs.js";
 import { makeIo, waitFor } from "./io.js";
@@ -24,15 +27,19 @@ export interface RunningServe {
   stop: () => Promise<number>;
 }
 
-/** Starts the real `imbehind serve` in this process, on a free port and a temporary directory. */
+/**
+ * Starts the real `imbehind serve` in this process, on a free port and a temporary directory.
+ * `args` are the words after `serve`, such as `--timeout 1`. `clock` replaces the clock of serve.
+ */
 export async function startServe(
-  options: { storageDir?: string; storeFs?: StoreFs } = {},
+  options: { storageDir?: string; storeFs?: StoreFs; args?: string[]; clock?: Clock } = {},
 ): Promise<RunningServe> {
   const t = makeIo();
   const storageDir = options.storageDir ?? (await makeTempDir());
-  const exit = main(["serve"], t.io, {
+  const exit = main(["serve", ...(options.args ?? [])], t.io, {
     settings: { port: 0, storageDir },
     storeFs: options.storeFs,
+    clock: options.clock,
   });
   const stop = async (): Promise<number> => {
     t.interrupt();
@@ -125,4 +132,38 @@ export async function postChatRaw(
     contentType: response.headers.get("content-type") ?? "",
     text: await response.text(),
   };
+}
+
+/** The states of the stored requests, in id order, read from the files. */
+export async function storedStates(storageDir: string): Promise<string[]> {
+  const requests = path.join(storageDir, "requests");
+  const ids = (await readdir(requests)).filter((name) => !name.startsWith(".")).sort();
+  return Promise.all(
+    ids.map(async (id) => {
+      const text = await readFile(path.join(requests, id, "state.json"), "utf8");
+      return (JSON.parse(text) as { state: string }).state;
+    }),
+  );
+}
+
+/** Plays the human: answers every waiting request with "answer to <question>". */
+export async function answerEverything(storageDir: string, count: number): Promise<void> {
+  const store = new ExchangeStore({ rootDir: storageDir });
+  const done = new Set<string>();
+  const writtenAt = new Date().toISOString();
+  while (done.size < count) {
+    for (const id of await store.listIds()) {
+      const request = await store.readRequest(id);
+      if (done.has(id) || request.kind !== "ok") {
+        continue;
+      }
+      const question = request.value.conversation[0]?.content ?? "";
+      await store.placeReply(
+        id,
+        serializeFile(createReplyFile(`answer to ${question}`, writtenAt)),
+      );
+      done.add(id);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }

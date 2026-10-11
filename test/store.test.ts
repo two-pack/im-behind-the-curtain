@@ -307,6 +307,41 @@ describe("writing state", () => {
   });
 });
 
+describe("ending a request", () => {
+  it("writes each new state with its end time and end reason in one write, and reads it back", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(sampleRequest(), sampleState());
+    const endings = [
+      ["skipped", "skipped by the human"],
+      ["cancelled", "client disconnected"],
+      ["timed_out", "wait limit of 1 seconds reached"],
+    ] as const;
+    for (const [state, reason] of endings) {
+      await store.writeState(createStateFile(ID, state, NOW, NOW, reason));
+      const read = await store.readState(ID);
+      expect(read.kind === "ok" && read.value).toMatchObject({
+        state,
+        updatedAt: NOW,
+        endedAt: NOW,
+        endReason: reason,
+      });
+    }
+    expect(await names(path.join(requests, ID))).toEqual(["request.json", "state.json"]);
+  });
+
+  it("places a skip reply with an empty body, accepts it, and reads it back as skip", async () => {
+    const { store } = await newStore();
+    await store.createRequest(sampleRequest(), sampleState());
+    const bytes = serializeFile(createReplyFile("", NOW, "skip"));
+    await store.placeReply(ID, bytes);
+    await store.acceptReply(ID);
+    const read = await store.readReply(ID, "reply.accepted.json");
+    expect(read?.bytes).toBe(bytes);
+    expect(read?.parsed.kind === "ok" && read.parsed.value.kind).toBe("skip");
+    expect(read?.parsed.kind === "ok" && read.parsed.value.body).toBe("");
+  });
+});
+
 describe("json requests and replies", () => {
   const shape = { type: "object", properties: { passed: { type: "boolean" } } };
   const jsonRequest = createRequestFile(ID, NOW, {

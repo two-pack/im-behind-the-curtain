@@ -5,6 +5,7 @@ import {
   errorBody,
   MESSAGES,
   parseChatCompletionsRequest,
+  replyTimeoutMessage,
 } from "../src/chat-completions/adapter.js";
 
 function body(value: unknown): string {
@@ -339,6 +340,23 @@ describe("building an error body", () => {
         message: "The request could not be stored.",
         type: "server_error",
         code: "storage_error",
+      },
+    });
+  });
+
+  it("builds the 503 and 504 bodies as server errors", () => {
+    expect(errorBody("skipped_by_human", MESSAGES.skipped)).toEqual({
+      error: {
+        message: "The human skipped this request.",
+        type: "server_error",
+        code: "skipped_by_human",
+      },
+    });
+    expect(errorBody("reply_timeout", replyTimeoutMessage(1800))).toEqual({
+      error: {
+        message: "No reply within 1800 seconds. Increase the server timeout or reply sooner.",
+        type: "server_error",
+        code: "reply_timeout",
       },
     });
   });

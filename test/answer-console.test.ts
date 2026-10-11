@@ -25,6 +25,9 @@ const ID2 = "20261009T140513000Z-d4e5f6";
 const RECEIVED_AT = new Date(2026, 9, 9, 14, 5, 12).toISOString();
 const PROMPT = "Type your reply. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).";
 const WAITING = "Waiting for requests... (press Ctrl+C to quit)";
+const NOT_SENT = "Not sent: this request was already answered in another window.";
+const SKIP_PROMPT = "Skip this request? The client will receive an error. [y/N] ";
+const CANCELLED = "Cancelled: the client disconnected. Your reply will not be sent.";
 
 function requestWith(
   conversation: Message[],
@@ -49,8 +52,7 @@ function separator(n: number, total: number, shortId: string): string {
   return head + "-".repeat(60 - head.length);
 }
 
-function setup(steps: Step[]) {
-  const store = new FakeStore();
+function setup(steps: Step[], store = new FakeStore()) {
   const clock = new FakeClock();
   const out: string[] = [];
   const err: string[] = [];
@@ -60,7 +62,7 @@ function setup(steps: Step[]) {
   const makeBroker = () => new ExchangeBroker({ store, clock, pollIntervalMs: 500 });
   const broker = makeBroker();
   const serveBroker = makeBroker();
-  const reader = new ScriptedReader(steps);
+  const reader = new ScriptedReader(steps, (text) => out.push(`${text}\n`));
   const answer = new AnswerConsole({
     broker,
     screen: new Screen(stdout),
@@ -265,7 +267,7 @@ describe("sending a reply", () => {
     await running;
   });
 
-  it("says Not sent when another window already put a reply", async () => {
+  it("says Not sent when another window already put a reply, once serve has used it", async () => {
     const t = setup([
       () => {
         t.store.putFile(ID, "reply.json", serializeFile(createReplyFile("theirs", RECEIVED_AT)));
@@ -275,8 +277,11 @@ describe("sending a reply", () => {
     t.addWaiting();
     const running = t.start();
     await settle();
-    expect(t.stdout()).toContain("Not sent: this request was already answered in another window.");
+    expect(t.stdout()).not.toContain(NOT_SENT);
     expect(t.replyBody()).toBe("theirs");
+    await t.serveBroker.pollOnce();
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(NOT_SENT);
     t.controller.abort();
     await running;
   });
@@ -385,23 +390,26 @@ describe("a state file that stays unreadable while confirming", () => {
 });
 
 describe("closed input and Ctrl+C", () => {
-  it("stops with Error: input closed. and exit 1 after two end-of-input signals in a row", async () => {
+  it("stops with exit 1 and a clear line when the input ends at the skip question", async () => {
     const t = setup(["EOF", "EOF"]);
     t.addWaiting();
     const exit = await t.start();
     expect(exit).toBe(1);
-    expect(t.stderr()).toEqual(["Error: input closed."]);
-    expect(t.stdout()).toContain("The reply is empty. Type a reply, or press Ctrl+C to quit.");
+    expect(t.stderr()).toEqual([
+      "Error: input ended. Nothing was sent; the request is still waiting.",
+    ]);
+    expect(t.reader.asked).toEqual([SKIP_PROMPT]);
     expect(t.replyBody()).toBeUndefined();
     expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
   });
 
-  it("does not count an end-of-input after typed lines as closed input", async () => {
-    const t = setup(["EOF", "\n", "EOF", "answer"]);
+  it("goes back to typing when the skip question is answered with no, and keeps no count of earlier ends", async () => {
+    const t = setup(["EOF", "n", "EOF", "", "answer"]);
     t.addWaiting();
     const running = t.start();
     await settle();
     expect(t.stderr()).toEqual([]);
+    expect(t.reader.asked).toEqual([SKIP_PROMPT, SKIP_PROMPT]);
     expect(t.replyBody()).toBe("answer");
     t.controller.abort();
     await running;
@@ -880,5 +888,572 @@ describe("a long conversation and unsafe text", () => {
       "Model:    whatever",
       "Reply:    JSON",
     ]);
+  });
+});
+
+const ID3 = "20261009T140514000Z-0a0b0c";
+const ID4 = "20261009T140515000Z-0d0e0f";
+
+type Setup = ReturnType<typeof setup>;
+
+/** Ends a request the way serve does, so the screen can see it in state.json. */
+function end(t: Setup, id: string, state: "cancelled" | "timed_out" | "replied", reason?: string) {
+  const entry = t.store.entries.get(id);
+  if (entry === undefined) {
+    throw new Error("the request should exist");
+  }
+  entry.state = createStateFile(id, state, RECEIVED_AT, RECEIVED_AT, reason ?? null);
+}
+
+describe("the order of the requests", () => {
+  it("shows the request with the smallest id first, whatever order they were stored in", async () => {
+    const t = setup([]);
+    t.addWaiting(ID3);
+    t.addWaiting(ID);
+    t.addWaiting(ID2);
+    const running = t.start();
+    await settle();
+    expect(t.stdout()[0]).toBe(separator(1, 3, "a1b2c3"));
+    t.controller.abort();
+    await running;
+  });
+
+  it("shows the smaller id first when the arrival times are the same", async () => {
+    const t = setup([]);
+    t.addWaiting(ID2);
+    t.addWaiting(ID);
+    const running = t.start();
+    await settle();
+    expect(t.stdout()[0]).toBe(separator(1, 2, "a1b2c3"));
+    expect(t.store.entries.get(ID)?.request).toMatchObject({ receivedAt: RECEIVED_AT });
+    expect(t.store.entries.get(ID2)?.request).toMatchObject({ receivedAt: RECEIVED_AT });
+    t.controller.abort();
+    await running;
+  });
+
+  it("counts again after a reply: the next request is shown with the new count", async () => {
+    const t = setup(["a", "b"]);
+    t.addWaiting(ID);
+    t.addWaiting(ID2);
+    const running = t.start();
+    await settle();
+    t.addWaiting(ID3);
+    await t.serveBroker.pollOnce();
+    await t.clock.advance(500);
+    const separators = t.stdout().filter((line) => line.startsWith("--- Request"));
+    expect(separators).toEqual([separator(1, 2, "a1b2c3"), separator(1, 2, "d4e5f6")]);
+    t.controller.abort();
+    await running;
+  });
+});
+
+describe("skipping a request", () => {
+  it("asks before skipping when nothing was typed, and places a skip reply for y", async () => {
+    const t = setup(["EOF", "y"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.reader.asked).toEqual([SKIP_PROMPT]);
+    expect(t.replyKind()).toBe("skip");
+    expect(t.replyBody()).toBe("");
+    expect(t.stdout()).not.toContain("Skipped.");
+    await t.serveBroker.pollOnce();
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain("Skipped.");
+    expect(t.stdout()).not.toContain("Sent.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("skips for an upper case Y too", async () => {
+    const t = setup(["EOF", "Y"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.replyKind()).toBe("skip");
+    t.controller.abort();
+    await running;
+  });
+
+  it("does not skip for Enter alone, n or any other answer, and asks for the reply again", async () => {
+    for (const answer of ["", "n", "N", "yes", " y", "ok"]) {
+      const t = setup(["EOF", answer, "typed"]);
+      t.addWaiting();
+      const running = t.start();
+      await settle();
+      expect(t.replyKind()).toBe("text");
+      expect(t.replyBody()).toBe("typed");
+      expect(t.reader.calls).toBe(2);
+      t.controller.abort();
+      await running;
+    }
+  });
+
+  it("still refuses a reply that only has empty lines, without asking to skip", async () => {
+    const t = setup(["\n\n", "typed"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.reader.asked).toEqual([]);
+    expect(t.stdout()).toContain("The reply is empty. Type a reply, or press Ctrl+C to quit.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("asks to skip a request for JSON too", async () => {
+    const t = setup(["EOF", "y"]);
+    t.addWaiting(ID, undefined, { replyKind: "json" });
+    const running = t.start();
+    await settle();
+    expect(t.replyKind()).toBe("skip");
+    t.controller.abort();
+    await running;
+  });
+
+  it("leaves the request waiting and exits 130 on Ctrl+C at the question", async () => {
+    const t = setup(["EOF", "INTERRUPT"]);
+    t.addWaiting();
+    const exit = await t.start();
+    expect(exit).toBe(130);
+    expect(t.stdout()).toContain("Quit. Request a1b2c3 is still waiting.");
+    expect(t.replyBody()).toBeUndefined();
+    expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
+  });
+
+  it("says another window answered first when the question is answered after that", async () => {
+    const t = setup([
+      "EOF",
+      () => {
+        const entry = t.store.entries.get(ID);
+        entry?.files.set(
+          "reply.accepted.json",
+          serializeFile(createReplyFile("theirs", RECEIVED_AT)),
+        );
+        end(t, ID, "replied");
+        return "y";
+      },
+    ]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).toContain(NOT_SENT);
+    expect(t.stdout()).not.toContain("Skipped.");
+    expect(t.replyKind()).toBeUndefined();
+    t.controller.abort();
+    await running;
+  });
+});
+
+describe("a request that ends while the person is busy", () => {
+  it("tells at once, stops the typing and goes on to the next request when the client left", async () => {
+    const t = setup(["WAIT", "WAIT"]);
+    t.addWaiting(ID);
+    t.addWaiting(ID2);
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).not.toContain(CANCELLED);
+    end(t, ID, "cancelled", "client disconnected");
+    await t.clock.advance(500);
+    const lines = t.stdout();
+    expect(lines).toContain(CANCELLED);
+    expect(lines.indexOf(CANCELLED)).toBeLessThan(lines.indexOf(separator(1, 1, "d4e5f6")));
+    expect(t.replyBody(ID)).toBeUndefined();
+    expect(t.reader.calls).toBe(2);
+    t.controller.abort();
+    expect(await running).toBe(130);
+  });
+
+  it("tells the wait limit that was used when the request timed out", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    end(t, ID, "timed_out", "wait limit of 30 seconds reached");
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(
+      "Timed out: the request waited longer than 30 seconds. Your reply will not be sent.",
+    );
+    t.controller.abort();
+    await running;
+  });
+
+  it("tells the timeout without a number when the end reason cannot be read", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    end(t, ID, "timed_out", "unknown");
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(
+      "Timed out: the request waited longer than the wait limit. Your reply will not be sent.",
+    );
+    t.controller.abort();
+    await running;
+  });
+
+  it("tells at the skip question, without Skipped., and goes on", async () => {
+    const t = setup(["EOF", "WAIT"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.reader.asked).toEqual([SKIP_PROMPT]);
+    end(t, ID, "cancelled", "client disconnected");
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(CANCELLED);
+    expect(t.stdout()).not.toContain("Skipped.");
+    expect(t.stdout().filter((line) => line === WAITING)).toHaveLength(1);
+    t.controller.abort();
+    await running;
+  });
+
+  it("tells while the reply is being sent, without Sent., and goes on", async () => {
+    const t = setup(["Hi"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.replyBody()).toBe("Hi");
+    end(t, ID, "cancelled", "client disconnected");
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(CANCELLED);
+    expect(t.stdout()).not.toContain("Sent.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("tells the wait limit after a skip was placed", async () => {
+    const t = setup(["EOF", "y"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    end(t, ID, "timed_out", "wait limit of 2 seconds reached");
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(
+      "Timed out: the request waited longer than 2 seconds. Your reply will not be sent.",
+    );
+    expect(t.stdout()).not.toContain("Skipped.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("does not interrupt the typing when another window answered; it tells when the typing ends", async () => {
+    const t = setup(["WAIT", "later"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    t.store.entries
+      .get(ID)
+      ?.files.set("reply.accepted.json", serializeFile(createReplyFile("theirs", RECEIVED_AT)));
+    end(t, ID, "replied");
+    await t.clock.advance(1500);
+    expect(t.stdout()).not.toContain(NOT_SENT);
+    expect(t.reader.calls).toBe(1);
+    t.controller.abort();
+    await running;
+  });
+
+  it("stops watching when the typing is over: no timer is left behind", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.clock.sleeping).toBe(1);
+    t.controller.abort();
+    await running;
+    expect(t.clock.sleeping).toBe(0);
+  });
+
+  it("writes one error line and goes on watching when the state cannot be read during the typing", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    t.store.fail("readState", 2);
+    await t.clock.advance(1000);
+    const failures = t.stdout().filter((line) => line.includes(" error "));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatch(/ error {6}a1b2c3 {2}read failed$/);
+    end(t, ID, "cancelled", "client disconnected");
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(CANCELLED);
+    t.controller.abort();
+    await running;
+  });
+});
+
+describe("new requests while the person types", () => {
+  const NEW = (count: number) => `New request received. ${count} requests are waiting.`;
+
+  it("says how many requests are waiting and keeps the typing going", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting(ID);
+    const running = t.start();
+    await settle();
+    t.addWaiting(ID2);
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(NEW(2));
+    expect(t.reader.calls).toBe(1);
+    expect(t.stdout().filter((line) => line.startsWith("--- Request"))).toHaveLength(1);
+    t.controller.abort();
+    await running;
+  });
+
+  it("writes one line for several new requests, with the count now", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting(ID);
+    const running = t.start();
+    await settle();
+    t.addWaiting(ID2);
+    t.addWaiting(ID3);
+    t.addWaiting(ID4);
+    await t.clock.advance(500);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([NEW(4)]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("says nothing again for a request it already told about, or when requests only go away", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting(ID);
+    t.addWaiting(ID2);
+    const running = t.start();
+    await settle();
+    await t.clock.advance(1500);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([]);
+    end(t, ID2, "cancelled", "client disconnected");
+    await t.clock.advance(500);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([]);
+    t.addWaiting(ID3);
+    await t.clock.advance(500);
+    await t.clock.advance(500);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([NEW(2)]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("tells when one request came and another went in the same time (the count stays the same)", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting(ID);
+    t.addWaiting(ID2);
+    const running = t.start();
+    await settle();
+    end(t, ID2, "cancelled", "client disconnected");
+    t.addWaiting(ID3);
+    await t.clock.advance(500);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([NEW(2)]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("counts the shown request while its state is waiting, even when another window put a reply on it", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting(ID);
+    const running = t.start();
+    await settle();
+    // Another window put a reply on the shown request (it is still waiting), and a new one came.
+    t.store.entries
+      .get(ID)
+      ?.files.set("reply.json", serializeFile(createReplyFile("x", RECEIVED_AT)));
+    t.addWaiting(ID2);
+    await t.clock.advance(500);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([NEW(2)]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("does not count the shown request once its state has left waiting", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting(ID);
+    const running = t.start();
+    await settle();
+    t.store.entries
+      .get(ID)
+      ?.files.set("reply.accepted.json", serializeFile(createReplyFile("x", RECEIVED_AT)));
+    end(t, ID, "replied");
+    t.addWaiting(ID2);
+    await t.clock.advance(500);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("still tells once about a request it cannot show that arrives while the person types", async () => {
+    const t = setup(["WAIT"]);
+    t.addWaiting(ID);
+    const running = t.start();
+    await settle();
+    t.store.addRaw(ID2, {
+      request: "unsupported",
+      state: createStateFile(ID2, "waiting", RECEIVED_AT, null),
+    });
+    await t.clock.advance(1500);
+    const notices = t.stdout().filter((line) => line.includes("d4e5f6"));
+    expect(notices).toEqual(["Cannot show request d4e5f6: this version does not support it."]);
+    expect(t.stdout().filter((line) => line.startsWith("New request"))).toEqual([]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("also tells while the skip question is open", async () => {
+    const t = setup(["EOF", "WAIT"]);
+    t.addWaiting(ID);
+    const running = t.start();
+    await settle();
+    t.addWaiting(ID2);
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain(NEW(2));
+    t.controller.abort();
+    await running;
+  });
+});
+
+describe("what the screen says about the reply it placed", () => {
+  it("says the request has already ended for a state it does not know", async () => {
+    const t = setup(["Hi"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    const entry = t.store.entries.get(ID);
+    if (entry !== undefined) {
+      entry.state = { ...createStateFile(ID, "replied", RECEIVED_AT, RECEIVED_AT), state: "other" };
+    }
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain("Not sent: this request has already ended.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("does not show a request that has already timed out", async () => {
+    const t = setup(["Hi"]);
+    t.addWaiting();
+    end(t, ID, "timed_out", "wait limit of 5 seconds reached");
+    const running = t.start();
+    await settle();
+    // A request that is not waiting is not shown at all.
+    expect(t.stdout()).toEqual([WAITING]);
+    expect(t.reader.calls).toBe(0);
+    t.controller.abort();
+    await running;
+  });
+
+  it("waits for as long as the request still waits, however many reads it takes", async () => {
+    const t = setup(["Hi"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    for (let round = 0; round < 20; round += 1) {
+      await t.clock.advance(500);
+    }
+    expect(t.stdout()).not.toContain("Sent.");
+    await t.serveBroker.pollOnce();
+    await t.clock.advance(500);
+    expect(t.stdout()).toContain("Sent.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("leaves a request alone that was left with Ctrl+C, and shows it again to the next screen", async () => {
+    const t = setup(["INTERRUPT"]);
+    t.addWaiting();
+    expect(await t.start()).toBe(130);
+    expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
+    const next = setup(["WAIT"], t.store);
+    const running = next.start();
+    await settle();
+    expect(next.stdout()[0]).toBe(separator(1, 1, "a1b2c3"));
+    next.controller.abort();
+    await running;
+  });
+});
+
+describe("asking one question and showing a line while typing", () => {
+  function terminal() {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const written: string[] = [];
+    output.on("data", (chunk: Buffer) => written.push(chunk.toString("utf8")));
+    return { input, output, written, text: () => written.join("") };
+  }
+
+  it("reads one line and writes the question, as a terminal would show it", async () => {
+    const t = terminal();
+    const reader = createReplyReader(t.input, t.output, true);
+    const reading = reader.readLine("Skip? [y/N] ", new AbortController().signal);
+    t.input.write("y\r");
+    expect(await reading).toEqual({ kind: "line", text: "y" });
+    expect(t.text()).toContain("Skip? [y/N] ");
+  });
+
+  it("reads one line from a plain stream of lines, one question after the other", async () => {
+    const reader = createReplyReader(Readable.from(["y\nn\n"]), new PassThrough(), false);
+    const signal = new AbortController().signal;
+    expect(await reader.readLine("first? ", signal)).toEqual({ kind: "line", text: "y" });
+  });
+
+  it("says the input ended when the end-of-input key is pressed, and moves to a new line", async () => {
+    const t = terminal();
+    const reader = createReplyReader(t.input, t.output, true);
+    const reading = reader.readLine("Skip? [y/N] ", new AbortController().signal);
+    t.input.write("\u0004");
+    expect(await reading).toEqual({ kind: "end" });
+    expect(t.text().endsWith("\n")).toBe(true);
+  });
+
+  it("says the input ended at once when the input has already ended", async () => {
+    const input = Readable.from([]);
+    const reader = createReplyReader(input, new PassThrough(), false);
+    const signal = new AbortController().signal;
+    await reader.readReply(signal);
+    expect(await reader.readLine("Skip? ", signal)).toEqual({ kind: "end" });
+  });
+
+  it("can ask after a reply was ended with the end-of-input key, on the same terminal", async () => {
+    const t = terminal();
+    const reader = createReplyReader(t.input, t.output, true);
+    const signal = new AbortController().signal;
+    const reading = reader.readReply(signal);
+    t.input.write("\u0004");
+    expect(await reading).toEqual({ kind: "reply", text: "", gotInput: false });
+    const asking = reader.readLine("Skip? [y/N] ", signal);
+    t.input.write("y\r");
+    expect(await asking).toEqual({ kind: "line", text: "y" });
+  });
+
+  it("gives interrupted when the signal aborts, when it is already aborted, and on Ctrl+C", async () => {
+    const t = terminal();
+    const reader = createReplyReader(t.input, t.output, true);
+    const controller = new AbortController();
+    const reading = reader.readLine("Skip? ", controller.signal);
+    controller.abort();
+    expect(await reading).toEqual({ kind: "interrupted" });
+    expect(await reader.readLine("Skip? ", AbortSignal.abort())).toEqual({ kind: "interrupted" });
+    const again = reader.readLine("Skip? ", new AbortController().signal);
+    t.input.write("\u0003");
+    expect(await again).toEqual({ kind: "interrupted" });
+  });
+
+  it("shows a line in the middle of the typing and draws the prompt and the typed text again", async () => {
+    const t = terminal();
+    const reader = createReplyReader(t.input, t.output, true);
+    const reading = reader.readReply(new AbortController().signal);
+    t.input.write("I think");
+    await settle();
+    const before = t.text();
+    reader.notify("New request received. 2 requests are waiting.");
+    await settle();
+    const added = t.text().slice(before.length);
+    expect(added.startsWith("\n")).toBe(false);
+    expect(added).toContain("New request received. 2 requests are waiting.\n");
+    expect(added).toContain("> I think");
+    t.input.write(" it\r");
+    t.input.write("\u0004");
+    expect(await reading).toEqual({ kind: "reply", text: "I think it", gotInput: true });
+  });
+
+  it("shows a line on its own when nobody is typing", async () => {
+    const t = terminal();
+    const reader = createReplyReader(t.input, t.output, true);
+    reader.notify("Hello.");
+    await settle();
+    expect(t.text()).toBe("Hello.\n");
   });
 });

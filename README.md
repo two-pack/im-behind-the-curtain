@@ -58,6 +58,46 @@ Requests are stored under the user data directory: `$XDG_DATA_HOME/imbehind` (or
 
 In this version `imbehind serve` always listens on `127.0.0.1:3000`, and it accepts text messages on `POST /v1/chat/completions`. A request with a browser `Origin` header, or with a `Host` header that is not `127.0.0.1` or `localhost`, is refused.
 
+### Skipping a request
+
+If you end the input without typing anything (for example Ctrl+D right away), `imbehind answer` asks `Skip this request? The client will receive an error. [y/N]`. Only `y` or `Y` skips the request. The client receives a `503` error with the code `skipped_by_human`, `imbehind answer` prints `Skipped.`, and `imbehind serve` prints a `skipped` line. Any other answer, including Enter alone, takes you back to typing the reply. If the input ends at this question, nothing is sent: `imbehind answer` prints `Error: input ended. Nothing was sent; the request is still waiting.` and exits with code 1.
+
+### Several requests
+
+Several clients can wait at the same time. `imbehind answer` shows one request at a time, the oldest first, and counts again each time, for example `--- Request 1 of 3 (...)`. If a new request arrives while you type, it prints `New request received. 2 requests are waiting.` (the count includes the request you are answering), and what you typed is not lost.
+
+You can run `imbehind answer` in two terminals. When both send a reply to the same request, only the first one is used, and the other prints `Not sent: this request was already answered in another window.`
+
+### When the client leaves, and the wait limit
+
+If the client closes the connection before you reply, the request ends as `cancelled`. `imbehind answer` tells you at once, even while you type (`Cancelled: the client disconnected. Your reply will not be sent.`), drops what you typed and moves on to the next request. `imbehind serve` prints `cancelled  <id>  client disconnected`.
+
+`imbehind serve` waits for a reply for 1800 seconds (30 minutes) by default. Change it with `--timeout <seconds>` or the environment variable `IMBEHIND_TIMEOUT`; the option wins over the variable, and an empty variable counts as not set. The value is a whole number of seconds from 0 to 2147483, and `0` means no limit. Only `imbehind serve` takes it.
+
+```sh
+imbehind serve --timeout 600
+IMBEHIND_TIMEOUT=600 imbehind serve
+```
+
+When the limit passes, the client receives a `504` error with the code `reply_timeout` and the message `No reply within <limit> seconds. Increase the server timeout or reply sooner.`, `imbehind serve` prints a `timed_out` line, and `imbehind answer` shows `Timed out: the request waited longer than <limit> seconds. Your reply will not be sent.` if you were answering it. A value that is not allowed stops the start with a line such as `Error: --timeout must be a whole number of seconds from 0 to 2147483 (got "abc").` and exit code 2.
+
+### Client wait time and retries
+
+The server waits as long as its own limit, but a client may give up earlier. Set the timeout of your client to at least the wait limit of `imbehind serve`, and turn its automatic retries off. The official OpenAI SDKs for Python and Node wait 600 seconds by default and send a request again, up to 2 times, after a `408`, `409`, `429` or `5xx` answer and after a failed connection. With the defaults, a request that you skip (`503`) or that times out (`504`) is sent again and shows up as a new request, and a request that waits longer than 600 seconds is dropped by the SDK, ends as `cancelled`, and is also sent again. The settings below keep one request for 30 minutes and send it only once:
+
+```python
+client = OpenAI(base_url="http://127.0.0.1:3000/v1", api_key="any", max_retries=0, timeout=1800)
+```
+
+```js
+const client = new OpenAI({
+  baseURL: "http://127.0.0.1:3000/v1",
+  apiKey: "any",
+  maxRetries: 0,
+  timeout: 1800 * 1000,
+});
+```
+
 ## Development
 
 ```sh

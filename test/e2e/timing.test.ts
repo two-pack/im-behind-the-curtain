@@ -1,6 +1,6 @@
 import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
-import type { ReadResult, ReplyReader } from "../../src/answer/answer-console.js";
+import type { LineResult, ReadResult, ReplyReader } from "../../src/answer/answer-console.js";
 import { waitFor } from "../helpers/io.js";
 import { postChat, postChatRaw, startAnswer, startServe } from "../helpers/system.js";
 
@@ -18,6 +18,12 @@ class GatedReader implements ReplyReader {
       signal.addEventListener("abort", () => resolve({ kind: "interrupted" }), { once: true });
     });
   }
+
+  async readLine(): Promise<LineResult> {
+    return { kind: "end" };
+  }
+
+  notify(): void {}
 
   type(text: string): void {
     const resolve = this.pending;

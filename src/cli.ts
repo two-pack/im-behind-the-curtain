@@ -5,8 +5,8 @@
 import { AnswerConsole, createReplyReader } from "./answer/answer-console.js";
 import { ExchangeBroker } from "./broker/exchange-broker.js";
 import { type Clock, systemClock } from "./clock.js";
-import { createSettings, loadSettings, type Settings } from "./config.js";
-import { EXIT, IoFailure, StartupError } from "./errors.js";
+import { createSettings, loadSettings, resolveWaitLimit, type Settings } from "./config.js";
+import { EXIT, InvalidOptionError, IoFailure, StartupError } from "./errors.js";
 import { HttpServer } from "./http/server.js";
 import { Logger, Screen } from "./log.js";
 import { ctrlZEndsInput, type ProcessIo } from "./platform.js";
@@ -32,6 +32,37 @@ type Ending = { kind: "interrupted" } | { kind: "failed"; error: unknown };
 
 const USAGE = "usage: imbehind serve | imbehind answer";
 
+/** The command that was asked for. `timeout` is the text after `--timeout`, for serve only. */
+interface Command {
+  name: "serve" | "answer";
+  timeout?: string;
+}
+
+const TIMEOUT_OPTION = "--timeout";
+
+/**
+ * Reads the words after the program name: `answer`, or `serve` with an optional
+ * `--timeout <seconds>` or `--timeout=<seconds>`. Anything else gives undefined. The value is
+ * not checked here.
+ */
+function parseCommand(argv: readonly string[]): Command | undefined {
+  const [name, ...rest] = argv;
+  if (name === "answer") {
+    return rest.length === 0 ? { name } : undefined;
+  }
+  if (name !== "serve") {
+    return undefined;
+  }
+  const [word, value, ...more] = rest;
+  if (word === undefined) {
+    return { name };
+  }
+  if (word.startsWith(`${TIMEOUT_OPTION}=`) && value === undefined) {
+    return { name, timeout: word.slice(TIMEOUT_OPTION.length + 1) };
+  }
+  return word === TIMEOUT_OPTION && more.length === 0 ? { name, timeout: value ?? "" } : undefined;
+}
+
 function resolveSettings(io: ProcessIo, options: CliOptions): Settings {
   const override = options.settings;
   if (override?.storageDir !== undefined) {
@@ -46,8 +77,10 @@ async function prepare(
   options: CliOptions,
   logger: Logger,
   clock: Clock,
+  waitLimitSeconds?: number,
 ): Promise<Context> {
-  const settings = resolveSettings(io, options);
+  const resolved = resolveSettings(io, options);
+  const settings = waitLimitSeconds === undefined ? resolved : { ...resolved, waitLimitSeconds };
   const store = new ExchangeStore({ rootDir: settings.storageDir, fs: options.storeFs });
   await store.prepare();
   return { io, clock, logger, settings, store };
@@ -58,6 +91,7 @@ function newBroker(context: Context): ExchangeBroker {
     store: context.store,
     clock: context.clock,
     pollIntervalMs: context.settings.pollIntervalMs,
+    waitLimitSeconds: context.settings.waitLimitSeconds,
   });
 }
 
@@ -94,8 +128,11 @@ async function runServe(context: Context): Promise<number> {
   });
   const ending = await Promise.race([interrupted, failed]);
   stopListening();
-  await server.close();
+  // Stop accepting replies before anything else closes: a poll that is still
+  // running must not claim a reply that no client will receive.
+  broker.shutdown();
   await polling.stop();
+  await server.close();
   if (ending.kind === "failed") {
     throw ending.error;
   }
@@ -131,12 +168,15 @@ async function dispatch(
   logger: Logger,
   clock: Clock,
 ): Promise<number> {
-  const [command, ...rest] = argv;
-  if (rest.length > 0 || (command !== "serve" && command !== "answer")) {
+  const command = parseCommand(argv);
+  if (command === undefined) {
     throw new StartupError(USAGE);
   }
-  const context = await prepare(io, options, logger, clock);
-  return command === "serve" ? runServe(context) : runAnswer(context);
+  // Only serve uses the wait limit. It is checked before anything is created on disk.
+  const waitLimit =
+    command.name === "serve" ? resolveWaitLimit(command.timeout, io.info.env) : undefined;
+  const context = await prepare(io, options, logger, clock, waitLimit);
+  return command.name === "serve" ? runServe(context) : runAnswer(context);
 }
 
 /** How long a command may take to wind down after a failure before main returns anyway. */
@@ -255,7 +295,7 @@ function handleFailure(error: unknown, logger: Logger, alreadyReported: boolean)
   }
   if (error instanceof StartupError) {
     logger.startupError(error.message);
-    return EXIT.failure;
+    return error instanceof InvalidOptionError ? EXIT.invalidOption : EXIT.failure;
   }
   // Any other exception is unexpected. Its message, stack and paths are never shown.
   logger.unexpectedFailure();

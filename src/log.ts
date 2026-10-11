@@ -28,7 +28,7 @@ const UNEXPECTED_FAILURE = "unexpected failure.";
 
 /** The width of the event column in a serve line. */
 const EVENT_WIDTH = 10;
-type EventWord = "received" | "replied" | "error";
+type EventWord = "received" | "replied" | "skipped" | "cancelled" | "timed_out" | "error";
 
 const NO_ID = "------";
 const SHORT_ID = /^[0-9a-f]{6}$/;
@@ -77,6 +77,19 @@ export class Logger {
 
   replied(shortId: string): void {
     this.event("replied", shortId);
+  }
+
+  skipped(shortId: string): void {
+    this.event("skipped", shortId);
+  }
+
+  /** The client went away. The reason is always the same fixed phrase. */
+  cancelled(shortId: string): void {
+    this.event("cancelled", shortId, "client disconnected");
+  }
+
+  timedOut(shortId: string): void {
+    this.event("timed_out", shortId);
   }
 
   /** Writes a failure once for each pair of request and reason, until the request recovers. */
