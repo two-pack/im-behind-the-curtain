@@ -13,6 +13,7 @@ import {
 
 export type ErrorCode =
   | "invalid_request"
+  | "unsupported_content"
   | "request_too_large"
   | "not_found"
   | "method_not_allowed"
@@ -27,6 +28,8 @@ export const MESSAGES = {
   modelRequired: '"model" must be a string.',
   messageNotObject: "Each message must be an object.",
   contentType: "Message content must be a string, null, or an array of text parts.",
+  images: "Images are not supported. A human reads requests as text.",
+  tools: "Tool calls are not supported. Send the request without tools.",
   tooManyChoices: 'Only one choice can be returned; "n" must be 1.',
   requestTooLarge: "Request body is larger than 10 MB.",
   notFound: "Not found.",
@@ -37,13 +40,17 @@ export const MESSAGES = {
   unexpectedHost: "Unexpected Host header.",
 } as const;
 
-/** Longest piece of a role name that is put into an error message. */
+/** Longest piece of a role name or content part type that is put into an error message. */
 const MAX_ROLE_LENGTH = 64;
 
-interface RequestRejection {
-  status: 400;
-  code: "invalid_request";
+/** Why a request is turned away: a malformed one, or one that asks for something not supported. */
+interface Failure {
+  code: "invalid_request" | "unsupported_content";
   message: string;
+}
+
+interface RequestRejection extends Failure {
+  status: 400;
 }
 
 export type AdapterResult =
@@ -73,8 +80,16 @@ export interface ChatCompletion {
   usage: { prompt_tokens: 0; completion_tokens: 0; total_tokens: 0 };
 }
 
-function reject(message: string): AdapterResult {
-  return { ok: false, rejection: { status: 400, code: "invalid_request", message } };
+function invalid(message: string): Failure {
+  return { code: "invalid_request", message };
+}
+
+function unsupported(message: string): Failure {
+  return { code: "unsupported_content", message };
+}
+
+function reject(failure: Failure): AdapterResult {
+  return { ok: false, rejection: { status: 400, ...failure } };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -99,20 +114,20 @@ function roleMessage(role: unknown): string {
   return `Unsupported message role: "${shown}".`;
 }
 
-/** A check returns the error message when it fails, and undefined when it passes. */
-type Check<T> = (value: T) => string | undefined;
+/** A check returns the failure when it fails, and undefined when it passes. */
+type Check<T> = (value: T) => Failure | undefined;
 
 /** Checks on the whole body, in order. */
 const BODY_CHECKS: readonly Check<Record<string, unknown>>[] = [
   (body) =>
     Array.isArray(body.messages) && body.messages.length > 0
       ? undefined
-      : MESSAGES.messagesRequired,
-  (body) => (typeof body.model === "string" ? undefined : MESSAGES.modelRequired),
+      : invalid(MESSAGES.messagesRequired),
+  (body) => (typeof body.model === "string" ? undefined : invalid(MESSAGES.modelRequired)),
 ];
 
-/** Runs the checks in order and returns the first error. */
-function firstError<T>(checks: readonly Check<T>[], value: T): string | undefined {
+/** Runs the checks in order and returns the first failure. */
+function firstError<T>(checks: readonly Check<T>[], value: T): Failure | undefined {
   for (const check of checks) {
     const error = check(value);
     if (error !== undefined) {
@@ -120,6 +135,75 @@ function firstError<T>(checks: readonly Check<T>[], value: T): string | undefine
     }
   }
   return undefined;
+}
+
+/** Whether a value is an array with at least one entry. What the entries hold is not looked at. */
+function hasEntries(value: unknown): boolean {
+  return Array.isArray(value) && value.length > 0;
+}
+
+/** A message with the role tool or function. Its content is not read. */
+function checkToolRole(message: Record<string, unknown>): Failure | undefined {
+  return message.role === "tool" || message.role === "function"
+    ? unsupported(MESSAGES.tools)
+    : undefined;
+}
+
+/** A role that is none of the four. */
+function checkRole(message: Record<string, unknown>): Failure | undefined {
+  return isRole(message.role) ? undefined : invalid(roleMessage(message.role));
+}
+
+/** An assistant message that calls a tool. Other roles are not looked at. */
+function checkToolCalls(message: Record<string, unknown>): Failure | undefined {
+  if (message.role !== "assistant") {
+    return undefined;
+  }
+  const calls = hasEntries(message.tool_calls);
+  const legacy = message.function_call !== null && message.function_call !== undefined;
+  return calls || legacy ? unsupported(MESSAGES.tools) : undefined;
+}
+
+/** Any part of the content that is an image. */
+function checkImageParts(message: Record<string, unknown>): Failure | undefined {
+  const content = message.content;
+  const hasImage =
+    Array.isArray(content) && content.some((part) => isRecord(part) && part.type === "image_url");
+  return hasImage ? unsupported(MESSAGES.images) : undefined;
+}
+
+function partTypeMessage(type: string): string {
+  return `Unsupported content part type: "${type.slice(0, MAX_ROLE_LENGTH)}".`;
+}
+
+/** The first part whose type is a string other than text or image_url. */
+function checkOtherParts(message: Record<string, unknown>): Failure | undefined {
+  const content = message.content;
+  if (!Array.isArray(content)) {
+    return undefined;
+  }
+  for (const part of content) {
+    if (isRecord(part) && typeof part.type === "string" && part.type !== "text") {
+      return unsupported(partTypeMessage(part.type));
+    }
+  }
+  return undefined;
+}
+
+/** Checks on one message before its content is read, in order. */
+const MESSAGE_CHECKS: readonly Check<Record<string, unknown>>[] = [
+  checkToolRole,
+  checkRole,
+  checkToolCalls,
+  checkImageParts,
+  checkOtherParts,
+];
+
+/** Tools or functions with at least one definition. */
+function checkToolDefinitions(body: Record<string, unknown>): Failure | undefined {
+  return hasEntries(body.tools) || hasEntries(body.functions)
+    ? unsupported(MESSAGES.tools)
+    : undefined;
 }
 
 function textOfPart(part: unknown): string | undefined {
@@ -146,25 +230,29 @@ function readContent(content: unknown): string | undefined {
   return texts.every((text) => text !== undefined) ? texts.join("") : undefined;
 }
 
-type MessageResult = { message: Message } | { error: string };
+type MessageResult = { message: Message } | { error: Failure };
 
-/** Checks one message in the order object, role, content, keeping only those two. */
+/**
+ * Checks one message in order: object, the checks of MESSAGE_CHECKS, then
+ * content. Only the role and the text content are kept.
+ */
 function convertMessage(item: unknown): MessageResult {
   if (!isRecord(item)) {
-    return { error: MESSAGES.messageNotObject };
+    return { error: invalid(MESSAGES.messageNotObject) };
   }
-  if (!isRole(item.role)) {
-    return { error: roleMessage(item.role) };
+  const failure = firstError(MESSAGE_CHECKS, item);
+  if (failure !== undefined) {
+    return { error: failure };
   }
   const content = readContent(item.content);
   if (content === undefined) {
-    return { error: MESSAGES.contentType };
+    return { error: invalid(MESSAGES.contentType) };
   }
-  return { message: { role: item.role, content } };
+  return { message: { role: item.role as Role, content } };
 }
 
 /** Checks the messages one by one and stops at the first one that fails. */
-function convertMessages(items: unknown[]): { messages: Message[] } | { error: string } {
+function convertMessages(items: unknown[]): { messages: Message[] } | { error: Failure } {
   const messages: Message[] = [];
   for (const item of items) {
     const converted = convertMessage(item);
@@ -212,14 +300,13 @@ function readStreaming(body: Record<string, unknown>): { stream: boolean; includ
 }
 
 /**
- * Checks a request body in order:
- * JSON object, messages, model, each message, n. The first failure decides. Unknown fields are
- * ignored.
+ * Checks a request body in this order: JSON object, messages, model, each message, tools and
+ * functions, n. The first failure decides. Unknown fields are ignored.
  */
 export function parseChatCompletionsRequest(text: string): AdapterResult {
   const body = parseObject(text);
   if (body === undefined) {
-    return reject(MESSAGES.invalidJson);
+    return reject(invalid(MESSAGES.invalidJson));
   }
   const bodyError = firstError(BODY_CHECKS, body);
   if (bodyError !== undefined) {
@@ -229,8 +316,12 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
   if ("error" in converted) {
     return reject(converted.error);
   }
+  const toolsError = checkToolDefinitions(body);
+  if (toolsError !== undefined) {
+    return reject(toolsError);
+  }
   if (typeof body.n === "number" && body.n >= 2) {
-    return reject(MESSAGES.tooManyChoices);
+    return reject(invalid(MESSAGES.tooManyChoices));
   }
   return {
     ok: true,

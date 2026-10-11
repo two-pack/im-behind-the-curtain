@@ -50,7 +50,7 @@ node dist/bin.js answer   # 端末2: リクエストを表示して、返答を�
 
 ### リクエストの中身
 
-発言の `content` には、文字列、`null`（`(empty)` と表示します）、文章の部品の配列（`{"type": "text", "text": "..."}`。区切りなしでつなげます）を指定できます。それ以外の部品、`system`、`developer`、`user`、`assistant` 以外の役割、2以上の `n` は、`400` のエラーで断ります。知らない項目は無視します。本文が10 MB（10485760バイト）を超えるリクエストは、`413` と `request_too_large` で断り、何も保存しません。
+発言の `content` には、文字列、`null`（`(empty)` と表示します）、文章の部品の配列（`{"type": "text", "text": "..."}`。区切りなしでつなげます）を指定できます。`system`、`developer`、`user`、`assistant` 以外の役割、形のおかしい部品、2以上の `n` は、`400` のエラーで断ります。人間が読めない、または行えない内容を求めるリクエストは、`code` が `unsupported_content` の `400` のエラーで断ります。断るのは、文章でない部品（画像、音声、ファイル）、1件以上の定義がある `tools` と `functions`、役割が `tool` か `function` の発言、`tool_calls` か `function_call` を持つ `assistant` の発言です。空の `tools` と `functions` は受け付けます。知らない項目は無視します。本文が10 MB（10485760バイト）を超えるリクエストは、`413` と `request_too_large` で断り、何も保存しません。
 
 `imbehind answer` は、`system` と `developer` の発言をすべて、それ以外は最後の3件を表示します。発言を省いたときは、`(3 earlier messages omitted. Full conversation: <path>)` のような行を1つ表示します。`<path>` は、会話の全体を入れた `request.json` の場所です。200行を超える発言は、200行で切り、同じような行を足します。改行とタブ以外の制御文字は、`\xNN`（たとえば `\x1b`）の形で表示します。
 
@@ -134,7 +134,7 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 ## 注意
 
-- 送った内容は、画像も含めてファイルに保存され、人間が読みます。
+- 送った内容はファイルに保存され、人間が読みます。画像入りなど、断ったリクエストは保存しません。
 - 認証はありません。手元のマシンの中だけで使ってください。
 - OpenAI、Anthropicほか、名前を挙げた各社とは関係ありません。
 

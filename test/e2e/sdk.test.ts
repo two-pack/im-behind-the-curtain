@@ -119,7 +119,11 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
         model: "whatever",
         messages: [{ role: "tool", content: "x", tool_call_id: "1" }],
       }),
-    ).rejects.toMatchObject({ status: 400 });
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "unsupported_content",
+      type: "invalid_request_error",
+    });
   });
 
   it("accepts a message whose content is an array of text parts", async () => {

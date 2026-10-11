@@ -63,10 +63,10 @@ describe("checking the request body", () => {
   });
 
   it("rejects an unsupported role and names it", () => {
-    const tool = rejectionOf(body({ model: "m", messages: [{ role: "tool", content: "x" }] }));
-    expect(tool.message).toBe('Unsupported message role: "tool".');
-    expect(tool.code).toBe("invalid_request");
-    expect(tool.status).toBe(400);
+    const critic = rejectionOf(body({ model: "m", messages: [{ role: "critic", content: "x" }] }));
+    expect(critic.message).toBe('Unsupported message role: "critic".');
+    expect(critic.code).toBe("invalid_request");
+    expect(critic.status).toBe(400);
   });
 
   it("cuts a long role name to 64 characters", () => {
@@ -133,10 +133,8 @@ describe("the content of a message", () => {
     expect(conversationOf([])).toEqual([{ role: "user", content: "" }]);
   });
 
-  it("rejects a part that is not a text part", () => {
+  it("rejects a malformed part, as before", () => {
     const bad: unknown[] = [
-      [{ type: "image_url", image_url: { url: "x" } }],
-      [{ type: "text", text: "a" }, { type: "input_audio" }],
       [{ type: "text" }],
       [{ type: "text", text: 5 }],
       [{ text: "no type" }],
@@ -202,6 +200,160 @@ describe("the order of the checks", () => {
     expect(rejectionOf(body({ model: "m", messages })).message).toBe(
       "Message content must be a string, null, or an array of text parts.",
     );
+  });
+});
+
+describe("requests that are turned away as unsupported", () => {
+  const TOOLS = "Tool calls are not supported. Send the request without tools.";
+  const IMAGES = "Images are not supported. A human reads requests as text.";
+  const ROLE_CRITIC = 'Unsupported message role: "critic".';
+  const CONTENT = "Message content must be a string, null, or an array of text parts.";
+  const IMAGE_PART = { type: "image_url", image_url: { url: "x" } };
+
+  function unsupported(message: string) {
+    return { status: 400, code: "unsupported_content", message };
+  }
+
+  function invalid(message: string) {
+    return { status: 400, code: "invalid_request", message };
+  }
+
+  function turnedAway(messages: unknown[], extra: Record<string, unknown> = {}) {
+    return rejectionOf(body({ model: "m", messages, ...extra }));
+  }
+
+  function accepted(messages: unknown[], extra: Record<string, unknown> = {}) {
+    return parseChatCompletionsRequest(body({ model: "m", messages, ...extra })).ok;
+  }
+
+  it("rejects a message with the role tool or function with the tools message", () => {
+    for (const role of ["tool", "function"]) {
+      expect(turnedAway([{ role, content: "x" }])).toEqual(unsupported(TOOLS));
+    }
+    expect(turnedAway([{ role: "tool" }])).toEqual(unsupported(TOOLS));
+    expect(turnedAway([{ role: "tool", content: [IMAGE_PART] }])).toEqual(unsupported(TOOLS));
+  });
+
+  it("treats a role that differs only in case as an unknown role", () => {
+    expect(turnedAway([{ role: "Tool", content: "x" }])).toEqual(
+      invalid('Unsupported message role: "Tool".'),
+    );
+  });
+
+  it("rejects an assistant message with tool_calls or function_call", () => {
+    const calls = [{ id: "1", type: "function", function: { name: "f", arguments: "{}" } }];
+    expect(turnedAway([{ role: "assistant", tool_calls: calls }])).toEqual(unsupported(TOOLS));
+    expect(turnedAway([{ role: "assistant", content: "x", tool_calls: calls }])).toEqual(
+      unsupported(TOOLS),
+    );
+    expect(turnedAway([{ role: "assistant", function_call: { name: "f" } }])).toEqual(
+      unsupported(TOOLS),
+    );
+  });
+
+  it("accepts empty or null tool fields, and tool fields on other roles", () => {
+    expect(accepted([{ role: "assistant", content: "x", tool_calls: [] }])).toBe(true);
+    expect(accepted([{ role: "assistant", content: "x", tool_calls: null }])).toBe(true);
+    expect(accepted([{ role: "assistant", content: "x", function_call: null }])).toBe(true);
+    expect(accepted([{ role: "user", content: "x", tool_calls: [{ id: "1" }] }])).toBe(true);
+    expect(accepted([{ role: "user", content: "x", function_call: { name: "f" } }])).toBe(true);
+  });
+
+  it("rejects an image part with the images message, wherever it is", () => {
+    expect(turnedAway([{ role: "user", content: [IMAGE_PART] }])).toEqual(unsupported(IMAGES));
+    const mixed = [{ type: "text", text: "a" }, IMAGE_PART];
+    for (const role of ["system", "developer", "user", "assistant"]) {
+      expect(turnedAway([{ role, content: mixed }])).toEqual(unsupported(IMAGES));
+    }
+    expect(turnedAway([{ role: "user", content: [{ type: "input_audio" }, IMAGE_PART] }])).toEqual(
+      unsupported(IMAGES),
+    );
+  });
+
+  it("names the type of any other part", () => {
+    for (const type of ["input_audio", "file", "refusal", ""]) {
+      expect(turnedAway([{ role: "user", content: [{ type }] }])).toEqual(
+        unsupported(`Unsupported content part type: "${type}".`),
+      );
+    }
+    const first = [{ type: "text", text: "a" }, { type: "file" }, { type: "input_audio" }];
+    expect(turnedAway([{ role: "user", content: first }]).message).toBe(
+      'Unsupported content part type: "file".',
+    );
+  });
+
+  it("cuts a long part type to 64 characters", () => {
+    const type = "t".repeat(100);
+    expect(turnedAway([{ role: "user", content: [{ type }] }]).message).toBe(
+      `Unsupported content part type: "${"t".repeat(64)}".`,
+    );
+  });
+
+  it("keeps a malformed part as an invalid request", () => {
+    const malformed: unknown[] = [
+      [{ text: "no type" }],
+      [{ type: 5 }],
+      [{ type: null }],
+      ["a string part"],
+      [null],
+      [{ type: "text" }],
+      [{ type: "text", text: 5 }],
+    ];
+    for (const content of malformed) {
+      expect(turnedAway([{ role: "user", content }])).toEqual(invalid(CONTENT));
+    }
+  });
+
+  it("rejects tools or functions with at least one entry", () => {
+    for (const extra of [
+      { tools: [{ type: "function" }] },
+      { tools: [null] },
+      { functions: [{ name: "f" }] },
+      { functions: [5] },
+    ]) {
+      expect(turnedAway(VALID.messages, extra)).toEqual(unsupported(TOOLS));
+    }
+  });
+
+  it("accepts empty, null, missing or non-array tools and functions", () => {
+    for (const extra of [
+      { tools: [] },
+      { tools: null },
+      { tools: "x" },
+      { tools: {} },
+      { functions: [] },
+      { functions: null },
+      { functions: 7 },
+      { tool_choice: "auto", parallel_tool_calls: true, function_call: "auto" },
+    ]) {
+      expect(accepted(VALID.messages, extra)).toBe(true);
+    }
+  });
+
+  it("decides by the first failing message, and by the first failing check in it", () => {
+    expect(turnedAway([{ role: "critic" }, { role: "tool" }])).toEqual(invalid(ROLE_CRITIC));
+    expect(turnedAway([{ role: "tool" }, { role: "critic" }])).toEqual(unsupported(TOOLS));
+    expect(turnedAway([{ role: "tool", content: [IMAGE_PART] }])).toEqual(unsupported(TOOLS));
+    expect(
+      turnedAway([{ role: "assistant", content: [IMAGE_PART], tool_calls: [{ id: "1" }] }]),
+    ).toEqual(unsupported(TOOLS));
+    expect(turnedAway([{ role: "user", content: 5 }, { role: "tool" }])).toEqual(invalid(CONTENT));
+    expect(
+      turnedAway([{ role: "user", content: [{ type: "file" }, { text: "no type" }] }]),
+    ).toEqual(unsupported('Unsupported content part type: "file".'));
+  });
+
+  it("checks tools and functions after the messages and before n", () => {
+    const withTools = { tools: [{ type: "function" }], n: 2 };
+    expect(turnedAway(VALID.messages, withTools)).toEqual(unsupported(TOOLS));
+    expect(turnedAway([{ role: "critic" }], withTools)).toEqual(invalid(ROLE_CRITIC));
+    expect(turnedAway(VALID.messages, { n: 2 }).code).toBe("invalid_request");
+  });
+
+  it("reports unsupported_content as a client error, not a server error", () => {
+    expect(errorBody("unsupported_content", TOOLS)).toEqual({
+      error: { message: TOOLS, type: "invalid_request_error", code: "unsupported_content" },
+    });
   });
 });
 
@@ -297,7 +449,7 @@ describe("converting to the shared form", () => {
       ...VALID,
       temperature: 0.2,
       n: 1,
-      tools: [{ type: "function" }],
+      tools: [],
       response_format: { type: "json_object" },
       surprise: { nested: true },
     };

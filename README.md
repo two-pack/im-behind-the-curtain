@@ -50,7 +50,7 @@ If the request cannot be stored, the server answers with the normal JSON error i
 
 ### Request content
 
-A message `content` can be a string, `null` (shown as `(empty)`), or an array of text parts (`{"type": "text", "text": "..."}`, joined without a separator). Any other part, a role other than `system`, `developer`, `user` or `assistant`, and an `n` of 2 or more are refused with a `400` error. Unknown fields are ignored. A request body larger than 10 MB (10485760 bytes) is refused with `413` and `request_too_large`, and nothing is stored.
+A message `content` can be a string, `null` (shown as `(empty)`), or an array of text parts (`{"type": "text", "text": "..."}`, joined without a separator). A role other than `system`, `developer`, `user` or `assistant`, a malformed part, and an `n` of 2 or more are refused with a `400` error. Requests that ask for something a human cannot read or do are refused with a `400` error whose `code` is `unsupported_content`: a part that is not text (an image, audio, a file), `tools` or `functions` with at least one entry, a message with the role `tool` or `function`, and an `assistant` message with `tool_calls` or `function_call`. Empty `tools` and `functions` are accepted. Unknown fields are ignored. A request body larger than 10 MB (10485760 bytes) is refused with `413` and `request_too_large`, and nothing is stored.
 
 `imbehind answer` shows every `system` and `developer` message and the last three of the other messages. When it leaves messages out, it prints one line such as `(3 earlier messages omitted. Full conversation: <path>)`, where `<path>` is the `request.json` file with the whole conversation. A message longer than 200 lines is cut after 200 lines with a similar line. Control characters other than newline and tab are shown as `\xNN` (for example `\x1b`).
 
@@ -134,7 +134,7 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 ## Notes
 
-- Everything you send, including images, is saved to files and read by a human.
+- Everything you send is saved to files and read by a human. A request that is refused, such as one with an image, is not saved.
 - There is no authentication. Use it only on your own machine.
 - Not affiliated with OpenAI, Anthropic, or any other company named here.
 

@@ -262,6 +262,37 @@ describe("rejected bodies", () => {
   });
 });
 
+describe("requests turned away as unsupported", () => {
+  const TOOLS = "Tool calls are not supported. Send the request without tools.";
+  const IMAGES = "Images are not supported. A human reads requests as text.";
+
+  const CASES: [string, Record<string, unknown>, string][] = [
+    [
+      "an image part",
+      {
+        model: "m",
+        messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "x" } }] }],
+      },
+      IMAGES,
+    ],
+    ["tools", { model: "m", messages: [{ role: "user", content: "Hi" }], tools: [{}] }, TOOLS],
+    ["a tool role", { model: "m", messages: [{ role: "tool", content: "x" }] }, TOOLS],
+  ];
+
+  for (const [name, request, message] of CASES) {
+    it(`answers 400 unsupported_content for ${name} and stores nothing`, async () => {
+      const { port, store, out } = await startServer();
+      const reply = await send(port, { body: JSON.stringify(request) });
+      expect(reply.status).toBe(400);
+      expect(reply.json()).toEqual({
+        error: { message, type: "invalid_request_error", code: "unsupported_content" },
+      });
+      expect(store.entries.size).toBe(0);
+      expect(out).toEqual([]);
+    });
+  }
+});
+
 const BODY_LIMIT = 10485760;
 const TOO_LARGE = {
   error: {

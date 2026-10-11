@@ -295,6 +295,78 @@ describe("requests that are turned away or let through", () => {
   });
 });
 
+describe("requests that are turned away as unsupported", () => {
+  const TOOLS = "Tool calls are not supported. Send the request without tools.";
+  const IMAGES = "Images are not supported. A human reads requests as text.";
+  const USER = { role: "user", content: "Hello" };
+
+  async function refusedAs(request: Record<string, unknown>, message: string) {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader([]));
+    const reply = await curlPost(serve.baseUrl, JSON.stringify({ model: "m", ...request }));
+    expect(reply.status).toBe(400);
+    expect(reply.body.error).toEqual({
+      message,
+      type: "invalid_request_error",
+      code: "unsupported_content",
+    });
+    expect(await storedRequests(serve.storageDir)).toEqual([]);
+    expect(answer.stdout()).not.toContain("Request 1 of");
+  }
+
+  it("refuses an image part", async () => {
+    const content = [
+      { type: "text", text: "What is this?" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+    ];
+    await refusedAs({ messages: [{ role: "user", content }] }, IMAGES);
+  });
+
+  it("refuses an audio part and names its type", async () => {
+    const content = [{ type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }];
+    await refusedAs(
+      { messages: [{ role: "user", content }] },
+      'Unsupported content part type: "input_audio".',
+    );
+  });
+
+  it("refuses tools", async () => {
+    await refusedAs({ messages: [USER], tools: [{ type: "function" }] }, TOOLS);
+  });
+
+  it("refuses a message with the role tool", async () => {
+    await refusedAs(
+      { messages: [USER, { role: "tool", content: "42", tool_call_id: "1" }] },
+      TOOLS,
+    );
+  });
+
+  it("refuses functions and a message with the role function", async () => {
+    await refusedAs({ messages: [USER], functions: [{ name: "f" }] }, TOOLS);
+    await refusedAs({ messages: [{ role: "function", name: "f", content: "42" }] }, TOOLS);
+  });
+
+  it("refuses an assistant message with tool_calls or function_call", async () => {
+    const calls = [{ id: "1", type: "function", function: { name: "f", arguments: "{}" } }];
+    await refusedAs({ messages: [USER, { role: "assistant", tool_calls: calls }] }, TOOLS);
+    await refusedAs(
+      { messages: [USER, { role: "assistant", function_call: { name: "f" } }] },
+      TOOLS,
+    );
+  });
+
+  it("accepts empty tools and gets the reply", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["Hi"]));
+    const reply = await curlPost(
+      serve.baseUrl,
+      JSON.stringify({ model: "m", messages: [USER], tools: [] }),
+    );
+    expect(reply.status).toBe(200);
+    await waitFor(() => answer.stdout().includes("Sent."));
+  });
+});
+
 /** A body with one user message. */
 function chatBody(content: string): string {
   return JSON.stringify({ model: "m", messages: [{ role: "user", content }] });
