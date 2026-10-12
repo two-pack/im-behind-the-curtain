@@ -36,11 +36,19 @@ export function currentPlatformInfo(): PlatformInfo {
 
 /**
  * A path made absolute from the working directory and cleaned up, with the path rules of the
- * platform in `info`. Symbolic links are not resolved.
+ * platform in `info`. Symbolic links are not resolved. Without a working directory in `info`,
+ * the working directory of this process is used, and then the rules of this system apply to it.
+ * A path that is already absolute on this system is kept as it is, whatever the rules in `info`.
  */
 export function absolutePath(info: PlatformInfo, target: string): string {
+  if (info.cwd === undefined) {
+    return path.resolve(target);
+  }
+  if (path.isAbsolute(target)) {
+    return path.normalize(target);
+  }
   const rules = info.platform === "win32" ? path.win32 : path.posix;
-  return rules.resolve(info.cwd ?? process.cwd(), target);
+  return rules.resolve(info.cwd, target);
 }
 
 /**

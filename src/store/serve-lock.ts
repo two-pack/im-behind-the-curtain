@@ -38,8 +38,31 @@ export interface LockFs {
   unlink(file: string): Promise<void>;
 }
 
+/**
+ * Whether the parent of `file` is a regular file. Windows reports a missing file below a regular
+ * file as "not found" (ENOENT), where other systems report "not a directory" (ENOTDIR).
+ */
+async function parentIsFile(file: string): Promise<boolean> {
+  try {
+    return (await fsPromises.stat(path.dirname(file))).isFile();
+  } catch {
+    return false;
+  }
+}
+
 export const nodeLockFs: LockFs = {
-  readFile: (file) => fsPromises.readFile(file, "utf8"),
+  readFile: async (file) => {
+    try {
+      return await fsPromises.readFile(file, "utf8");
+    } catch (error) {
+      if (errorCode(error) === "ENOENT" && (await parentIsFile(file))) {
+        throw Object.assign(new Error(`ENOTDIR: not a directory, open '${file}'`), {
+          code: "ENOTDIR",
+        });
+      }
+      throw error;
+    }
+  },
   writeFile: (file, data, mode) => fsPromises.writeFile(file, data, { encoding: "utf8", mode }),
   link: (existing, target) => fsPromises.link(existing, target),
   rename: (from, to) => fsPromises.rename(from, to),

@@ -166,6 +166,12 @@ describe("absolute paths", () => {
     );
     expect(currentPlatformInfo().cwd).toBe(process.cwd());
   });
+
+  it("keeps a path that is already absolute on this system, whatever the rules of the information", () => {
+    const linux = { platform: "linux", env: {}, homedir: undefined, cwd: "/work" } as const;
+    const absolute = path.resolve("keep-me");
+    expect(absolutePath(linux, absolute)).toBe(absolute);
+  });
 });
 
 describe("fatal error handling", () => {
