@@ -1,0 +1,56 @@
+{
+  "name": "imbehind",
+  "version": "0.1.0",
+  "description": "An OpenAI Chat Completions compatible API server where a human writes the replies.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "imbehind": "dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "openai",
+    "chat-completions",
+    "mock",
+    "test",
+    "llm",
+    "human-in-the-loop",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/two-pack/im-behind-the-curtain.git"
+  },
+  "bugs": {
+    "url": "https://github.com/two-pack/im-behind-the-curtain/issues"
+  },
+  "homepage": "https://github.com/two-pack/im-behind-the-curtain#readme",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "biome check .",
+    "test": "vitest run --coverage",
+    "knip": "knip",
+    "deps": "depcruise src --config .dependency-cruiser.cjs",
+    "check": "npm run typecheck && npm run lint && npm test && npm run knip && npm run deps",
+    "prepublishOnly": "npm run build",
+    "audit": "npm audit",
+    "round-trip": "node test/tools/round-trip.ts",
+    "hooks:install": "git config core.hooksPath .githooks"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "22.20.5",
+    "@vitest/coverage-v8": "5.0.3",
+    "dependency-cruiser": "18.5.0",
+    "knip": "6.41.0",
+    "openai": "7.32.0",
+    "typescript": "6.0.3",
+    "vitest": "5.0.3"
+  }
+}

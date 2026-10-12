@@ -1,0 +1,67 @@
+name: Publish
+
+# Publishes the version in package.json to npm, tags it, and makes a GitHub release.
+# It never runs by itself: a person starts it with "Run workflow" on the main branch, and the
+# job then waits for the approval that the environment "npm-publish" asks for.
+#
+# npm trusted publishing (no stored token) works once the package exists and the trusted publisher
+# is set on npmjs.com. For the very first version, a temporary secret NPM_TOKEN in that
+# environment is used instead; delete it after the first publish.
+#
+# The publishing job uses no cache, so that nothing stored by an earlier run is trusted by the job
+# that holds the write permissions. Only one run publishes at a time, and a run that is already in
+# progress is never cancelled, because a publish that stops half way is hard to repair.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - name: Publish to npm
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then export NODE_AUTH_TOKEN="$NPM_TOKEN"; fi
+          npm publish --provenance --access public
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Tag the version and make the release
+        run: gh release create "v$(node -p "require('./package.json').version")" --target "$GITHUB_SHA" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  verify:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - name: Install the published version and make one round trip
+        run: |
+          version=$(node -p "require('./package.json').version")
+          for attempt in 1 2 3 4 5 6; do
+            npm install --prefix "$RUNNER_TEMP/published" --min-release-age=0 "imbehind@$version" && break
+            sleep 20
+          done
+          node test/tools/round-trip.ts "$RUNNER_TEMP/published/node_modules/imbehind/dist/bin.js"

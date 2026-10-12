@@ -1,0 +1,181 @@
+/**
+ * The only way serve and answer write to the terminal.
+ *
+ * The logger has one function per kind of line, and the lines about requests take only fixed
+ * values: a short id and a reason from a fixed list. A short id that does not look like one,
+ * or a reason that is not in the list, is replaced by a placeholder, so a request or a reply
+ * cannot reach the log by mistake. The one function that takes a sentence, `startupError`,
+ * is for the program's own startup messages. The screen writer shows what a person must
+ * read, such as a request, and it adds no color.
+ */
+import type { Clock } from "./clock.js";
+import { IO_REASONS, type IoReason } from "./errors.js";
+import { isInvalidReplyReason, type ReplyKind } from "./model.js";
+
+/** Where text goes. `process.stdout` and `process.stderr` fit, and tests pass a recorder. */
+export interface Sink {
+  write(text: string): unknown;
+}
+
+export interface LoggerOptions {
+  out: Sink;
+  err: Sink;
+  clock: Clock;
+}
+
+/** The sentence of the fixed line for an unexpected failure. */
+const UNEXPECTED_FAILURE = "unexpected failure.";
+
+/** The width of the event column in a serve line. */
+const EVENT_WIDTH = 10;
+type EventWord =
+  | "received"
+  | "replied"
+  | "skipped"
+  | "cancelled"
+  | "timed_out"
+  | "abandoned"
+  | "invalid_reply"
+  | "error";
+
+/** Written in place of text that is not one of the fixed reasons of an invalid reply file. */
+const UNKNOWN_INVALID_REASON = "reply file is invalid";
+
+const NO_ID = "------";
+const SHORT_ID = /^[0-9a-f]{6}$/;
+
+function pad(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function cleanId(shortId: string | undefined): string {
+  return shortId !== undefined && SHORT_ID.test(shortId) ? shortId : NO_ID;
+}
+
+function cleanReason(reason: IoReason): IoReason {
+  return (IO_REASONS as readonly string[]).includes(reason) ? reason : "failed";
+}
+
+export class Logger {
+  private readonly out: Sink;
+  private readonly err: Sink;
+  private readonly clock: Clock;
+  /** The failures that were already written, as "id|reason". */
+  private readonly written = new Set<string>();
+
+  constructor(options: LoggerOptions) {
+    this.out = options.out;
+    this.err = options.err;
+    this.clock = options.clock;
+  }
+
+  /** The first line of serve. An IPv6 address is written in brackets, as in a URL. */
+  listening(host: string, port: number, storageDir: string): void {
+    const shown = host.includes(":") ? `[${host}]` : host;
+    this.out.write(`Listening on http://${shown}:${port} (storage: ${storageDir})\n`);
+  }
+
+  /**
+   * The line for an accepted request: the endpoint, the reply kind, and `stream` only when the
+   * request streams. Only these fixed words are written.
+   */
+  received(shortId: string, replyKind: ReplyKind, stream: boolean): void {
+    const kind = replyKind === "json" ? "json" : "text";
+    this.event(
+      "received",
+      shortId,
+      `chat/completions  ${kind}${stream === true ? "  stream" : ""}`,
+    );
+  }
+
+  replied(shortId: string): void {
+    this.event("replied", shortId);
+  }
+
+  skipped(shortId: string): void {
+    this.event("skipped", shortId);
+  }
+
+  /** The client went away. The reason is always the same fixed phrase. */
+  cancelled(shortId: string): void {
+    this.event("cancelled", shortId, "client disconnected");
+  }
+
+  timedOut(shortId: string): void {
+    this.event("timed_out", shortId);
+  }
+
+  /** A request left waiting by an earlier run was ended at start. */
+  abandoned(shortId: string): void {
+    this.event("abandoned", shortId, "server restarted");
+  }
+
+  /**
+   * A reply file that was not valid ended the request. Only one of the fixed
+   * reasons is written, so a character of the reply cannot reach the screen (NFR10).
+   */
+  invalidReply(shortId: string, reason: string): void {
+    this.event(
+      "invalid_reply",
+      shortId,
+      isInvalidReplyReason(reason) ? reason : UNKNOWN_INVALID_REASON,
+    );
+  }
+
+  /** Writes a failure once for each pair of request and reason, until the request recovers. */
+  failure(shortId: string | undefined, reason: IoReason): void {
+    const id = cleanId(shortId);
+    const fixed = cleanReason(reason);
+    const key = `${id}|${fixed}`;
+    if (this.written.has(key)) {
+      return;
+    }
+    this.written.add(key);
+    this.event("error", id, fixed);
+  }
+
+  /** Forgets the failures of a request, so a new failure is written again. */
+  recovered(shortId: string | undefined): void {
+    const prefix = `${cleanId(shortId)}|`;
+    for (const key of [...this.written]) {
+      if (key.startsWith(prefix)) {
+        this.written.delete(key);
+      }
+    }
+  }
+
+  startupError(message: string): void {
+    this.err.write(`Error: ${message}\n`);
+  }
+
+  /** The one line for a failure nobody planned for. It carries no message, stack or path. */
+  unexpectedFailure(): void {
+    this.startupError(UNEXPECTED_FAILURE);
+  }
+
+  /**
+   * Writes one line of columns: the time, the event padded to ten columns, the short id, and
+   * after two spaces the detail. An event word of ten or more characters is not cut and is
+   * followed by two spaces. A line with no detail ends with the short id.
+   */
+  private event(event: EventWord, shortId: string, detail?: string): void {
+    const now = this.clock.now();
+    const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+    const column = `${event.padEnd(Math.max(EVENT_WIDTH, event.length + 1))} `;
+    const tail = detail === undefined ? "" : `  ${detail}`;
+    this.out.write(`${time} ${column}${cleanId(shortId)}${tail}\n`);
+  }
+}
+
+/** Writes lines for a person to read. */
+export class Screen {
+  private readonly sink: Sink;
+
+  constructor(sink: Sink) {
+    this.sink = sink;
+  }
+
+  line(text: string): void {
+    this.sink.write(`${text}\n`);
+  }
+}
