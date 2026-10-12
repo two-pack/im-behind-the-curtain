@@ -9,6 +9,19 @@ import { waitFor } from "../helpers/io.js";
 import { ScriptedReader } from "../helpers/scripted-reader.js";
 import { postChat, startAnswer, startServe } from "../helpers/system.js";
 
+/** The result of `promise`, or a failure that names the step that did not end within `ms`. */
+async function within<T>(promise: Promise<T>, ms: number, step: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`did not end within ${ms} ms: ${step}`)), ms);
+  });
+  try {
+    return await Promise.race([promise, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function requestFolderFiles(storageDir: string): Promise<string[]> {
   const requests = path.join(storageDir, "requests");
   const [id] = await readdir(requests);
@@ -169,19 +182,23 @@ describe("Ctrl+C while a reply is being read", () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "Hello" }] }),
     }).catch(() => undefined);
-    await waitFor(async () => (await readdir(path.join(serve.storageDir, "requests"))).length > 0);
     const store = new ExchangeStore({ rootDir: serve.storageDir });
+    await within(
+      waitFor(async () => (await store.listIds()).length > 0),
+      10_000,
+      "the request did not show up in the storage directory",
+    );
     const [id] = await store.listIds();
     await store.placeReply(
       id ?? "",
       serializeFile(createReplyFile("late", new Date().toISOString())),
     );
-    await held;
+    await within(held, 10_000, "serve did not start to read reply.json");
 
     const stopped = serve.stop();
     letGo();
-    await stopped;
-    await client;
+    await within(stopped, 10_000, "serve did not stop");
+    await within(client, 10_000, "the client request did not end after the stop");
 
     expect(await requestState(serve.storageDir)).toBe("waiting");
     expect(await requestFolderFiles(serve.storageDir)).toEqual([

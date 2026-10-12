@@ -41,15 +41,15 @@ export function currentPlatformInfo(): PlatformInfo {
  * A path that is already absolute by the rules in `info`, or on this system, is kept as it is.
  */
 export function absolutePath(info: PlatformInfo, target: string): string {
-  if (info.cwd === undefined) {
-    return path.resolve(target);
-  }
   const rules = info.platform === "win32" ? path.win32 : path.posix;
   if (rules.isAbsolute(target)) {
     return rules.normalize(target);
   }
   if (path.isAbsolute(target)) {
     return path.normalize(target);
+  }
+  if (info.cwd === undefined) {
+    return path.resolve(target);
   }
   return rules.resolve(info.cwd, target);
 }
