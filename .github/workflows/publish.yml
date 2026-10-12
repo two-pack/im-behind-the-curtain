@@ -7,11 +7,19 @@ name: Publish
 # npm trusted publishing (no stored token) works once the package exists and the trusted publisher
 # is set on npmjs.com. For the very first version, a temporary secret NPM_TOKEN in that
 # environment is used instead; delete it after the first publish.
+#
+# The publishing job uses no cache, so that nothing stored by an earlier run is trusted by the job
+# that holds the write permissions. Only one run publishes at a time, and a run that is already in
+# progress is never cancelled, because a publish that stops half way is hard to repair.
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -27,7 +35,6 @@ jobs:
         with:
           node-version: lts/*
           registry-url: https://registry.npmjs.org
-          cache: npm
       - run: npm ci
       - run: npm run check
       - run: npm run build

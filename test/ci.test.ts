@@ -204,4 +204,54 @@ describe(".github/workflows/publish.yml (FR13.2)", () => {
     expect(verify).toContain("--min-release-age=0");
     expect(verify).toContain("test/tools/round-trip.ts");
   });
+
+  /** The text of the two jobs, split at the start of the second one. */
+  function jobs(): { publishJob: string; verifyJob: string } {
+    const start = publish.search(/^jobs:$/m);
+    const split = publish.search(/^ {2}verify:$/m);
+    return { publishJob: publish.slice(start, split), verifyJob: publish.slice(split) };
+  }
+
+  it("keeps publishing and verifying in two separate jobs", () => {
+    expect(publish).toMatch(/^ {2}publish:$/m);
+    expect(publish).toMatch(/^ {2}verify:$/m);
+    const { publishJob, verifyJob } = jobs();
+    expect(publishJob).toContain("npm publish");
+    expect(publishJob).not.toContain("--min-release-age=0");
+    expect(verifyJob).not.toContain("npm publish");
+    expect(verifyJob).toMatch(/^ {4}needs: publish$/m);
+  });
+
+  it("does not use a cache in the publishing job", () => {
+    const { publishJob } = jobs();
+    expect(publishJob).not.toMatch(/^\s*cache:/m);
+    expect(publishJob).not.toContain("actions/cache");
+  });
+
+  it("gives the verifying job no environment and no npm token", () => {
+    const { verifyJob } = jobs();
+    expect(verifyJob).not.toMatch(/^\s*environment:/m);
+    expect(verifyJob).not.toContain("NPM_TOKEN");
+    expect(verifyJob).not.toMatch(/contents: write|id-token: write/);
+  });
+
+  it("lets only one run publish at a time, and never cancels a run that is in progress", () => {
+    const top = publish.slice(0, publish.search(/^jobs:$/m));
+    expect(top).toMatch(/^concurrency:\n {2}group: publish\n {2}cancel-in-progress: false$/m);
+    expect([...publish.matchAll(/^\s*concurrency:/gm)]).toHaveLength(1);
+  });
+
+  it("tries to install the published version up to 6 times, 20 seconds apart", () => {
+    const { verifyJob } = jobs();
+    expect(verifyJob).toContain("for attempt in 1 2 3 4 5 6; do");
+    expect(verifyJob).toContain("&& break");
+    expect(verifyJob).toContain("sleep 20");
+  });
+
+  it("lets GitHub write the notes of the release", () => {
+    const { publishJob } = jobs();
+    const release = publishJob.split("\n").filter((line) => line.includes("gh release create"));
+    expect(release).toHaveLength(1);
+    expect(release[0]).toContain("--generate-notes");
+  });
 });
