@@ -12,8 +12,9 @@ const CODEQL = ".github/workflows/codeql.yml";
 const PUBLISH = ".github/workflows/publish.yml";
 const DEPENDABOT = ".github/dependabot.yml";
 
+/** The text of a file with LF line endings, also on Windows where the checkout uses CRLF. */
 async function text(file: string): Promise<string> {
-  return readFile(file, "utf8");
+  return (await readFile(file, "utf8")).replace(/\r\n/g, "\n");
 }
 
 /** The commands after `run:` in a workflow, one per line. */
