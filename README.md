@@ -1,5 +1,7 @@
 # im-behind-the-curtain
 
+![im-behind-the-curtain](assets/banner.png)
+
 An API server where a human writes the replies instead of an LLM. When the server receives a request, it writes it to a file. When the human writes a reply, the server returns it as the response. Use it to see how an LLM client behaves without a real model, or to play the part of the AI yourself.
 
 [Japanese](README.ja.md)

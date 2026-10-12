@@ -1,5 +1,7 @@
 # im-behind-the-curtain
 
+![im-behind-the-curtain](assets/banner.png)
+
 人間がLLMの代わりに返答を書くAPIサーバーです。サーバーはリクエストを受け取るとファイルに書き出し、人間が返答を書くと、それをレスポンスとして返します。本物のモデルなしでLLMクライアントの動きを確かめたいとき、また、自分がAIの役をしたいときに使えます。
 
 [English](README.md)

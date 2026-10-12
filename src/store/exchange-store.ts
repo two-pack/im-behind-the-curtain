@@ -146,7 +146,7 @@ function tempName(kind: string, processId: number, sequence: number, random: str
 }
 
 const OWN_TEMP_NAME = new RegExp(
-  `^\\.(?:${TEMP_KINDS.map((kind) => kind.replace(/\./g, "\\.")).join("|")})\\.\\d+\\.\\d+\\.[0-9a-f]+\\.tmp$`,
+  `^\\.(?:${TEMP_KINDS.map((kind) => kind.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")})\\.\\d+\\.\\d+\\.[0-9a-f]+\\.tmp$`,
 );
 
 /**
