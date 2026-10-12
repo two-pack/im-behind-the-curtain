@@ -18,6 +18,7 @@ import {
   createReplyFile,
   createRequestFile,
   createStateFile,
+  MAX_FILE_BYTES,
   serializeFile,
 } from "../src/model.js";
 import { ExchangeStore, isOwnTempName, nodeFs, type StoreFs } from "../src/store/exchange-store.js";
@@ -61,6 +62,12 @@ function relative(base: string, target: string): string {
 
 async function names(dir: string): Promise<string[]> {
   return (await readdir(dir)).sort();
+}
+
+/** Accepts the bytes that reply.json holds now, as the broker does with the bytes it verified. */
+async function acceptFromDisk(store: ExchangeStore, id: string): Promise<void> {
+  const bytes = await readFile(path.join(store.rootDir, "requests", id, "reply.json"));
+  await store.acceptReply(id, bytes);
 }
 
 describe("preparing the storage directory", () => {
@@ -346,7 +353,7 @@ describe("ending a request", () => {
     await store.createRequest(sampleRequest(), sampleState());
     const bytes = serializeFile(createReplyFile("", NOW, "skip"));
     await store.placeReply(ID, bytes);
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     const read = await store.readReply(ID, "reply.accepted.json");
     expect(read?.bytes).toBe(bytes);
     expect(read?.parsed.kind === "ok" && read.parsed.value.kind).toBe("skip");
@@ -395,7 +402,7 @@ describe("json requests and replies", () => {
     const body = '{"passed":   true}';
     const bytes = serializeFile(createReplyFile(body, NOW, "json"));
     await store.placeReply(ID, bytes);
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     await store.removeReply(ID);
     expect(await names(path.join(requests, ID))).toEqual([
       "reply.accepted.json",
@@ -503,7 +510,7 @@ describe("accepting a reply", () => {
     const { store, requests } = await newStore();
     await store.createRequest(sampleRequest(), sampleState());
     await store.placeReply(ID, replyText);
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     expect((await store.listFiles(ID)).has("reply.json")).toBe(true);
     expect(await readFile(path.join(requests, ID, "reply.accepted.json"), "utf8")).toBe(replyText);
     await store.removeReply(ID);
@@ -518,10 +525,10 @@ describe("accepting a reply", () => {
     const { store, requests } = await newStore();
     await store.createRequest(sampleRequest(), sampleState());
     await store.placeReply(ID, replyText);
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     await store.removeReply(ID);
     await store.placeReply(ID, "late reply");
-    await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    await expect(acceptFromDisk(store, ID)).rejects.toBeInstanceOf(AlreadyExistsError);
     expect(await readFile(path.join(requests, ID, "reply.accepted.json"), "utf8")).toBe(replyText);
   });
 
@@ -530,12 +537,6 @@ describe("accepting a reply", () => {
     await store.createRequest(sampleRequest(), sampleState());
     await store.removeReply(ID);
     await store.removeReply(ID);
-  });
-
-  it("reports a missing reply.json as link failed", async () => {
-    const { store } = await newStore();
-    await store.createRequest(sampleRequest(), sampleState());
-    await expect(store.acceptReply(ID)).rejects.toMatchObject({ reason: "link failed" });
   });
 
   it("reports a failed removal as an IoFailure", async () => {
@@ -603,7 +604,7 @@ describe.skipIf(process.platform === "win32")("permissions on Linux and macOS", 
     await store.createRequest(sampleRequest(), sampleState());
     await store.writeState(createStateFile(ID, "replied", NOW, NOW));
     await store.placeReply(ID, serializeFile(createReplyFile("Hi", NOW)));
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     const dir = path.join(root, "requests", ID);
     for (const name of ["state.json", "reply.json", "reply.accepted.json"]) {
       expect(await modeOf(path.join(dir, name)), name).toBe(0o600);
@@ -643,7 +644,7 @@ describe.skipIf(process.platform === "win32")("permissions on Linux and macOS", 
     const reply = path.join(root, "requests", ID, "reply.json");
     await writeFile(reply, serializeFile(createReplyFile("Hand written", NOW)));
     await chmod(reply, 0o644);
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     expect(await modeOf(reply)).toBe(0o644);
     expect(await store.readReply(ID, "reply.json")).toBeDefined();
     expect(await modeOf(reply)).toBe(0o644);
@@ -699,7 +700,7 @@ describe("removing a request", () => {
     const t = await newStore(overrides);
     await t.store.createRequest(sampleRequest(), sampleState());
     await t.store.placeReply(ID, serializeFile(createReplyFile("Hi", NOW)));
-    await t.store.acceptReply(ID);
+    await acceptFromDisk(t.store, ID);
     return { ...t, dir: path.join(t.requests, ID) };
   }
 
@@ -908,7 +909,7 @@ describe("accepting a reply through a hidden copy", () => {
     it("makes reply.accepted.json 0600 from a reply.json of mode 0644, and leaves reply.json alone", async () => {
       const { store, dir } = await withUserReply();
       await chmod(path.join(dir, "reply.json"), 0o644);
-      await store.acceptReply(ID);
+      await acceptFromDisk(store, ID);
       expect(await modeOf(path.join(dir, "reply.accepted.json"))).toBe(0o600);
       expect(await modeOf(path.join(dir, "reply.json"))).toBe(0o644);
       expect(await readFile(path.join(dir, "reply.json"), "utf8")).toBe(replyText);
@@ -917,7 +918,7 @@ describe("accepting a reply through a hidden copy", () => {
 
     it("does not link reply.json itself: the two files are different files", async () => {
       const { store, dir } = await withUserReply();
-      await store.acceptReply(ID);
+      await acceptFromDisk(store, ID);
       const accepted = await stat(path.join(dir, "reply.accepted.json"));
       const original = await stat(path.join(dir, "reply.json"));
       expect(accepted.ino).not.toBe(original.ino);
@@ -928,13 +929,13 @@ describe("accepting a reply through a hidden copy", () => {
       const { store, dir } = await withUserReply();
       await writeFile(path.join(dir, LEFTOVER), "other");
       await chmod(path.join(dir, LEFTOVER), 0o666);
-      await store.acceptReply(ID);
+      await acceptFromDisk(store, ID);
       expect(await modeOf(path.join(dir, "reply.accepted.json"))).toBe(0o600);
       expect(await modeOf(path.join(dir, LEFTOVER))).toBe(0o666);
     });
   });
 
-  it("reads reply.json, writes the hidden copy, links it, removes it, in that order", async () => {
+  it("writes the hidden copy, links it, removes it, in that order, and reads nothing", async () => {
     const steps: string[] = [];
     const { store, dir } = await withUserReply({
       readFile: (file) => {
@@ -959,11 +960,10 @@ describe("accepting a reply through a hidden copy", () => {
       },
     });
     steps.length = 0;
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     await store.removeReply(ID);
     expect(steps.map((step) => step.replace(/\.reply\.accepted\.[^ ]+\.tmp/g, ACCEPT_TMP))).toEqual(
       [
-        "read reply.json",
         `write ${ACCEPT_TMP} 600`,
         `link ${ACCEPT_TMP} reply.accepted.json`,
         `rm ${ACCEPT_TMP}`,
@@ -991,8 +991,8 @@ describe("accepting a reply through a hidden copy", () => {
     };
     const { store, dir } = await withUserReply(watch);
     await writeFile(path.join(dir, LEFTOVER), "left by a stopped serve");
-    await store.acceptReply(ID);
-    await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    await acceptFromDisk(store, ID);
+    await expect(acceptFromDisk(store, ID)).rejects.toBeInstanceOf(AlreadyExistsError);
     expect(await readFile(path.join(dir, "reply.accepted.json"), "utf8")).toBe(replyText);
     expect(await readFile(path.join(dir, LEFTOVER), "utf8")).toBe("left by a stopped serve");
     expect(removed.filter((name) => name === LEFTOVER)).toEqual([]);
@@ -1012,9 +1012,9 @@ describe("accepting a reply through a hidden copy", () => {
       },
     });
     written.length = 0;
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     for (let i = 0; i < 4; i += 1) {
-      await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+      await expect(acceptFromDisk(store, ID)).rejects.toBeInstanceOf(AlreadyExistsError);
     }
     expect(written).toHaveLength(5);
     expect(written.every(isAcceptTemp)).toBe(true);
@@ -1042,8 +1042,8 @@ describe("accepting a reply through a hidden copy", () => {
     await store.createRequest(sampleRequest(), sampleState());
     await writeFile(path.join(root, "requests", ID, "reply.json"), replyText);
     written.length = 0;
-    await store.acceptReply(ID);
-    await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    await acceptFromDisk(store, ID);
+    await expect(acceptFromDisk(store, ID)).rejects.toBeInstanceOf(AlreadyExistsError);
     expect(written).toHaveLength(2);
     expect(written[0]).not.toBe(written[1]);
   });
@@ -1059,7 +1059,7 @@ describe("accepting a reply through a hidden copy", () => {
     written.length = 0;
     await store.writeState(sampleState());
     await store.placeReply(ID, replyText).catch(() => undefined);
-    await store.acceptReply(ID);
+    await acceptFromDisk(store, ID);
     expect(written.length).toBeGreaterThanOrEqual(3);
     for (const name of written) {
       expect(isOwnTempName(name)).toBe(true);
@@ -1119,7 +1119,10 @@ describe("accepting a reply through a hidden copy", () => {
       await first.createRequest(sampleRequest(id), sampleState(id));
       await writeFile(path.join(root, "requests", id, "reply.json"), text);
       progress.pieces = 0;
-      const results = await Promise.allSettled([first.acceptReply(id), second.acceptReply(id)]);
+      const results = await Promise.allSettled([
+        acceptFromDisk(first, id),
+        acceptFromDisk(second, id),
+      ]);
       expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
       expect(
         results.filter((r) => r.status === "rejected" && r.reason instanceof AlreadyExistsError),
@@ -1140,7 +1143,7 @@ describe("accepting a reply through a hidden copy", () => {
   it("removes the hidden copy when reply.accepted.json already exists, and keeps the old one", async () => {
     const { store, dir } = await withUserReply();
     await writeFile(path.join(dir, "reply.accepted.json"), "first");
-    await expect(store.acceptReply(ID)).rejects.toBeInstanceOf(AlreadyExistsError);
+    await expect(acceptFromDisk(store, ID)).rejects.toBeInstanceOf(AlreadyExistsError);
     expect(await names(dir)).toEqual([
       "reply.accepted.json",
       "reply.json",
@@ -1157,7 +1160,7 @@ describe("accepting a reply through a hidden copy", () => {
           ? Promise.reject(errno("EPERM"))
           : nodeFs.link(existing, target),
     });
-    const failure = store.acceptReply(ID);
+    const failure = acceptFromDisk(store, ID);
     await expect(failure).rejects.toBeInstanceOf(IoFailure);
     await expect(failure).rejects.toMatchObject({ reason: "link failed" });
     expect(await names(dir)).toEqual(["reply.json", "request.json", "state.json"]);
@@ -1174,16 +1177,7 @@ describe("accepting a reply through a hidden copy", () => {
         return nodeFs.writeFile(file, data, mode);
       },
     });
-    await expect(store.acceptReply(ID)).rejects.toMatchObject({ reason: "write failed" });
-    expect(await names(dir)).toEqual(["reply.json", "request.json", "state.json"]);
-  });
-
-  it("reports a reply.json that cannot be read as read failed", async () => {
-    const { store, dir } = await withUserReply({
-      readFile: (file) =>
-        path.basename(file) === "reply.json" ? Promise.reject(errno("EIO")) : nodeFs.readFile(file),
-    });
-    await expect(store.acceptReply(ID)).rejects.toMatchObject({ reason: "read failed" });
+    await expect(acceptFromDisk(store, ID)).rejects.toMatchObject({ reason: "write failed" });
     expect(await names(dir)).toEqual(["reply.json", "request.json", "state.json"]);
   });
 });
@@ -1298,6 +1292,187 @@ describe("a stop between the steps of accepting a reply", () => {
     await broker.pollOnce();
     const replied = await store.readState(ID);
     expect(replied.kind === "ok" && replied.value.state).toBe("replied");
+  });
+});
+
+describe("reading reply.json for the check", () => {
+  const limit = MAX_FILE_BYTES;
+
+  async function withReplyFile(
+    content: string | Uint8Array | undefined,
+    overrides: Partial<StoreFs> = {},
+  ) {
+    const made = await newStore(overrides);
+    await made.store.createRequest(sampleRequest(), sampleState());
+    const file = path.join(made.requests, ID, "reply.json");
+    if (content !== undefined) {
+      await writeFile(file, content);
+    }
+    return { ...made, file };
+  }
+
+  it("gives nothing when there is no reply.json", async () => {
+    const { store } = await withReplyFile(undefined);
+    expect(await store.readReplyFile(ID)).toBeUndefined();
+  });
+
+  it("gives nothing when the request folder is gone", async () => {
+    const { store } = await newStore();
+    expect(await store.readReplyFile(ID)).toBeUndefined();
+  });
+
+  it("gives the bytes exactly as they are, bytes that are not UTF-8 included", async () => {
+    const raw = Uint8Array.from([0x7b, 0xff, 0xfe, 0x7d]);
+    const { store } = await withReplyFile(raw);
+    const read = await store.readReplyFile(ID);
+    expect(read?.kind).toBe("bytes");
+    expect(read?.kind === "bytes" && Array.from(read.bytes)).toEqual(Array.from(raw));
+  });
+
+  it("reads a file of exactly the limit and calls one byte more too large", async () => {
+    const exact = await withReplyFile(Buffer.alloc(limit, 0x61));
+    const read = await exact.store.readReplyFile(ID);
+    expect(read?.kind === "bytes" && read.bytes.length).toBe(limit);
+    const over = await withReplyFile(Buffer.alloc(limit + 1, 0x61));
+    expect(await over.store.readReplyFile(ID)).toEqual({ kind: "too-large" });
+  });
+
+  it("decides from the size alone and does not open a file that is too large", async () => {
+    const reads: number[] = [];
+    const { store } = await withReplyFile(Buffer.alloc(limit + 1, 0x61), {
+      readBytes: (file, max) => {
+        reads.push(max);
+        return nodeFs.readBytes(file, max);
+      },
+    });
+    expect(await store.readReplyFile(ID)).toEqual({ kind: "too-large" });
+    expect(reads).toEqual([]);
+  });
+
+  it("never reads past one byte more than the limit when the file grew after the size check", async () => {
+    const reads: number[] = [];
+    const lengths: number[] = [];
+    const { store } = await withReplyFile(Buffer.alloc(limit + 4096, 0x61), {
+      statFile: async () => ({ size: 10, isFile: true }),
+      readBytes: async (file, max) => {
+        reads.push(max);
+        const bytes = await nodeFs.readBytes(file, max);
+        lengths.push(bytes.length);
+        return bytes;
+      },
+    });
+    expect(await store.readReplyFile(ID)).toEqual({ kind: "too-large" });
+    expect(reads).toEqual([limit + 1]);
+    expect(lengths).toEqual([limit + 1]);
+  });
+
+  it("reads a bounded number of bytes with the real file operation", async () => {
+    const { file } = await withReplyFile(Buffer.alloc(5000, 0x62));
+    expect((await nodeFs.readBytes(file, 1234)).length).toBe(1234);
+    expect((await nodeFs.readBytes(file, 9999)).length).toBe(5000);
+    expect(await nodeFs.statFile(file)).toEqual({ size: 5000, isFile: true });
+  });
+
+  it("calls a directory named reply.json unreadable, not a wrong reply", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(sampleRequest(), sampleState());
+    await mkdir(path.join(requests, ID, "reply.json"));
+    await expect(store.readReplyFile(ID)).rejects.toMatchObject({
+      name: "IoFailure",
+      reason: "unreadable",
+    });
+  });
+
+  it("calls a failed size check and a failed read unreadable", async () => {
+    const noStat = await withReplyFile("{}", { statFile: () => Promise.reject(errno("EACCES")) });
+    await expect(noStat.store.readReplyFile(ID)).rejects.toMatchObject({ reason: "unreadable" });
+    const noRead = await withReplyFile("{}", { readBytes: () => Promise.reject(errno("EIO")) });
+    await expect(noRead.store.readReplyFile(ID)).rejects.toMatchObject({ reason: "unreadable" });
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "calls a file without read permission unreadable",
+    async () => {
+      const { store, file } = await withReplyFile("{}");
+      await chmod(file, 0o000);
+      await expect(store.readReplyFile(ID)).rejects.toMatchObject({ reason: "unreadable" });
+      await chmod(file, 0o600);
+      expect((await store.readReplyFile(ID))?.kind).toBe("bytes");
+    },
+  );
+
+  it("treats a file that is gone after the size check as no reply", async () => {
+    const { store } = await withReplyFile("{}", {
+      readBytes: () => Promise.reject(errno("ENOENT")),
+    });
+    expect(await store.readReplyFile(ID)).toBeUndefined();
+  });
+
+  it("treats a file that is gone at the size check as no reply", async () => {
+    const { store } = await withReplyFile("{}", {
+      statFile: () => Promise.reject(errno("ENOENT")),
+    });
+    expect(await store.readReplyFile(ID)).toBeUndefined();
+  });
+});
+
+describe("accepting the verified bytes", () => {
+  async function withReply(content: string | Uint8Array) {
+    const made = await newStore();
+    await made.store.createRequest(sampleRequest(), sampleState());
+    await writeFile(path.join(made.requests, ID, "reply.json"), content);
+    return made;
+  }
+
+  it("writes the given bytes to reply.accepted.json and does not read reply.json again", async () => {
+    const reads: string[] = [];
+    const root = await makeTempDir();
+    const store = new ExchangeStore({
+      rootDir: root,
+      fs: {
+        ...nodeFs,
+        readFile: (file) => {
+          reads.push(path.basename(file));
+          return nodeFs.readFile(file);
+        },
+        readBytes: (file, max) => {
+          reads.push(path.basename(file));
+          return nodeFs.readBytes(file, max);
+        },
+      },
+    });
+    await store.prepare();
+    await store.createRequest(sampleRequest(), sampleState());
+    const dir = path.join(root, "requests", ID);
+    const verified = serializeFile(createReplyFile("verified", NOW));
+    await writeFile(path.join(dir, "reply.json"), serializeFile(createReplyFile("rewritten", NOW)));
+    reads.length = 0;
+    await store.acceptReply(ID, Buffer.from(verified, "utf8"));
+    expect(reads).toEqual([]);
+    expect(await readFile(path.join(dir, "reply.accepted.json"), "utf8")).toBe(verified);
+    expect((await store.readReply(ID, "reply.json"))?.parsed).toMatchObject({
+      kind: "ok",
+      value: { body: "rewritten" },
+    });
+  });
+
+  it("writes a leading byte order mark as it is and still reads the accepted file", async () => {
+    const { store, requests } = await withReply("{}");
+    const withBom = Buffer.from(`﻿${serializeFile(createReplyFile("Hi", NOW))}`, "utf8");
+    await store.acceptReply(ID, withBom);
+    const onDisk = await readFile(path.join(requests, ID, "reply.accepted.json"));
+    expect(Array.from(onDisk)).toEqual(Array.from(withBom));
+    const read = await store.readReply(ID, "reply.accepted.json");
+    expect(read?.parsed.kind === "ok" && read.parsed.value.body).toBe("Hi");
+  });
+
+  it("still never replaces an existing reply.accepted.json", async () => {
+    const { store, requests } = await withReply("{}");
+    await store.acceptReply(ID, Buffer.from("first", "utf8"));
+    await expect(store.acceptReply(ID, Buffer.from("second", "utf8"))).rejects.toBeInstanceOf(
+      AlreadyExistsError,
+    );
+    expect(await readFile(path.join(requests, ID, "reply.accepted.json"), "utf8")).toBe("first");
   });
 });
 

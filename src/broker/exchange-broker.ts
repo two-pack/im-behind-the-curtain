@@ -6,6 +6,8 @@ import {
   createReplyFile,
   createRequestFile,
   createStateFile,
+  INVALID_REPLY_REASONS,
+  MAX_FILE_BYTES,
   type ReplyFile,
   type ReplyFileKind,
   type ReplyKind,
@@ -15,10 +17,13 @@ import {
 } from "../model.js";
 import type { ExchangeStorage } from "../store/exchange-store.js";
 import { checkReply, type ReplyCheck } from "./reply-check.js";
+import { checkReplyFile } from "./reply-file-check.js";
 
 /** What the broker tells the outside. The log lines are made elsewhere. */
 export type BrokerEvent =
   | { type: "replied" | "skipped" | "cancelled" | "timed_out" | "abandoned"; id: string }
+  /** `reason` is one of the fixed phrases of `INVALID_REPLY_REASONS`. */
+  | { type: "invalid_reply"; id: string; reason: string }
   /** `id` is missing when the failure is not about one request, such as a failed listing. */
   | { type: "error"; id: string | undefined; reason: IoReason }
   | { type: "recovered"; id: string | undefined };
@@ -33,7 +38,9 @@ export type ExchangeOutcome =
   | { kind: "replied"; id: string; body: string }
   | { kind: "skipped"; id: string }
   | { kind: "timed_out"; id: string; limitSeconds: number }
-  | { kind: "cancelled"; id: string };
+  | { kind: "cancelled"; id: string }
+  /** The reply file was not valid. `reason` carries no character of the file. */
+  | { kind: "invalid_reply"; id: string; reason: string };
 
 export interface Submitted {
   id: string;
@@ -73,7 +80,17 @@ interface Ending {
   removeReplyFile: boolean;
   /** The client was told and the log line was written. */
   answered: boolean;
+  /**
+   * The log line comes only when state.json is written, not at the first try. The
+   * client is still answered at the first try.
+   */
+  logAfterWrite?: boolean;
 }
+
+/** What the check of a reply.json found: the reply and the bytes it was judged on, or a reason. */
+type Judged =
+  | { kind: "valid"; reply: ReplyFile; bytes: Uint8Array }
+  | { kind: "invalid"; reason: string };
 
 export interface BrokerOptions {
   store: ExchangeStorage;
@@ -120,6 +137,8 @@ export class ExchangeBroker {
   private readonly finished = new Set<string>();
   /** Requests whose request.json serve has read once, or wrote itself, in this run. */
   private readonly requestChecked = new Set<string>();
+  /** The reply kind of the requests that serve saved in this run, so their request.json is not read. */
+  private readonly replyKinds = new Map<string, ReplyKind>();
   /** Requests whose last attempt failed. A later success reports a recovery. */
   private readonly failing = new Set<string>();
   /** True while the listing of the storage directory is failing. */
@@ -175,6 +194,7 @@ export class ExchangeBroker {
       throw error;
     }
     this.requestChecked.add(id);
+    this.replyKinds.set(id, request.replyKind);
     return { id, outcome };
   }
 
@@ -367,6 +387,16 @@ export class ExchangeBroker {
   }
 
   /**
+   * Whether the reply file that `placeReply` would write for this body is within the limit.
+   * The length is that of the written bytes: indented, with the body escaped as a JSON string, so quotes and
+   * line ends count for more than the body itself.
+   */
+  replyFitsLimit(body: string, kind: ReplyFileKind): boolean {
+    const bytes = serializeFile(createReplyFile(body, this.clock.now().toISOString(), kind));
+    return Buffer.byteLength(bytes, "utf8") <= MAX_FILE_BYTES;
+  }
+
+  /**
    * Places this answer's reply. `too-late` means the request is no longer waiting or another
    * reply came first. An input/output failure is thrown for the caller to show.
    */
@@ -512,45 +542,100 @@ export class ExchangeBroker {
   }
 
   /**
-   * Accepting a reply, in the order of the table in the reliability design: link
-   * reply.accepted.json, remove reply.json, then write state.json. The reply is read and checked
-   * before the request is claimed, so a reply file that cannot be used never holds a claim.
+   * Looking at the reply files of a request. reply.accepted.json decides when it is there, and
+   * reply.json is then not read. Otherwise reply.json is checked.
    */
   private async receive(id: string): Promise<void> {
     if (this.stopped || this.claimed.has(id)) {
       return;
     }
     const files = await this.store.listFiles(id);
-    const hasAccepted = files.has("reply.accepted.json");
-    if (!hasAccepted && !files.has("reply.json")) {
-      return;
+    if (files.has("reply.accepted.json")) {
+      await this.receiveAccepted(id, files.has("reply.json"));
+    } else if (files.has("reply.json")) {
+      await this.receiveDirect(id);
     }
-    const reply = await this.usableReply(id, hasAccepted);
+  }
+
+  /**
+   * A reply that was accepted earlier ends the request: reply.json goes away if it is still there,
+   * then state.json is written. The reply is read before the request is claimed, so a file that
+   * cannot be used never holds a claim.
+   */
+  private async receiveAccepted(id: string, hasReplyFile: boolean): Promise<void> {
+    const reply = await this.acceptedReply(id);
     // After shutdown nothing is claimed, linked or written. The check comes right
     // before the claim and again before each later step, because every await can let it happen.
     if (this.stopped || reply === undefined || !this.claim(id)) {
       return;
     }
-    if (!hasAccepted) {
-      await this.linkAccepted(id);
-    }
-    await this.finish(
-      id,
-      replyEnding(id, reply, this.clock.now().toISOString(), files.has("reply.json")),
-    );
+    await this.finish(id, replyEnding(id, reply, this.clock.now().toISOString(), hasReplyFile));
   }
 
   /**
-   * The reply that ends the request: the accepted one if there is one, else reply.json. Only a
-   * version 1 reply of a kind this version knows is used. An accepted reply that cannot be read
-   * is reported once.
+   * Accepting a reply.json that nobody has accepted yet, in this order: check it, link
+   * reply.accepted.json, remove reply.json, then write state.json. The check comes before the
+   * request is claimed. A reply that is not valid ends the request as `invalid_reply` and leaves
+   * reply.json where it is.
    */
-  private async usableReply(id: string, hasAccepted: boolean): Promise<ReplyFile | undefined> {
-    const stored = await this.store.readReply(
-      id,
-      hasAccepted ? "reply.accepted.json" : "reply.json",
-    );
-    if (stored?.parsed.kind === "unreadable" && hasAccepted) {
+  private async receiveDirect(id: string): Promise<void> {
+    const judged = await this.judgeReplyFile(id);
+    if (this.stopped || judged === undefined || !this.claim(id)) {
+      return;
+    }
+    const now = this.clock.now().toISOString();
+    if (judged.kind === "invalid") {
+      await this.finish(id, invalidEnding(id, judged.reason, now));
+      return;
+    }
+    await this.linkAccepted(id, judged.bytes);
+    await this.finish(id, replyEnding(id, judged.reply, now, true));
+  }
+
+  /**
+   * Reads reply.json once and judges those bytes. Nothing when the file is gone or
+   * the kind of reply is not known yet.
+   * A file that cannot be read is an IoFailure, which the poll reports and tries again.
+   */
+  private async judgeReplyFile(id: string): Promise<Judged | undefined> {
+    const read = await this.store.readReplyFile(id);
+    if (read === undefined) {
+      return undefined;
+    }
+    if (read.kind === "too-large") {
+      return { kind: "invalid", reason: INVALID_REPLY_REASONS.tooLarge };
+    }
+    const replyKind = await this.replyKindOf(id);
+    if (replyKind === undefined) {
+      return undefined;
+    }
+    const verdict = checkReplyFile(read.bytes, replyKind);
+    return verdict.kind === "valid"
+      ? { kind: "valid", reply: verdict.reply, bytes: read.bytes }
+      : verdict;
+  }
+
+  /**
+   * What the request asks for. A request that serve saved in this run is remembered; for any other
+   * request.json is read. Nothing when request.json cannot show it, so the reply file is judged
+   * on a later poll instead of skipping the json check.
+   */
+  private async replyKindOf(id: string): Promise<ReplyKind | undefined> {
+    const known = this.replyKinds.get(id);
+    if (known !== undefined) {
+      return known;
+    }
+    const request = await this.store.readRequest(id);
+    return request.kind === "ok" ? request.value.replyKind : undefined;
+  }
+
+  /**
+   * The accepted reply of a request. Only a version 1 reply of a kind this version knows is used.
+   * One that cannot be read is reported once.
+   */
+  private async acceptedReply(id: string): Promise<ReplyFile | undefined> {
+    const stored = await this.store.readReply(id, "reply.accepted.json");
+    if (stored?.parsed.kind === "unreadable") {
       this.markUnreadable(id);
     }
     return stored?.parsed.kind === "ok" ? stored.parsed.value : undefined;
@@ -640,8 +725,12 @@ export class ExchangeBroker {
     }
     this.endings.delete(id);
     this.answer(id, ending);
+    if (ending.logAfterWrite === true) {
+      this.emit(eventOf(ending.outcome));
+    }
     this.finished.add(id);
     this.deferred.delete(id);
+    this.replyKinds.delete(id);
   }
 
   /** Tells the log and the client how the request ended, once, and clears what it left. */
@@ -651,7 +740,9 @@ export class ExchangeBroker {
     }
     ending.answered = true;
     this.stopWatching(id);
-    this.emit({ type: ending.outcome.kind, id });
+    if (ending.logAfterWrite !== true) {
+      this.emit(eventOf(ending.outcome));
+    }
     const resolve = this.waiters.get(id);
     if (resolve !== undefined) {
       this.waiters.delete(id);
@@ -686,9 +777,9 @@ export class ExchangeBroker {
    * Step one of accepting: reply.accepted.json is linked to reply.json. When that fails, nothing
    * is decided yet, so the claim is given back before the failure goes on.
    */
-  private async linkAccepted(id: string): Promise<void> {
+  private async linkAccepted(id: string, bytes: Uint8Array): Promise<void> {
     try {
-      await this.store.acceptReply(id);
+      await this.store.acceptReply(id, bytes);
     } catch (error) {
       if (!(error instanceof AlreadyExistsError)) {
         this.release(id);
@@ -737,6 +828,27 @@ function replyEnding(id: string, reply: ReplyFile, now: string, removeReplyFile:
     removeReplyFile,
     answered: false,
   };
+}
+
+/**
+ * The ending for a reply file that is not valid: state.json says `invalid_reply`
+ * with the reason, and reply.json stays. The log line waits for the write.
+ */
+function invalidEnding(id: string, reason: string, now: string): Ending {
+  return {
+    outcome: { kind: "invalid_reply", id, reason },
+    state: createStateFile(id, "invalid_reply", now, now, reason),
+    removeReplyFile: false,
+    answered: false,
+    logAfterWrite: true,
+  };
+}
+
+/** What the broker tells the outside about an ending. */
+function eventOf(outcome: ExchangeOutcome): BrokerEvent {
+  return outcome.kind === "invalid_reply"
+    ? { type: "invalid_reply", id: outcome.id, reason: outcome.reason }
+    : { type: outcome.kind, id: outcome.id };
 }
 
 /** The wait limit in seconds that a `timed_out` end reason names, if it can be read. */

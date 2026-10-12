@@ -256,6 +256,8 @@ async function runAnswer(command: CommandLine, context: Context): Promise<number
     }),
     pollIntervalMs: POLL_INTERVAL_MS,
     storageDir,
+    // A terminal gets the typing screen. A pipe or a file gives the whole input as the reply.
+    inputMode: io.answerInput ?? (io.isTerminal ? "interactive" : "stdin"),
     checkServe: () =>
       checkServe({
         rootDir: storageDir,

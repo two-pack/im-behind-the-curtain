@@ -5,6 +5,47 @@
 
 export const FORMAT_VERSION = 1;
 
+/** The most bytes a reply file may have, as written. */
+export const MAX_FILE_BYTES = 10485760;
+
+/**
+ * The fixed reasons that a reply file is not valid (entity InvalidReplyReason). They are the same
+ * text in the serve line, in `endReason` of state.json and in the error sent to the client, and
+ * they never carry a character of the reply (NFR10).
+ */
+export const INVALID_REPLY_REASONS = {
+  tooLarge: "reply file is larger than 10 MB",
+  notJson: "reply file is not valid JSON",
+  missingField: "reply file is missing a required field",
+  unknownVersion: "reply file has an unknown format version",
+  unknownKind: "reply file has an unknown kind",
+  bodyMismatch: "reply file has a body that does not fit its kind",
+  bodyNotJson: (detail: string): string => `reply body is not valid JSON (${detail})`,
+} as const;
+
+const FIXED_REASONS: ReadonlySet<string> = new Set([
+  INVALID_REPLY_REASONS.tooLarge,
+  INVALID_REPLY_REASONS.notJson,
+  INVALID_REPLY_REASONS.missingField,
+  INVALID_REPLY_REASONS.unknownVersion,
+  INVALID_REPLY_REASONS.unknownKind,
+  INVALID_REPLY_REASONS.bodyMismatch,
+]);
+
+/** The three phrases for a text that is not valid JSON, which carry only numbers. */
+const BODY_DETAIL =
+  /^(?:unexpected end of input at line \d+|unexpected character at line \d+, column \d+|extra data after the JSON value at line \d+, column \d+)$/;
+const BODY_REASON = /^reply body is not valid JSON \((.*)\)$/;
+
+/** Whether `text` is one of the fixed reasons. The log writes no other text as a reason. */
+export function isInvalidReplyReason(text: string): boolean {
+  if (FIXED_REASONS.has(text)) {
+    return true;
+  }
+  const detail = BODY_REASON.exec(text)?.[1];
+  return detail !== undefined && BODY_DETAIL.test(detail);
+}
+
 export const ROLES = ["system", "developer", "user", "assistant"] as const;
 export type Role = (typeof ROLES)[number];
 
@@ -47,7 +88,8 @@ export type WrittenState =
   | "skipped"
   | "cancelled"
   | "timed_out"
-  | "abandoned";
+  | "abandoned"
+  | "invalid_reply";
 
 /** Every state this version knows by name: the written ones, and `invalid_reply`. */
 const KNOWN_STATES: readonly string[] = [

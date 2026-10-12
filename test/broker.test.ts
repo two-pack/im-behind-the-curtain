@@ -11,6 +11,7 @@ import {
   createReplyFile,
   createRequestFile,
   createStateFile,
+  MAX_FILE_BYTES,
   serializeFile,
 } from "../src/model.js";
 import { FakeClock, settle } from "./helpers/fake-clock.js";
@@ -191,14 +192,31 @@ describe("accepting a reply", () => {
     expect(store.entries.get(id)?.files.has("reply.json")).toBe(false);
   });
 
-  it("does not accept a reply of a kind it does not know", async () => {
+  it("ends a request whose reply is of a kind it does not know as invalid_reply", async () => {
     const { store, broker, events } = setup();
     const { id } = await submitWaiting(broker);
     store.putFile(id, "reply.json", serializeFile({ formatVersion: 1, kind: "sing", body: "la" }));
     await broker.pollOnce();
-    expect(stateOf(store, id)).toBe("waiting");
+    expect(stateOf(store, id)).toBe("invalid_reply");
     expect(store.count("acceptReply")).toBe(0);
-    expect(events).toEqual([]);
+    expect(events).toEqual([
+      { type: "invalid_reply", id, reason: "reply file has an unknown kind" },
+    ]);
+  });
+
+  it("does not judge a reply file while the kind of reply the request asks for cannot be known", async () => {
+    const { store, broker, events } = setup();
+    const id = "20260101T000000000Z-abcdef";
+    store.addRaw(id, {
+      request: "unsupported",
+      state: createStateFile(id, "waiting", NOW, null),
+    });
+    store.putFile(id, "reply.json", replyBytes("not json"));
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(store.entries.get(id)?.files.has("reply.accepted.json")).toBe(false);
+    expect(store.entries.get(id)?.files.has("reply.json")).toBe(true);
+    expect(events.filter((event) => event.type === "invalid_reply")).toEqual([]);
   });
 
   it("settles an old waiting request from a previous run without a connection", async () => {
@@ -710,22 +728,28 @@ describe("how a request ends", () => {
   it("does not use a reply.json it cannot read, leaves the claim free and tries again later", async () => {
     const { store, broker, events } = setup();
     const { id, outcomeOf } = await submitWaiting(broker);
-    store.putFile(id, "reply.json", "{broken");
+    store.putFile(id, "reply.json", replyBytes("fixed"));
+    store.fail("readReply", 2, "unreadable");
     await broker.pollOnce();
     await broker.pollOnce();
     expect(stateOf(store, id)).toBe("waiting");
     expect(store.count("acceptReply")).toBe(0);
-    expect(events).toEqual([]);
-    store.putFile(id, "reply.json", replyBytes("fixed"));
+    expect(events).toEqual([
+      { type: "error", id, reason: "unreadable" },
+      { type: "error", id, reason: "unreadable" },
+    ]);
     await broker.pollOnce();
     await settle();
     expect(outcomeOf()).toEqual({ kind: "replied", id, body: "fixed" });
+    expect(events.at(-2)).toEqual({ type: "replied", id });
+    expect(events.at(-1)).toEqual({ type: "recovered", id });
   });
 
-  it("lets a disconnect win when the only reply.json is unreadable", async () => {
+  it("lets a disconnect win when the only reply.json cannot be read", async () => {
     const { store, broker } = setup();
     const { id, outcomeOf } = await submitWaiting(broker);
-    store.putFile(id, "reply.json", "{broken");
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    store.fail("readReply", 1, "unreadable");
     await broker.pollOnce();
     await broker.cancel(id);
     expect(stateOf(store, id)).toBe("cancelled");
@@ -1199,6 +1223,387 @@ describe("only the first ending counts", () => {
     await Promise.all([first, second]);
     expect(store.count("acceptReply")).toBe(1);
     expect(store.count("writeState")).toBe(1);
+  });
+});
+
+describe("checking a reply file before it is accepted (BR27)", () => {
+  const jsonRequest: ConversationRequest = { ...request, replyKind: "json" };
+
+  async function submitJson(broker: ExchangeBroker) {
+    const submitted = await broker.submit(jsonRequest);
+    let outcome: ExchangeOutcome | undefined;
+    submitted.outcome.then((value) => {
+      outcome = value;
+    });
+    return { id: submitted.id, outcomeOf: () => outcome };
+  }
+
+  function hold(store: FakeStore, operation: string): () => void {
+    let release: () => void = () => {};
+    store.gate(
+      operation,
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    return () => {
+      store.gate(operation, undefined);
+      release();
+    };
+  }
+
+  async function reached(store: FakeStore, operation: string): Promise<void> {
+    for (let round = 0; round < 100 && store.count(operation) < 1; round += 1) {
+      await settle();
+    }
+    expect(store.count(operation)).toBeGreaterThanOrEqual(1);
+  }
+
+  it("accepts the bytes it verified, even when reply.json is rewritten afterwards", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("first"));
+    const release = hold(store, "acceptReply");
+    const polling = broker.pollOnce();
+    await reached(store, "acceptReply");
+    store.putFile(id, "reply.json", replyBytes("second"));
+    release();
+    await polling;
+    await settle();
+    expect(store.entries.get(id)?.files.get("reply.accepted.json")).toBe(replyBytes("first"));
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "first" });
+    expect(stateOf(store, id)).toBe("replied");
+  });
+
+  it("reads reply.json once and does not read it again to accept it", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    await broker.pollOnce();
+    expect(store.count("readReply")).toBe(1);
+    expect(stateOf(store, id)).toBe("replied");
+  });
+
+  it("accepts a reply that starts with a byte order mark and keeps the file as written", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", `﻿${replyBytes("Hi")}`);
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(store.entries.get(id)?.files.get("reply.accepted.json")).toBe(`﻿${replyBytes("Hi")}`);
+  });
+
+  it("hands the body over as written, with no change of line ends", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(
+      id,
+      "reply.json",
+      serializeFile({ formatVersion: 1, kind: "text", body: "a\r\nb\n\n" }),
+    );
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "a\r\nb\n\n" });
+  });
+
+  it("accepts a skip reply written by hand as skipped, for a json request too", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitJson(broker);
+    store.putFile(id, "reply.json", serializeFile({ formatVersion: 1, kind: "skip", body: "" }));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "skipped", id });
+    expect(stateOf(store, id)).toBe("skipped");
+  });
+
+  it("checks the body as json by the kind of the request, not by the kind of the reply", async () => {
+    const { store, broker } = setup();
+    const textRequest = await submitWaiting(broker);
+    store.putFile(
+      textRequest.id,
+      "reply.json",
+      serializeFile({ formatVersion: 1, kind: "json", body: "not json" }),
+    );
+    const jsonOne = await submitJson(broker);
+    store.putFile(
+      jsonOne.id,
+      "reply.json",
+      serializeFile({ formatVersion: 1, kind: "text", body: "not json" }),
+    );
+    await broker.pollOnce();
+    await settle();
+    expect(textRequest.outcomeOf()).toEqual({
+      kind: "replied",
+      id: textRequest.id,
+      body: "not json",
+    });
+    expect(jsonOne.outcomeOf()).toEqual({
+      kind: "invalid_reply",
+      id: jsonOne.id,
+      reason: "reply body is not valid JSON (unexpected character at line 1, column 2)",
+    });
+  });
+
+  it("uses the reply kind of a request that an earlier run saved (read from request.json)", async () => {
+    const { store, broker, events } = setup();
+    const id = "20260101T000000000Z-abcdef";
+    store.addRaw(id, {
+      request: createRequestFile(id, NOW, jsonRequest),
+      state: createStateFile(id, "waiting", NOW, null),
+    });
+    store.putFile(id, "reply.json", replyBytes("not json"));
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(events).toEqual([
+      {
+        type: "invalid_reply",
+        id,
+        reason: "reply body is not valid JSON (unexpected character at line 1, column 2)",
+      },
+    ]);
+  });
+
+  it("treats a reply.json that vanished after the listing as no reply", async () => {
+    const { store, broker, events } = setup();
+    const { id } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", replyBytes("Hi"));
+    const release = hold(store, "readReply");
+    const polling = broker.pollOnce();
+    await reached(store, "readReply");
+    store.entries.get(id)?.files.delete("reply.json");
+    release();
+    await polling;
+    expect(stateOf(store, id)).toBe("waiting");
+    expect(events).toEqual([]);
+  });
+});
+
+describe("ending a request with an invalid reply file (BR28)", () => {
+  function hold(store: FakeStore, operation: string): () => void {
+    let release: () => void = () => {};
+    store.gate(
+      operation,
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    return () => {
+      store.gate(operation, undefined);
+      release();
+    };
+  }
+
+  it("keeps reply.json, makes no reply.accepted.json, and writes the reason", async () => {
+    const { store, broker, clock } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", "{broken");
+    await broker.pollOnce();
+    await settle();
+    const entry = store.entries.get(id);
+    expect(entry?.files.get("reply.json")).toBe("{broken");
+    expect(entry?.files.has("reply.accepted.json")).toBe(false);
+    expect(store.count("acceptReply")).toBe(0);
+    expect(store.count("removeReply")).toBe(0);
+    const now = clock.now().toISOString();
+    expect(entry?.state).toEqual(
+      createStateFile(id, "invalid_reply", now, now, "reply file is not valid JSON"),
+    );
+    expect(outcomeOf()).toEqual({
+      kind: "invalid_reply",
+      id,
+      reason: "reply file is not valid JSON",
+    });
+  });
+
+  it("gives every reason of the reply file check to the state, the outcome and the event alike", async () => {
+    const cases: Array<[unknown, string]> = [
+      [{ formatVersion: 1, kind: "text" }, "reply file is missing a required field"],
+      [{ formatVersion: 3, kind: "text", body: "x" }, "reply file has an unknown format version"],
+      [{ formatVersion: 1, kind: "audio", body: "x" }, "reply file has an unknown kind"],
+      [
+        { formatVersion: 1, kind: "text", body: "" },
+        "reply file has a body that does not fit its kind",
+      ],
+    ];
+    for (const [content, reason] of cases) {
+      const { store, broker, events } = setup();
+      const { id, outcomeOf } = await submitWaiting(broker);
+      store.putFile(id, "reply.json", serializeFile(content));
+      await broker.pollOnce();
+      await settle();
+      expect(store.entries.get(id)?.state).toMatchObject({
+        state: "invalid_reply",
+        endReason: reason,
+      });
+      expect(outcomeOf()).toEqual({ kind: "invalid_reply", id, reason });
+      expect(events).toEqual([{ type: "invalid_reply", id, reason }]);
+    }
+  });
+
+  it("says too large for a file over the limit without reading its content", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putOversizeReply(id);
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "invalid_reply",
+      id,
+      reason: "reply file is larger than 10 MB",
+    });
+    expect(store.entries.get(id)?.files.has("reply.json")).toBe(true);
+  });
+
+  it("says not valid JSON for bytes that are not UTF-8", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putRawReply(id, Uint8Array.from([0x7b, 0xff, 0x7d]));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "invalid_reply",
+      id,
+      reason: "reply file is not valid JSON",
+    });
+  });
+
+  it("writes the line for a request that this serve holds no connection for", async () => {
+    const { store, broker, events } = setup();
+    const id = "20260101T000000000Z-abcdef";
+    store.addRaw(id, {
+      request: createRequestFile(id, NOW, request),
+      state: createStateFile(id, "waiting", NOW, null),
+    });
+    store.putFile(id, "reply.json", "{broken");
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(events).toEqual([{ type: "invalid_reply", id, reason: "reply file is not valid JSON" }]);
+  });
+
+  it("does not read reply.json of a request that has reply.accepted.json", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.accepted.json", replyBytes("first"));
+    store.putFile(id, "reply.json", "{broken");
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "first" });
+    expect(events).toEqual([{ type: "replied", id }]);
+    expect(store.entries.get(id)?.state).toMatchObject({ state: "replied" });
+  });
+
+  it("cannot take a reply after an invalid reply.json: the first arrival is the one", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", "{broken");
+    await broker.pollOnce();
+    expect(await broker.placeReply(id, "late")).toEqual({ kind: "too-late" });
+    expect(await broker.confirmReply(id, undefined)).toEqual({ kind: "ended" });
+  });
+
+  it("lets abandoned win for a request that waited before the start, and does not read its reply", async () => {
+    const { store, broker } = setup();
+    const id = "20260101T000000000Z-abcdef";
+    store.addRaw(id, {
+      request: createRequestFile(id, NOW, request),
+      state: createStateFile(id, "waiting", NOW, null),
+    });
+    store.putFile(id, "reply.json", "{broken");
+    await broker.abandon(await broker.snapshotWaiting());
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("abandoned");
+    expect(store.count("readReply")).toBe(0);
+  });
+
+  it("claims the request: a disconnect or the wait limit that comes during the write loses", async () => {
+    const { store, broker, clock, events } = setup(10);
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", "{broken");
+    const release = hold(store, "writeState");
+    const polling = broker.pollOnce();
+    for (let round = 0; round < 100 && store.count("writeState") < 1; round += 1) {
+      await settle();
+    }
+    await broker.cancel(id);
+    await clock.advance(10_000);
+    release();
+    await polling;
+    await settle();
+    expect(store.count("writeState")).toBe(1);
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(outcomeOf()).toMatchObject({ kind: "invalid_reply" });
+    expect(events).toEqual([{ type: "invalid_reply", id, reason: "reply file is not valid JSON" }]);
+  });
+
+  it("answers the client at once and retries only the state write when it fails", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", "{broken");
+    store.fail("writeState", 2);
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "invalid_reply",
+      id,
+      reason: "reply file is not valid JSON",
+    });
+    expect(stateOf(store, id)).toBe("waiting");
+    // The line comes only when state.json is written, and the failure is reported.
+    expect(events).toEqual([{ type: "error", id, reason: "write failed" }]);
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("waiting");
+    store.putFile(id, "reply.json", replyBytes("now valid"));
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(store.entries.get(id)?.state).toMatchObject({
+      endReason: "reply file is not valid JSON",
+    });
+    expect(store.count("readReply")).toBe(1);
+    expect(store.count("acceptReply")).toBe(0);
+    expect(events.filter((event) => event.type === "invalid_reply")).toEqual([
+      { type: "invalid_reply", id, reason: "reply file is not valid JSON" },
+    ]);
+    expect(events.at(-1)).toEqual({ type: "recovered", id });
+  });
+
+  it("keeps the ending when a disconnect comes between the failed write and the retry", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWaiting(broker);
+    store.putFile(id, "reply.json", "{broken");
+    store.fail("writeState", 1);
+    await broker.pollOnce();
+    await broker.cancel(id);
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(outcomeOf()).toMatchObject({ kind: "invalid_reply" });
+    expect(events.some((event) => event.type === "cancelled")).toBe(false);
+  });
+});
+
+describe("the size of the file an answer writes", () => {
+  const empty = serializeFile(createReplyFile("", NOW)).length;
+
+  it("lets a reply of exactly the limit through and refuses one byte more", () => {
+    const { broker } = setup();
+    expect(broker.replyFitsLimit("a".repeat(MAX_FILE_BYTES - empty), "text")).toBe(true);
+    expect(broker.replyFitsLimit("a".repeat(MAX_FILE_BYTES - empty + 1), "text")).toBe(false);
+  });
+
+  it("counts the bytes of the written file, not the characters of the body", () => {
+    const { broker } = setup();
+    const fits = Math.floor((MAX_FILE_BYTES - empty) / 2);
+    expect(broker.replyFitsLimit("é".repeat(fits), "text")).toBe(true);
+    expect(broker.replyFitsLimit("é".repeat(fits + 1), "text")).toBe(false);
+  });
+
+  it("counts the quotes and line ends that the written form escapes", () => {
+    const { broker } = setup();
+    expect(broker.replyFitsLimit('"'.repeat(6_000_000), "json")).toBe(false);
+    expect(broker.replyFitsLimit("\n".repeat(6_000_000), "text")).toBe(false);
+    expect(broker.replyFitsLimit("short", "text")).toBe(true);
   });
 });
 

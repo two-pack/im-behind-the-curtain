@@ -1,4 +1,9 @@
-import type { LineResult, ReadResult, ReplyReader } from "../../src/answer/answer-console.js";
+import type {
+  LineResult,
+  ReadResult,
+  ReplyReader,
+  StdinRead,
+} from "../../src/answer/answer-console.js";
 
 /** A reader that waits at a barrier, so two answers can type at the same moment. */
 export class BarrierReader implements ReplyReader {
@@ -19,6 +24,10 @@ export class BarrierReader implements ReplyReader {
 
   async readLine(): Promise<LineResult> {
     return { kind: "end" };
+  }
+
+  async readStdin(): Promise<StdinRead> {
+    return { kind: "interrupted" };
   }
 
   notify(): void {}

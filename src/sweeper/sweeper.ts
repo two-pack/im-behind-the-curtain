@@ -50,8 +50,7 @@ export class Sweeper {
 
   /**
    * One pass over the request folders. A pass that is already running is not joined by a second
-   * one: the call waits for it and returns. With retention 0 nothing is done
-   *.
+   * one: the call waits for it and returns. With retention 0 nothing is done.
    */
   sweepOnce(): Promise<void> {
     if (this.options.retentionSeconds === 0) {

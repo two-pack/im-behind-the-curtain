@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { chmod, mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { type CliOptions, main } from "../src/cli.js";
 import { type Clock, systemClock } from "../src/clock.js";
@@ -278,7 +278,12 @@ describe("the wait limit option", () => {
     const refused = await runWith(["answer", "--timeout", "5"]);
     expect(refused.exit).toBe(2);
     expect(refused.err).toEqual([USAGE_LINE]);
-    const t = makeIo({ platform: "linux", env: { IMBEHIND_TIMEOUT: "abc" }, homedir: "/h" });
+    const t = makeIo(
+      { platform: "linux", env: { IMBEHIND_TIMEOUT: "abc" }, homedir: "/h" },
+      undefined,
+      false,
+      "interactive",
+    );
     const storageDir = await makeTempDir();
     await placeRunningLock(storageDir);
     const exit = main(["answer"], t.io, { settings: { storageDir } });
@@ -383,7 +388,7 @@ describe("imbehind serve", () => {
 
 describe("imbehind answer", () => {
   it("shows the waiting line and exits 130 on Ctrl+C", async () => {
-    const t = makeIo();
+    const t = makeIo(undefined, undefined, false, "interactive");
     const storageDir = await makeTempDir();
     await placeRunningLock(storageDir);
     const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });
@@ -397,7 +402,7 @@ describe("imbehind answer", () => {
   it("does not make hard links or create anything of its own: it only reads", async () => {
     const storageDir = await makeTempDir();
     await placeRunningLock(storageDir);
-    const t = makeIo();
+    const t = makeIo(undefined, undefined, false, "interactive");
     const storeFs = { ...nodeFs, link: () => Promise.reject(errno("EPERM")) };
     const exit = main(["answer"], t.io, { settings: { port: 0, storageDir }, storeFs });
     await waitFor(() => t.out.text().includes("Waiting for requests..."));
@@ -449,12 +454,107 @@ describe("imbehind answer", () => {
     expect(await exit).toBe(130);
   });
 
+  describe("how it uses its input", () => {
+    const id = "20261009T140512123Z-a1b2c3";
+
+    async function withWaitingRequest() {
+      const storageDir = await makeTempDir();
+      const store = new ExchangeStore({ rootDir: storageDir });
+      await store.prepare();
+      await placeRunningLock(storageDir);
+      const now = "2026-10-09T14:05:12.123Z";
+      await store.createRequest(
+        createRequestFile(id, now, {
+          format: "chat.completions",
+          model: "whatever",
+          replyKind: "text",
+          requiredShape: null,
+          stream: false,
+          includeUsage: false,
+          conversation: [{ role: "user", content: "Hello" }],
+          originalRequest: { model: "whatever" },
+        }),
+        createStateFile(id, "waiting", now, null),
+      );
+      return { storageDir, store };
+    }
+
+    async function replyBody(store: ExchangeStore): Promise<string | undefined> {
+      await waitFor(async () => (await store.listFiles(id)).has("reply.json"));
+      const reply = await store.readReply(id, "reply.json");
+      return reply?.parsed.kind === "ok" ? reply.parsed.value.body : undefined;
+    }
+
+    it("reads the input as the reply when it is not a terminal, and shows nothing", async () => {
+      const { storageDir, store } = await withWaitingRequest();
+      const t = makeIo(undefined, Readable.from(["Hi from a pipe\n"]), false);
+      const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });
+      expect(await replyBody(store)).toBe("Hi from a pipe");
+      expect(t.out.text()).toBe("");
+      expect(t.err.text()).toBe("");
+      t.interrupt();
+      expect(await exit).toBe(130);
+    });
+
+    it("shows the screen and reads typed lines when it is a terminal", async () => {
+      const { storageDir, store } = await withWaitingRequest();
+      const stdin = new PassThrough();
+      const t = makeIo(undefined, stdin, true);
+      const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });
+      await waitFor(() => t.out.text().includes("Type your reply."));
+      stdin.write("typed\n");
+      stdin.write("\u0004");
+      expect(await replyBody(store)).toBe("typed");
+      t.interrupt();
+      expect(await exit).toBe(130);
+    });
+
+    it("lets answerInput stdin win over a terminal", async () => {
+      const { storageDir, store } = await withWaitingRequest();
+      const t = makeIo(undefined, Readable.from(["forced\n"]), true, "stdin");
+      const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });
+      expect(await replyBody(store)).toBe("forced");
+      expect(t.out.text()).toBe("");
+      t.interrupt();
+      expect(await exit).toBe(130);
+    });
+
+    it("lets answerInput interactive win over a pipe", async () => {
+      const { storageDir } = await withWaitingRequest();
+      const t = makeIo(undefined, new PassThrough(), false, "interactive");
+      const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });
+      await waitFor(() => t.out.text().includes("Type your reply."));
+      t.interrupt();
+      expect(await exit).toBe(130);
+      expect(t.out.text()).toContain("Quit. Request a1b2c3 is still waiting.");
+    });
+
+    it("does not read the input at all when no serve runs", async () => {
+      const storageDir = await makeTempDir();
+      let reads = 0;
+      const stdin = new Readable({
+        read() {
+          reads += 1;
+        },
+      });
+      const t = makeIo(undefined, stdin, false);
+      const exit = await main(["answer"], t.io, { settings: { storageDir } });
+      expect(exit).toBe(1);
+      expect(t.err.lines()).toEqual([
+        `Error: imbehind serve is not running for ${storageDir}.`,
+        "Start it with: imbehind serve",
+      ]);
+      expect(reads).toBe(0);
+      expect(stdin.listenerCount("data")).toBe(0);
+    });
+  });
+
   it("leaves unrelated files in the storage directory alone", async () => {
     const storageDir = await makeTempDir();
     await mkdir(path.join(storageDir, "requests", "not-an-id"), { recursive: true });
     await writeFile(path.join(storageDir, "requests", ".half.tmp"), "x");
     await placeRunningLock(storageDir);
-    const t = makeIo();
+    const t = makeIo(undefined, undefined, false, "interactive");
     const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });
     await waitFor(() => t.out.text().includes("Waiting for requests..."));
     t.interrupt();
@@ -573,7 +673,7 @@ describe("imbehind answer when serve is not running", () => {
         return nodeFs.readFile(file);
       },
     };
-    const t = makeIo();
+    const t = makeIo(undefined, undefined, false, "interactive");
     const exit = main(["answer"], t.io, { settings: { storageDir: dir }, storeFs });
     await waitFor(() => t.out.text().includes("Waiting for requests..."));
     await new Promise((resolve) => setTimeout(resolve, 800));
@@ -1071,7 +1171,7 @@ describe("unexpected failures (NFR10.7)", () => {
   });
 
   it("answer prints one fixed line and exits 1 for an exception it does not handle", async () => {
-    const t = makeIo();
+    const t = makeIo(undefined, undefined, false, "interactive");
     const storageDir = await makeTempDir();
     await placeRunningLock(storageDir);
     const exit = await main(["answer"], t.io, {
@@ -1144,7 +1244,7 @@ describe("a broken terminal and uncaught errors", () => {
   });
 
   it("answer ends with the fixed line and exit 1 when standard output breaks", async () => {
-    const t = makeIo();
+    const t = makeIo(undefined, undefined, false, "interactive");
     const storageDir = await makeTempDir();
     await placeRunningLock(storageDir);
     const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });
@@ -1158,7 +1258,7 @@ describe("a broken terminal and uncaught errors", () => {
   });
 
   it("writes the fixed line once when several streams break", async () => {
-    const t = makeIo();
+    const t = makeIo(undefined, undefined, false, "interactive");
     const storageDir = await makeTempDir();
     await placeRunningLock(storageDir);
     const exit = main(["answer"], t.io, { settings: { port: 0, storageDir } });

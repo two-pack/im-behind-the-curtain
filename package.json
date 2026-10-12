@@ -1,12 +1,11 @@
 {
   "name": "imbehind",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "An OpenAI Chat Completions compatible API server where a human writes the replies.",
   "license": "MIT",
   "type": "module",
-  "private": true,
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "bin": {
     "imbehind": "dist/bin.js"
@@ -14,6 +13,23 @@
   "files": [
     "dist"
   ],
+  "keywords": [
+    "openai",
+    "chat-completions",
+    "mock",
+    "test",
+    "llm",
+    "human-in-the-loop",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/two-pack/im-behind-the-curtain.git"
+  },
+  "bugs": {
+    "url": "https://github.com/two-pack/im-behind-the-curtain/issues"
+  },
+  "homepage": "https://github.com/two-pack/im-behind-the-curtain#readme",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
@@ -22,7 +38,9 @@
     "knip": "knip",
     "deps": "depcruise src --config .dependency-cruiser.cjs",
     "check": "npm run typecheck && npm run lint && npm test && npm run knip && npm run deps",
+    "prepublishOnly": "npm run build",
     "audit": "npm audit",
+    "round-trip": "node test/tools/round-trip.ts",
     "hooks:install": "git config core.hooksPath .githooks"
   },
   "devDependencies": {

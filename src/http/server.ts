@@ -7,6 +7,7 @@ import {
   buildStreamEvents,
   type ErrorCode,
   errorBody,
+  invalidReplyMessage,
   MESSAGES,
   parseChatCompletionsRequest,
   replyTimeoutMessage,
@@ -317,6 +318,8 @@ export class HttpServer {
       this.options.logger.failure(id, event.reason);
     } else if (event.type === "recovered") {
       this.options.logger.recovered(id);
+    } else if (event.type === "invalid_reply") {
+      this.options.logger.invalidReply(shortId(event.id), event.reason);
     } else if (id !== undefined) {
       this.logEnding(event.type, id);
     }
@@ -449,6 +452,9 @@ function respondTo(
 ): void {
   if (outcome.kind === "skipped") {
     respond(response, 503, errorBody("skipped_by_human", MESSAGES.skipped));
+  } else if (outcome.kind === "invalid_reply") {
+    // The stream has not started, so a stream request gets the normal error too.
+    respond(response, 502, errorBody("invalid_reply", invalidReplyMessage(outcome.reason)));
   } else if (outcome.kind === "timed_out") {
     respond(response, 504, errorBody("reply_timeout", replyTimeoutMessage(outcome.limitSeconds)));
   } else if (outcome.kind === "replied") {

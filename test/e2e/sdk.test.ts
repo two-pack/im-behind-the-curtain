@@ -2,7 +2,14 @@ import OpenAI from "openai";
 import { describe, expect, it } from "vitest";
 import { waitFor } from "../helpers/io.js";
 import { ScriptedReader } from "../helpers/scripted-reader.js";
-import { answerEverything, startAnswer, startServe, storedStates } from "../helpers/system.js";
+import {
+  answerEverything,
+  startAnswer,
+  startServe,
+  storedStates,
+  waitForRequestId,
+  writeReplyByHand,
+} from "../helpers/system.js";
 
 describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
   it("reads the response without an error and gets the typed text", async () => {
@@ -227,6 +234,40 @@ describe("many requests, skipping and waiting too long with the OpenAI SDK", () 
     ).rejects.toBeInstanceOf(OpenAI.APIConnectionTimeoutError);
     await waitFor(async () => (await storedStates(serve.storageDir))[0] === "cancelled");
     expect(serve.stdout()).toMatch(/cancelled {2}[0-9a-f]{6} {2}client disconnected\n/);
+  });
+});
+
+describe("a reply file written by hand, seen by the official OpenAI SDK", () => {
+  it("raises a typed server error for an invalid reply file and does not send the request again", async () => {
+    const serve = await startServe();
+    const client = new OpenAI({
+      apiKey: "any-key-is-accepted",
+      baseURL: `${serve.baseUrl}/v1`,
+      maxRetries: 0,
+      timeout: 20_000,
+    });
+    const pending = client.chat.completions.create({
+      model: "whatever",
+      messages: [{ role: "user", content: "Hello" }],
+    });
+    const failure = pending.then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    const id = await waitForRequestId(serve.storageDir);
+    await writeReplyByHand(serve.storageDir, id, '{"formatVersion":1,"kind":"text","body":');
+
+    const error = await failure;
+    expect(error).toBeInstanceOf(OpenAI.InternalServerError);
+    expect(error).toMatchObject({
+      status: 502,
+      code: "invalid_reply",
+      type: "server_error",
+    });
+    expect((error as Error).message).toContain(
+      "The reply file was invalid: reply file is not valid JSON.",
+    );
+    expect(await storedStates(serve.storageDir)).toEqual(["invalid_reply"]);
   });
 });
 

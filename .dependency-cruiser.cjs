@@ -5,7 +5,8 @@
  *                     platform
  *   http           -> chat-completions, broker, log
  *   answer-console -> broker, log, clock, platform, conversation-view
- *   broker         -> store, clock, reply-check
+ *   broker         -> store, clock, reply-check, reply-file-check
+ *   reply-file-check -> reply-check
  *   sweeper        -> broker, clock
  *   log            -> clock
  *   store          -> platform
@@ -105,8 +106,14 @@ module.exports = {
       "platform",
     ]),
     allow("answer/conversation-view", []),
-    allow("broker/exchange-broker", ["store/exchange-store", "clock", "broker/reply-check"]),
+    allow("broker/exchange-broker", [
+      "store/exchange-store",
+      "clock",
+      "broker/reply-check",
+      "broker/reply-file-check",
+    ]),
     allow("broker/reply-check", []),
+    allow("broker/reply-file-check", ["broker/reply-check"]),
     allow("store/exchange-store", ["platform"]),
     allow("store/serve-lock", ["platform"]),
     allow("sweeper/sweeper", ["broker/exchange-broker", "clock"]),

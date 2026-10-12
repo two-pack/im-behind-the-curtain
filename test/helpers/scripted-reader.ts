@@ -1,4 +1,9 @@
-import type { LineResult, ReadResult, ReplyReader } from "../../src/answer/answer-console.js";
+import type {
+  LineResult,
+  ReadResult,
+  ReplyReader,
+  StdinRead,
+} from "../../src/answer/answer-console.js";
 
 /**
  * One step of a script.
@@ -11,16 +16,33 @@ import type { LineResult, ReadResult, ReplyReader } from "../../src/answer/answe
  */
 export type Step = string | "EOF" | "INTERRUPT" | "WAIT" | (() => string);
 
+/**
+ * One step of the script for standard input.
+ * - a string: the whole input, as text
+ * - a result: what the reader gives back, such as `{ kind: "not-utf8" }`
+ * - "WAIT": the input never ends, until the screen stops the reading
+ * - a function: runs first (to change the world) and then gives one of the above
+ */
+export type StdinStep = string | StdinRead | "WAIT" | (() => string | StdinRead | "WAIT");
+
 /** A reply reader that follows a script instead of a terminal. */
 export class ScriptedReader implements ReplyReader {
   calls = 0;
+  /** The number of times the screen read the whole standard input. */
+  stdinCalls = 0;
   /** The questions the screen asked with `readLine`. */
   readonly asked: string[] = [];
   private readonly steps: Step[];
+  private readonly stdinSteps: StdinStep[];
   private readonly onNotify: (text: string) => void;
 
-  constructor(steps: Step[], onNotify: (text: string) => void = () => {}) {
+  constructor(
+    steps: Step[],
+    onNotify: (text: string) => void = () => {},
+    stdinSteps: StdinStep[] = [],
+  ) {
     this.steps = [...steps];
+    this.stdinSteps = [...stdinSteps];
     this.onNotify = onNotify;
   }
 
@@ -49,6 +71,17 @@ export class ScriptedReader implements ReplyReader {
     return step === "EOF" ? { kind: "end" } : { kind: "line", text: step };
   }
 
+  async readStdin(signal: AbortSignal): Promise<StdinRead> {
+    this.stdinCalls += 1;
+    const step = this.stdinSteps.shift();
+    const value = typeof step === "function" ? step() : step;
+    if (value === undefined || value === "WAIT") {
+      await untilAborted(signal);
+      return { kind: "interrupted" };
+    }
+    return typeof value === "string" ? { kind: "text", text: value } : value;
+  }
+
   /**
    * The next step, with a function step run. "WAIT", and the end of the script, behave like a
    * person who never answers: they last until the signal aborts, then give "WAIT".
@@ -59,13 +92,17 @@ export class ScriptedReader implements ReplyReader {
     if (value !== undefined && value !== "WAIT") {
       return value;
     }
-    await new Promise<void>((resolve) => {
-      if (signal.aborted) {
-        resolve();
-        return;
-      }
-      signal.addEventListener("abort", () => resolve(), { once: true });
-    });
+    await untilAborted(signal);
     return "WAIT";
   }
+}
+
+function untilAborted(signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }

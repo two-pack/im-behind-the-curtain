@@ -169,6 +169,34 @@ export async function postChatRaw(
   };
 }
 
+/** The id of the request at `index` in the storage directory, once it is there. */
+export async function waitForRequestId(storageDir: string, index = 0): Promise<string> {
+  const store = new ExchangeStore({ rootDir: storageDir });
+  let found: string | undefined;
+  await waitFor(async () => {
+    found = (await store.listIds())[index];
+    return found !== undefined;
+  });
+  return found as string;
+}
+
+/**
+ * Plays a tool that writes reply.json by hand, the way docs/storage-format.md tells: the content
+ * goes to a hidden file first and gets its final name only when it is whole.
+ */
+export async function writeReplyByHand(
+  storageDir: string,
+  id: string,
+  content: string,
+): Promise<void> {
+  await new ExchangeStore({ rootDir: storageDir }).placeReply(id, content);
+}
+
+/** The names of the files in a request folder, sorted. */
+export async function requestFiles(storageDir: string, id: string): Promise<string[]> {
+  return (await readdir(path.join(storageDir, "requests", id))).sort();
+}
+
 /** The states of the stored requests, in id order, read from the files. */
 export async function storedStates(storageDir: string): Promise<string[]> {
   const requests = path.join(storageDir, "requests");

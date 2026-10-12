@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { main } from "../../src/cli.js";
+import { MAX_FILE_BYTES } from "../../src/model.js";
 import { BarrierReader } from "../helpers/barrier-reader.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { makeTempDir } from "../helpers/fs.js";
@@ -12,9 +13,12 @@ import {
   answerEverything,
   freePort,
   postChat,
+  requestFiles,
   startAnswer,
   startServe,
   storedStates,
+  waitForRequestId,
+  writeReplyByHand,
 } from "../helpers/system.js";
 
 interface CurlResult {
@@ -720,10 +724,170 @@ describe("a restart and a second serve", () => {
   });
 });
 
+describe("a reply file written by hand", () => {
+  const URL_PATH = "/v1/chat/completions";
+  const JSON_REQUEST = {
+    model: "whatever",
+    messages: [{ role: "user", content: "Did it pass?" }],
+    response_format: { type: "json_object" },
+  };
+  const TEXT_REQUEST = { model: "whatever", messages: [{ role: "user", content: "Hello" }] };
+
+  interface Outcome {
+    status: number;
+    body: { choices?: { message: { content: string } }[]; error?: Record<string, string> };
+  }
+
+  /** Sends a request with curl, and gives the HTTP status and the JSON body. */
+  async function curlChat(baseUrl: string, request: unknown): Promise<Outcome> {
+    const result = await curl(
+      [
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "30",
+        "-X",
+        "POST",
+        `${baseUrl}${URL_PATH}`,
+        "-H",
+        "Content-Type: application/json",
+        "--data-binary",
+        "@-",
+        "--write-out",
+        "\n%{http_code}",
+      ],
+      JSON.stringify(request),
+    );
+    expect(result.code).toBe(0);
+    const split = result.stdout.lastIndexOf("\n");
+    return {
+      status: Number(result.stdout.slice(split + 1)),
+      body: JSON.parse(result.stdout.slice(0, split)) as Outcome["body"],
+    };
+  }
+
+  const reply = (kind: string, body: string, version = 1) =>
+    JSON.stringify({ formatVersion: version, kind, body });
+
+  it("hands a valid reply file to the client and marks the request replied", async () => {
+    const serve = await startServe();
+    const pending = curlChat(serve.baseUrl, TEXT_REQUEST);
+    const id = await waitForRequestId(serve.storageDir);
+    await writeReplyByHand(serve.storageDir, id, reply("text", "Hi by hand"));
+    const outcome = await pending;
+    expect(outcome.status).toBe(200);
+    expect(outcome.body.choices?.[0]?.message.content).toBe("Hi by hand");
+    expect(await storedStates(serve.storageDir)).toEqual(["replied"]);
+    await waitFor(async () =>
+      (await requestFiles(serve.storageDir, id)).includes("reply.accepted.json"),
+    );
+    expect(await requestFiles(serve.storageDir, id)).toEqual([
+      "reply.accepted.json",
+      "request.json",
+      "state.json",
+    ]);
+    expect(serve.stdout()).toMatch(/replied {4}[0-9a-f]{6}/);
+  });
+
+  const invalid: Array<[string, unknown, string, string]> = [
+    [
+      "JSON that is cut off",
+      TEXT_REQUEST,
+      '{"formatVersion":1,"kind":"text","body":"Hi"',
+      "reply file is not valid JSON",
+    ],
+    [
+      "a body that is not JSON for a request that asks for JSON",
+      JSON_REQUEST,
+      reply("text", "not json"),
+      "reply body is not valid JSON (unexpected character at line 1, column 2)",
+    ],
+    [
+      "a format version this version does not know",
+      TEXT_REQUEST,
+      reply("text", "Hi", 2),
+      "reply file has an unknown format version",
+    ],
+  ];
+
+  it.each(invalid)(
+    "answers 502 invalid_reply for %s, keeps reply.json, and writes the line",
+    async (_name, request, content, reason) => {
+      const serve = await startServe();
+      const pending = curlChat(serve.baseUrl, request);
+      const id = await waitForRequestId(serve.storageDir);
+      await writeReplyByHand(serve.storageDir, id, content);
+      const outcome = await pending;
+      expect(outcome.status).toBe(502);
+      expect(outcome.body).toEqual({
+        error: {
+          message: `The reply file was invalid: ${reason}.`,
+          type: "server_error",
+          code: "invalid_reply",
+        },
+      });
+      expect(await storedStates(serve.storageDir)).toEqual(["invalid_reply"]);
+      expect(await requestFiles(serve.storageDir, id)).toEqual([
+        "reply.json",
+        "request.json",
+        "state.json",
+      ]);
+      const state = JSON.parse(
+        await readFile(path.join(serve.storageDir, "requests", id, "state.json"), "utf8"),
+      ) as { endReason: string };
+      expect(state.endReason).toBe(reason);
+      expect(serve.stdout()).toContain(`invalid_reply  ${id.slice(-6)}  ${reason}\n`);
+    },
+  );
+
+  it("uses only the reply that came first when an answer and a tool both reply", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["from answer"]));
+    const outcome = await curlChat(serve.baseUrl, TEXT_REQUEST);
+    expect(outcome.body.choices?.[0]?.message.content).toBe("from answer");
+    await waitFor(() => answer.stdout().includes("Sent."));
+    const id = await waitForRequestId(serve.storageDir);
+    await writeReplyByHand(serve.storageDir, id, reply("text", "from a tool"));
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(await storedStates(serve.storageDir)).toEqual(["replied"]);
+    const accepted = JSON.parse(
+      await readFile(path.join(serve.storageDir, "requests", id, "reply.accepted.json"), "utf8"),
+    ) as { body: string; source: string };
+    expect(accepted).toMatchObject({ body: "from answer", source: "imbehind-answer" });
+  });
+
+  it("refuses a reply file over 10 MB and takes one of exactly 10 MB", async () => {
+    const serve = await startServe();
+    const head = '{"formatVersion":1,"kind":"text","body":"';
+    const tail = '"}';
+    const padded = (total: number): string =>
+      `${head}${"a".repeat(total - head.length - tail.length)}${tail}`;
+
+    const tooBig = curlChat(serve.baseUrl, TEXT_REQUEST);
+    const firstId = await waitForRequestId(serve.storageDir, 0);
+    await writeReplyByHand(serve.storageDir, firstId, padded(MAX_FILE_BYTES + 1));
+    const refused = await tooBig;
+    expect(refused.status).toBe(502);
+    expect(refused.body.error?.message).toBe(
+      "The reply file was invalid: reply file is larger than 10 MB.",
+    );
+
+    const fits = curlChat(serve.baseUrl, TEXT_REQUEST);
+    const secondId = await waitForRequestId(serve.storageDir, 1);
+    await writeReplyByHand(serve.storageDir, secondId, padded(MAX_FILE_BYTES));
+    const accepted = await fits;
+    expect(accepted.status).toBe(200);
+    expect(accepted.body.choices?.[0]?.message.content.length).toBe(
+      MAX_FILE_BYTES - head.length - tail.length,
+    );
+    expect(await storedStates(serve.storageDir)).toEqual(["invalid_reply", "replied"]);
+  });
+});
+
 describe("answer when no serve runs", () => {
   it("works while serve runs, and ends with exit 1 and a reason once serve has stopped", async () => {
     const serve = await startServe();
-    const running = makeIo();
+    const running = makeIo(undefined, undefined, false, "interactive");
     const answering = main(["answer"], running.io, { settings: { storageDir: serve.storageDir } });
     await waitFor(() => running.out.text().includes("Waiting for requests..."));
     running.interrupt();

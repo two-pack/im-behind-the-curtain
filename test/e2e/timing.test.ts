@@ -1,6 +1,11 @@
 import { performance } from "node:perf_hooks";
 import { describe, expect, it } from "vitest";
-import type { LineResult, ReadResult, ReplyReader } from "../../src/answer/answer-console.js";
+import type {
+  LineResult,
+  ReadResult,
+  ReplyReader,
+  StdinRead,
+} from "../../src/answer/answer-console.js";
 import { waitFor } from "../helpers/io.js";
 import { postChat, postChatRaw, startAnswer, startServe } from "../helpers/system.js";
 
@@ -21,6 +26,10 @@ class GatedReader implements ReplyReader {
 
   async readLine(): Promise<LineResult> {
     return { kind: "end" };
+  }
+
+  async readStdin(): Promise<StdinRead> {
+    return { kind: "interrupted" };
   }
 
   notify(): void {}

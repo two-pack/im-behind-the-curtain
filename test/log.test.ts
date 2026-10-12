@@ -181,6 +181,29 @@ describe("the lines for listening, invalid replies and abandoned requests", () =
     ]);
   });
 
+  it("writes the invalid_reply line with a fixed reason", () => {
+    const { out, logger } = setup();
+    logger.invalidReply("f1e2d3", "reply file is not valid JSON");
+    logger.invalidReply(
+      "f1e2d3",
+      "reply body is not valid JSON (unexpected character at line 1, column 2)",
+    );
+    expect(out).toEqual([
+      "14:05:12 invalid_reply  f1e2d3  reply file is not valid JSON\n",
+      "14:05:12 invalid_reply  f1e2d3  reply body is not valid JSON (unexpected character at line 1, column 2)\n",
+    ]);
+  });
+
+  it("never writes text that is not one of the fixed reasons as the reason of an invalid_reply line", () => {
+    const { out, logger } = setup();
+    logger.invalidReply("f1e2d3", "reply body is not valid JSON (secret-token)");
+    logger.invalidReply("not-an-id", "my own words");
+    expect(out).toEqual([
+      "14:05:12 invalid_reply  f1e2d3  reply file is invalid\n",
+      "14:05:12 invalid_reply  ------  reply file is invalid\n",
+    ]);
+  });
+
   it("writes the abandoned line in the usual form", () => {
     const { out, logger } = setup();
     logger.abandoned("c9d0e1");

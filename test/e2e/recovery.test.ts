@@ -152,12 +152,12 @@ describe("Ctrl+C while a reply is being read", () => {
     });
     const storeFs: StoreFs = {
       ...nodeFs,
-      readFile: async (file) => {
+      readBytes: async (file, maxBytes) => {
         if (file.endsWith(`${path.sep}reply.json`)) {
           reading?.();
           await gate;
         }
-        return nodeFs.readFile(file);
+        return nodeFs.readBytes(file, maxBytes);
       },
     };
     const held = new Promise<void>((resolve) => {

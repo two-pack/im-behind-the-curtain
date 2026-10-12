@@ -140,6 +140,12 @@ export interface InterruptTarget {
   off(event: "SIGINT", listener: () => void): unknown;
 }
 
+/**
+ * How `imbehind answer` uses its input. `interactive` shows the conversation and
+ * reads what a person types. `stdin` reads the whole input as one reply.
+ */
+export type AnswerInputMode = "interactive" | "stdin";
+
 /** The real terminal and operating system of this process, as the command layer sees them. */
 export interface ProcessIo {
   stdin: Readable;
@@ -147,6 +153,11 @@ export interface ProcessIo {
   stderr: Writable;
   /** True when standard input is a terminal. */
   isTerminal: boolean;
+  /**
+   * Only tests set this. It decides `AnswerInputMode` whatever `isTerminal` says, so a test can
+   * type lines into the answer screen without a terminal.
+   */
+  answerInput?: AnswerInputMode;
   info: PlatformInfo;
   onInterrupt(handler: () => void): () => void;
   /**

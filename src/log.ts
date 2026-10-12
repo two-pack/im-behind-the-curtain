@@ -10,7 +10,7 @@
  */
 import type { Clock } from "./clock.js";
 import { IO_REASONS, type IoReason } from "./errors.js";
-import type { ReplyKind } from "./model.js";
+import { isInvalidReplyReason, type ReplyKind } from "./model.js";
 
 /** Where text goes. `process.stdout` and `process.stderr` fit, and tests pass a recorder. */
 export interface Sink {
@@ -35,7 +35,11 @@ type EventWord =
   | "cancelled"
   | "timed_out"
   | "abandoned"
+  | "invalid_reply"
   | "error";
+
+/** Written in place of text that is not one of the fixed reasons of an invalid reply file. */
+const UNKNOWN_INVALID_REASON = "reply file is invalid";
 
 const NO_ID = "------";
 const SHORT_ID = /^[0-9a-f]{6}$/;
@@ -104,6 +108,18 @@ export class Logger {
   /** A request left waiting by an earlier run was ended at start. */
   abandoned(shortId: string): void {
     this.event("abandoned", shortId, "server restarted");
+  }
+
+  /**
+   * A reply file that was not valid ended the request. Only one of the fixed
+   * reasons is written, so a character of the reply cannot reach the screen (NFR10).
+   */
+  invalidReply(shortId: string, reason: string): void {
+    this.event(
+      "invalid_reply",
+      shortId,
+      isInvalidReplyReason(reason) ? reason : UNKNOWN_INVALID_REASON,
+    );
   }
 
   /** Writes a failure once for each pair of request and reason, until the request recovers. */

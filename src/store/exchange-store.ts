@@ -5,6 +5,7 @@ import { errorCode, IoFailure, type IoReason, StartupError } from "../errors.js"
 import { isRequestId } from "../ids.js";
 import {
   type Loaded,
+  MAX_FILE_BYTES,
   parseReplyFile,
   parseRequestFile,
   parseStateFile,
@@ -41,6 +42,37 @@ export interface StoreFs {
    * file, and it is not followed. Fails like `lstat` when `target` does not exist.
    */
   isRegularFile(target: string): Promise<boolean>;
+  /**
+   * The size and kind of `file`, without opening it. A symbolic link is followed. Fails like `stat`
+   * when `file` does not exist.
+   */
+  statFile(file: string): Promise<{ size: number; isFile: boolean }>;
+  /** Reads the start of `file`: the whole file, or its first `maxBytes` bytes if it is longer. */
+  readBytes(file: string, maxBytes: number): Promise<Uint8Array>;
+}
+
+/** The size of one read of `readBytes`. */
+const READ_CHUNK_BYTES = 65536;
+
+async function readUpTo(file: string, maxBytes: number): Promise<Uint8Array> {
+  const handle = await fsPromises.open(file, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total < maxBytes) {
+      const want = Math.min(READ_CHUNK_BYTES, maxBytes - total);
+      const chunk = Buffer.allocUnsafe(want);
+      const { bytesRead } = await handle.read(chunk, 0, want, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    await handle.close();
+  }
 }
 
 export const nodeFs: StoreFs = {
@@ -55,6 +87,11 @@ export const nodeFs: StoreFs = {
   rm: (target, options) => fsPromises.rm(target, options),
   isRealDirectory: async (target) => (await fsPromises.lstat(target)).isDirectory(),
   isRegularFile: async (target) => (await fsPromises.lstat(target)).isFile(),
+  statFile: async (file) => {
+    const info = await fsPromises.stat(file);
+    return { size: info.size, isFile: info.isFile() };
+  },
+  readBytes: readUpTo,
 };
 
 export interface StoreOptions {
@@ -76,6 +113,12 @@ export interface StoredReply {
   bytes: string;
   parsed: Loaded<ReplyFile>;
 }
+
+/**
+ * What a look at reply.json found: its bytes, or `too-large` when it is longer than
+ * the limit. A file that is too large is not read.
+ */
+export type ReplyFileRead = { kind: "bytes"; bytes: Uint8Array } | { kind: "too-large" };
 
 const MISSING = { kind: "missing" } as const;
 
@@ -120,9 +163,11 @@ function isMissingFile(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+/** Parses JSON text. One byte order mark at the start is allowed. */
 function parseJson(text: string): { ok: true; value: unknown } | { ok: false } {
   try {
-    return { ok: true, value: JSON.parse(text) as unknown };
+    const json = text.startsWith("﻿") ? text.slice(1) : text;
+    return { ok: true, value: JSON.parse(json) as unknown };
   } catch {
     return { ok: false };
   }
@@ -252,6 +297,10 @@ export class ExchangeStore {
    * there with a wider mode. reply.json itself is read and never linked, so its mode and content
    * stay as they are.
    *
+   * `bytes` are the bytes the check of the reply file judged, so reply.accepted.json holds exactly
+   * what was verified, whatever a tool writes to reply.json afterwards. They are
+   * valid UTF-8 by then, so turning them into text and writing the text gives the same bytes.
+   *
    * The content goes to a hidden file with a name of its own first
    * (`.reply.accepted.<pid>.<seq>.<hex>.tmp`), which is then linked as reply.accepted.json without
    * replacing a file that exists. Two accepts at the same time write two different files, so
@@ -259,15 +308,9 @@ export class ExchangeStore {
    * link worked. Fails with AlreadyExistsError when reply.accepted.json exists. Any other failure
    * changes nothing in the request, and the next poll tries again.
    */
-  async acceptReply(id: string): Promise<void> {
+  async acceptReply(id: string, bytes: Uint8Array): Promise<void> {
     const dir = this.requestDir(id);
-    const content = await this.readText(path.join(dir, "reply.json"));
-    if (content === undefined) {
-      throw new IoFailure(
-        "link failed",
-        Object.assign(new Error("no reply.json"), { code: "ENOENT" }),
-      );
-    }
+    const content = new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
     const hidden = path.join(dir, this.hiddenName("reply.accepted"));
     try {
       await this.guard("write failed", () => this.writeNew(hidden, content));
@@ -285,6 +328,34 @@ export class ExchangeStore {
       if (!isMissingFile(error)) {
         throw new IoFailure("failed", error);
       }
+    }
+  }
+
+  /**
+   * Looks at the reply.json of a request for the check of the reply file. The size is read first,
+   * without opening the file, and a file over the limit is not read. A file of the limit or less
+   * is read at most one byte past the limit, so one that grew meanwhile is still bounded. Nothing
+   * when the file is not there (also when it vanishes meanwhile). A file that cannot be examined
+   * or read (no permission, not a regular file, an input/output failure) is an IoFailure with the
+   * reason `unreadable`, which is not a fault of the reply.
+   */
+  async readReplyFile(id: string): Promise<ReplyFileRead | undefined> {
+    const file = path.join(this.requestDir(id), "reply.json");
+    try {
+      const info = await this.fs.statFile(file);
+      if (!info.isFile) {
+        throw Object.assign(new Error("not a regular file"), { code: "EISDIR" });
+      }
+      if (info.size > MAX_FILE_BYTES) {
+        return { kind: "too-large" };
+      }
+      const bytes = await this.fs.readBytes(file, MAX_FILE_BYTES + 1);
+      return bytes.length > MAX_FILE_BYTES ? { kind: "too-large" } : { kind: "bytes", bytes };
+    } catch (error) {
+      if (isMissingFile(error)) {
+        return undefined;
+      }
+      throw error instanceof IoFailure ? error : new IoFailure("unreadable", error);
     }
   }
 
@@ -489,6 +560,7 @@ export type ExchangeStorage = Pick<
   | "acceptReply"
   | "removeReply"
   | "readReply"
+  | "readReplyFile"
   | "removeRequest"
   | "requestFilePath"
 >;

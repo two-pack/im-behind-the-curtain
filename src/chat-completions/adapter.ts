@@ -19,7 +19,8 @@ export type ErrorCode =
   | "method_not_allowed"
   | "storage_error"
   | "skipped_by_human"
-  | "reply_timeout";
+  | "reply_timeout"
+  | "invalid_reply";
 
 /** The fixed English sentences of this API. A request value is never copied into them. */
 export const MESSAGES = {
@@ -435,11 +436,20 @@ export function replyTimeoutMessage(limitSeconds: number): string {
   return `No reply within ${limitSeconds} seconds. Increase the server timeout or reply sooner.`;
 }
 
+/**
+ * The message of the 502 answer for a reply file that is not valid. The reason is
+ * one of the fixed phrases of the check, so no character of the reply file reaches the client.
+ */
+export function invalidReplyMessage(reason: string): string {
+  return `The reply file was invalid: ${reason}.`;
+}
+
 /** The codes of the answers with status 500 and above. All others are the client's mistakes. */
 const SERVER_ERROR_CODES: readonly ErrorCode[] = [
   "storage_error",
   "skipped_by_human",
   "reply_timeout",
+  "invalid_reply",
 ];
 
 export function errorBody(code: ErrorCode, message: string): ErrorBody {

@@ -20,9 +20,32 @@ const JAPANESE = new RegExp(
   "u",
 );
 
-/** Folders that are checked, and the top-level files that are not checked. */
+/**
+ * Folders that are checked, and the top-level files that are checked. The list names the files
+ * that are part of the published repository, so a file that is not listed (README.ja.md, the
+ * Japanese README, among them) is not checked.
+ */
 const CHECKED_DIRS = ["src", "test", "docs", ".github"];
-const UNCHECKED_ROOT_FILES = new Set(["README.ja.md"]);
+const CHECKED_ROOT_FILES = new Set([
+  "README.md",
+  "LICENSE",
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "tsconfig.build.json",
+  "vitest.config.ts",
+  "biome.json",
+  "knip.json",
+  ".dependency-cruiser.cjs",
+  ".gitignore",
+  ".gitattributes",
+  ".npmrc",
+]);
+
+/** The names from a list of top-level entries that are checked, in the order they were given. */
+function selectCheckedRootFiles(names: string[]): string[] {
+  return names.filter((name) => CHECKED_ROOT_FILES.has(name));
+}
 
 async function filesUnder(dir: string): Promise<string[]> {
   let entries: Dirent[];
@@ -46,9 +69,8 @@ async function filesUnder(dir: string): Promise<string[]> {
 /** The top-level files of the repository, such as package.json, README.md and LICENSE. */
 async function rootFiles(): Promise<string[]> {
   const entries = await readdir(".", { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isFile() && !UNCHECKED_ROOT_FILES.has(entry.name))
-    .map((entry) => path.resolve(entry.name));
+  const present = entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+  return selectCheckedRootFiles(present).map((name) => path.resolve(name));
 }
 
 async function linesWithJapanese(file: string): Promise<string[]> {
@@ -72,6 +94,18 @@ describe("repository text is English (NFR15.1)", () => {
     expect(JAPANESE.test(katakana)).toBe(true);
     expect(JAPANESE.test(halfWidth)).toBe(true);
     expect(JAPANESE.test(`Plain English text, with punctuation: ${accented} ok.`)).toBe(false);
+  });
+
+  it("checks only the top-level files that are named in the list of checked files", () => {
+    const entries = [
+      "README.md",
+      "README.ja.md",
+      "package.json",
+      "notes.txt",
+      ".hidden",
+      "LICENSE",
+    ];
+    expect(selectCheckedRootFiles(entries)).toEqual(["README.md", "package.json", "LICENSE"]);
   });
 
   it("checks the source, tests, docs, workflows and top-level files", async () => {

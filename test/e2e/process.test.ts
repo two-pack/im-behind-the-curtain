@@ -1,5 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { createRequestFile, createStateFile } from "../../src/model.js";
@@ -7,9 +6,15 @@ import { ExchangeStore } from "../../src/store/exchange-store.js";
 import { makeTempDir } from "../helpers/fs.js";
 import { waitFor } from "../helpers/io.js";
 import { placeRunningLock } from "../helpers/lock.js";
-import { freePort } from "../helpers/system.js";
+import { type Running, runNode } from "../helpers/program.js";
+import { freePort, startServe, storedStates, waitForRequestId } from "../helpers/system.js";
 
 const BIN = path.resolve("dist", "bin.js");
+
+/** How long the answer program gets to choose its request before the client goes away. */
+const SETTLE_MS = 5000;
+/** How long the answer program gets to end after the client went away. */
+const EXIT_LIMIT_MS = 10000;
 
 /** Environment that puts the storage directory under a temporary folder on every OS. */
 function envFor(home: string): NodeJS.ProcessEnv {
@@ -33,25 +38,8 @@ function storageFor(home: string): string {
   return path.join(home, "xdg", "imbehind");
 }
 
-interface Running {
-  child: ChildProcess;
-  stdout: () => string;
-  stderr: () => string;
-  exit: Promise<number | null>;
-}
-
 function run(args: string[], env: NodeJS.ProcessEnv): Running {
-  const child = spawn(process.execPath, [BIN, ...args], { env, stdio: ["pipe", "pipe", "pipe"] });
-  let stdout = "";
-  let stderr = "";
-  child.stdout?.on("data", (chunk: Buffer) => {
-    stdout += chunk.toString("utf8");
-  });
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString("utf8");
-  });
-  const exit = new Promise<number | null>((resolve) => child.on("close", (code) => resolve(code)));
-  return { child, stdout: () => stdout, stderr: () => stderr, exit };
+  return runNode(BIN, args, env);
 }
 
 async function addWaitingRequest(storageDir: string): Promise<string> {
@@ -146,7 +134,7 @@ describe("the real program (dist/bin.js)", () => {
   // and no SIGINT handler runs, so this test cannot observe exit code 130 or the clean
   // shutdown. The Windows exit behavior is checked in a different way in the CI stage.
   it.skipIf(process.platform === "win32")(
-    "reads a reply from standard input, puts it next to the request, and exits 130 on Ctrl+C",
+    "reads a reply from standard input, puts it next to the request, shows nothing, and exits 130 on Ctrl+C",
     async () => {
       const home = await makeTempDir();
       const storageDir = storageFor(home);
@@ -155,8 +143,7 @@ describe("the real program (dist/bin.js)", () => {
       program.child.stdin?.end("Hi from stdin\r\n");
 
       const replyFile = path.join(storageDir, "requests", id, "reply.json");
-      await waitFor(() => program.stdout().includes("Hello from the process test"), 10_000);
-      await waitFor(async () => (await readFile(replyFile, "utf8").catch(() => "")) !== "");
+      await waitFor(async () => (await readFile(replyFile, "utf8").catch(() => "")) !== "", 10_000);
       expect(JSON.parse(await readFile(replyFile, "utf8"))).toMatchObject({
         formatVersion: 1,
         kind: "text",
@@ -165,19 +152,128 @@ describe("the real program (dist/bin.js)", () => {
       });
       program.child.kill("SIGINT");
       expect(await program.exit).toBe(130);
+      expect(program.stdout()).toBe("");
+      expect(program.stderr()).toBe("");
     },
   );
 
-  it("stops with Error: input ended. when standard input is closed at the skip question", async () => {
-    const home = await makeTempDir();
-    await addWaitingRequest(storageFor(home));
-    const program = run(["answer"], envFor(home));
-    program.child.stdin?.end();
-    expect(await program.exit).toBe(1);
-    expect(program.stderr()).toBe(
-      "Error: input ended. Nothing was sent; the request is still waiting.\n",
-    );
-    expect(program.stdout()).toContain("Request 1 of 1");
+  describe("imbehind answer with standard input that is not a terminal", () => {
+    const answerEnv = (storageDir: string): NodeJS.ProcessEnv => ({
+      ...process.env,
+      IMBEHIND_DIR: storageDir,
+    });
+
+    interface ChatReply {
+      choices: { message: { content: string } }[];
+    }
+
+    function chatInit(signal?: AbortSignal): RequestInit {
+      return {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "Hello" }] }),
+        signal,
+      };
+    }
+
+    it("replies to the only waiting request, prints one line and exits 0", async () => {
+      const serve = await startServe();
+      const program = run(["answer"], answerEnv(serve.storageDir));
+      program.child.stdin?.end("Hi\n");
+      const client = fetch(`${serve.baseUrl}/v1/chat/completions`, chatInit());
+      expect(await program.exit).toBe(0);
+      const id = await waitForRequestId(serve.storageDir);
+      expect(program.stdout()).toBe(`Sent reply to request ${id.slice(-6)}.\n`);
+      expect(program.stderr()).toBe("");
+      const body = (await (await client).json()) as ChatReply;
+      expect(body.choices[0]?.message.content).toBe("Hi");
+    });
+
+    it("replies to the first of two waiting requests only", async () => {
+      const serve = await startServe();
+      const first = fetch(`${serve.baseUrl}/v1/chat/completions`, chatInit());
+      const firstId = await waitForRequestId(serve.storageDir, 0);
+      const controller = new AbortController();
+      const second = fetch(
+        `${serve.baseUrl}/v1/chat/completions`,
+        chatInit(controller.signal),
+      ).catch(() => undefined);
+      await waitForRequestId(serve.storageDir, 1);
+
+      const program = run(["answer"], answerEnv(serve.storageDir));
+      program.child.stdin?.end("Hi\n");
+      expect(await program.exit).toBe(0);
+      expect(program.stdout()).toBe(`Sent reply to request ${firstId.slice(-6)}.\n`);
+      expect(await storedStates(serve.storageDir)).toEqual(["replied", "waiting"]);
+      expect(((await (await first).json()) as ChatReply).choices[0]?.message.content).toBe("Hi");
+      controller.abort();
+      await second;
+    });
+
+    it("ends with exit 1 for an empty input and leaves the request waiting", async () => {
+      const home = await makeTempDir();
+      const storageDir = storageFor(home);
+      const id = await addWaitingRequest(storageDir);
+      const program = run(["answer"], envFor(home));
+      program.child.stdin?.end();
+      expect(await program.exit).toBe(1);
+      expect(program.stderr()).toBe(
+        "Error: the reply is empty. Nothing was sent; the request is still waiting.\n",
+      );
+      expect(program.stdout()).toBe("");
+      const files = await readdir(path.join(storageDir, "requests", id));
+      expect(files.sort()).toEqual(["request.json", "state.json"]);
+    });
+
+    it("ends with exit 1 for an input over 10 MB and leaves the request waiting", async () => {
+      const home = await makeTempDir();
+      const storageDir = storageFor(home);
+      const id = await addWaitingRequest(storageDir);
+      const program = run(["answer"], envFor(home));
+      program.child.stdin?.on("error", () => {});
+      program.child.stdin?.end(Buffer.alloc(11 * 1024 * 1024, 0x61));
+      expect(await program.exit).toBe(1);
+      expect(program.stderr()).toBe(
+        "Error: the reply is larger than 10 MB. Nothing was sent; the request is still waiting.\n",
+      );
+      expect(program.stdout()).toBe("");
+      expect((await readdir(path.join(storageDir, "requests", id))).sort()).toEqual([
+        "request.json",
+        "state.json",
+      ]);
+    });
+
+    it("ends with exit 1 and names the request when the client goes away while the input still comes", async () => {
+      const serve = await startServe();
+      const controller = new AbortController();
+      const client = fetch(
+        `${serve.baseUrl}/v1/chat/completions`,
+        chatInit(controller.signal),
+      ).catch(() => undefined);
+      const id = await waitForRequestId(serve.storageDir);
+      const program = run(["answer"], answerEnv(serve.storageDir));
+      program.child.stdin?.on("error", () => {});
+      program.child.stdin?.write("a reply that is still being written");
+      // The program chooses the request at once and then reads, and it prints nothing before that,
+      // so there is nothing to wait for. Give it a generous time to get there, and never wait for
+      // its exit without a limit: a program that has not chosen yet would otherwise wait forever.
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_MS));
+      controller.abort();
+      await client;
+      const code = await Promise.race([
+        program.exit,
+        new Promise<"stuck">((resolve) => setTimeout(() => resolve("stuck"), EXIT_LIMIT_MS)),
+      ]);
+      if (code === "stuck") {
+        program.child.kill();
+      }
+      expect(code).toBe(1);
+      expect(program.stderr()).toBe(
+        `Error: request ${id.slice(-6)} was cancelled (the client disconnected). Nothing was sent.\n`,
+      );
+      expect(program.stdout()).toBe("");
+      expect(await storedStates(serve.storageDir)).toEqual(["cancelled"]);
+    });
   });
 
   // Skipped on Windows on purpose. A closed pipe does not give the child process an EPIPE error

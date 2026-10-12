@@ -6,7 +6,12 @@ import { ExchangeBroker } from "../src/broker/exchange-broker.js";
 import { StartupError } from "../src/errors.js";
 import { HttpServer, type HttpServerOptions } from "../src/http/server.js";
 import { Logger, type LoggerOptions } from "../src/log.js";
-import { createReplyFile, serializeFile } from "../src/model.js";
+import {
+  createReplyFile,
+  createRequestFile,
+  createStateFile,
+  serializeFile,
+} from "../src/model.js";
 import { FakeClock } from "./helpers/fake-clock.js";
 import { FakeStore } from "./helpers/fake-store.js";
 
@@ -674,6 +679,95 @@ describe("a request the human skipped", () => {
   });
 });
 
+describe("a request whose reply file is not valid", () => {
+  const REASON = "reply file is not valid JSON";
+
+  it("answers 502 invalid_reply with the reason and writes the invalid_reply line", async () => {
+    const context = await startServer();
+    const held = await holdOneRequest(context, "Hello");
+    context.store.putFile(held.id, "reply.json", "{broken secret-token");
+    await context.broker.pollOnce();
+    const reply = await held.pending;
+    expect(reply.status).toBe(502);
+    expect(reply.headers["content-type"]).toContain("application/json");
+    expect(reply.json()).toEqual({
+      error: {
+        message: `The reply file was invalid: ${REASON}.`,
+        type: "server_error",
+        code: "invalid_reply",
+      },
+    });
+    expect(reply.text).not.toContain("secret-token");
+    const short = held.id.slice(-6);
+    expect(context.out[1]).toMatch(
+      new RegExp(`^\\d\\d:\\d\\d:\\d\\d invalid_reply {2}${short} {2}${REASON}\\n$`),
+    );
+    expect(context.out.join("")).not.toContain("secret-token");
+    expect(stateName(context, held.id)).toBe("invalid_reply");
+  });
+
+  it("answers the same error, not a stream, when stream is true", async () => {
+    const context = await startServer();
+    const pending = send(context.port, { body: chat("Hello", { stream: true }) });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    context.store.putFile(
+      id,
+      "reply.json",
+      serializeFile({ formatVersion: 2, kind: "text", body: "x" }),
+    );
+    await context.broker.pollOnce();
+    const reply = await pending;
+    expect(reply.status).toBe(502);
+    expect(reply.headers["content-type"]).toContain("application/json");
+    expect(reply.text).not.toContain("data:");
+    expect(reply.json().error).toMatchObject({
+      type: "server_error",
+      code: "invalid_reply",
+      message: "The reply file was invalid: reply file has an unknown format version.",
+    });
+  });
+
+  it("writes the line for a request it holds no connection for", async () => {
+    const context = await startServer();
+    const id = "20260101T000000000Z-abcdef";
+    context.store.addRaw(id, {
+      request: createRequestFile(id, "2026-10-09T14:05:12.000Z", {
+        format: "chat.completions",
+        model: "m",
+        replyKind: "text",
+        requiredShape: null,
+        stream: false,
+        includeUsage: false,
+        conversation: [{ role: "user", content: "old" }],
+        originalRequest: { model: "m" },
+      }),
+      state: createStateFile(id, "waiting", "2026-10-09T14:05:12.000Z", null),
+    });
+    context.store.putFile(id, "reply.json", "[]");
+    await context.broker.pollOnce();
+    expect(context.out).toHaveLength(1);
+    expect(context.out[0]).toMatch(
+      /^\d\d:\d\d:\d\d invalid_reply {2}abcdef {2}reply file is missing a required field\n$/,
+    );
+  });
+
+  it("writes the line once, when state.json is written, and answers the client first", async () => {
+    const context = await startServer();
+    const held = await holdOneRequest(context, "Hello");
+    context.store.putFile(held.id, "reply.json", "{broken");
+    context.store.fail("writeState", 1);
+    await context.broker.pollOnce();
+    expect((await held.pending).status).toBe(502);
+    expect(context.out.filter((line) => line.includes("invalid_reply"))).toEqual([]);
+    expect(context.out.filter((line) => line.includes(" error "))).toHaveLength(1);
+    await context.broker.pollOnce();
+    await context.broker.pollOnce();
+    expect(context.out.filter((line) => line.includes("invalid_reply"))).toHaveLength(1);
+    expect(stateName(context, held.id)).toBe("invalid_reply");
+  });
+});
+
 describe("a request that waited too long", () => {
   it("answers 504 reply_timeout once the wait limit has passed, and writes the timed_out line", async () => {
     const context = await startServer(0, undefined, 1);
@@ -887,12 +981,15 @@ describe("streaming", () => {
   });
 
   it("streams a structured-output request in the same form", async () => {
-    const { reply, context, id } = await streamed({
-      response_format: {
-        type: "json_schema",
-        json_schema: { name: "x", schema: { type: "object" } },
+    const { reply, context, id } = await streamed(
+      {
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: "x", schema: { type: "object" } },
+        },
       },
-    });
+      '{"a": 1}',
+    );
     expect(reply.headers["content-type"]).toContain("text/event-stream");
     expect(eventsOf(reply.text)).toHaveLength(4);
     const stored = context.store.entries.get(id)?.request;

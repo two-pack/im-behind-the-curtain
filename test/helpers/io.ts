@@ -1,5 +1,5 @@
 import { Readable, Writable } from "node:stream";
-import type { PlatformInfo, ProcessIo } from "../../src/platform.js";
+import type { AnswerInputMode, PlatformInfo, ProcessIo } from "../../src/platform.js";
 
 const LINUX: PlatformInfo = { platform: "linux", env: {}, homedir: "/home/alice" };
 
@@ -25,11 +25,16 @@ function recorder(): Recorder {
   };
 }
 
-/** A process environment with recorded output and a Ctrl+C that the test presses. */
+/**
+ * A process environment with recorded output and a Ctrl+C that the test presses. `answerInput`
+ * picks how `imbehind answer` uses the input, whatever `isTerminal` says. The tests
+ * that type lines into the answer screen choose `interactive`.
+ */
 export function makeIo(
   info: PlatformInfo = LINUX,
   stdin: Readable = Readable.from([]),
   isTerminal = false,
+  answerInput?: AnswerInputMode,
 ) {
   const out = recorder();
   const err = recorder();
@@ -40,6 +45,7 @@ export function makeIo(
     stdout: out.stream,
     stderr: err.stream,
     isTerminal,
+    ...(answerInput === undefined ? {} : { answerInput }),
     info,
     onInterrupt: (handler) => {
       handlers.add(handler);

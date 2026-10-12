@@ -14,12 +14,14 @@ import {
   createReplyFile,
   createRequestFile,
   createStateFile,
+  MAX_FILE_BYTES,
   type Message,
   serializeFile,
 } from "../src/model.js";
+import type { AnswerInputMode } from "../src/platform.js";
 import { FakeClock, settle } from "./helpers/fake-clock.js";
 import { FakeStore } from "./helpers/fake-store.js";
-import { ScriptedReader, type Step } from "./helpers/scripted-reader.js";
+import { ScriptedReader, type StdinStep, type Step } from "./helpers/scripted-reader.js";
 
 const ID = "20261009T140512123Z-a1b2c3";
 const ID2 = "20261009T140513000Z-d4e5f6";
@@ -55,10 +57,17 @@ function separator(n: number, total: number, shortId: string): string {
 
 const STORAGE_DIR = "/home/alice/.local/share/imbehind";
 
+interface SetupOptions {
+  /** Left out, the screen is built without a mode, which must mean `interactive`. */
+  inputMode?: AnswerInputMode;
+  stdin?: StdinStep[];
+}
+
 function setup(
   steps: Step[],
   store = new FakeStore(),
   serveStatus: ServeStatus = { kind: "running" },
+  options: SetupOptions = {},
 ) {
   const clock = new FakeClock();
   const out: string[] = [];
@@ -70,7 +79,7 @@ function setup(
   const makeBroker = () => new ExchangeBroker({ store, clock, pollIntervalMs: 500 });
   const broker = makeBroker();
   const serveBroker = makeBroker();
-  const reader = new ScriptedReader(steps, (text) => out.push(`${text}\n`));
+  const reader = new ScriptedReader(steps, (text) => out.push(`${text}\n`), options.stdin);
   const answer = new AnswerConsole({
     broker,
     screen: new Screen(stdout),
@@ -84,6 +93,7 @@ function setup(
       serveChecks += 1;
       return serveStatus;
     },
+    ...(options.inputMode === undefined ? {} : { inputMode: options.inputMode }),
   });
   const controller = new AbortController();
   return {
@@ -1518,5 +1528,539 @@ describe("asking one question and showing a line while typing", () => {
     reader.notify("Hello.");
     await settle();
     expect(t.text()).toBe("Hello.\n");
+  });
+});
+
+describe("reading the whole standard input", () => {
+  const LIMIT = MAX_FILE_BYTES;
+
+  function stdinReader(input: Readable) {
+    return createReplyReader(input, new PassThrough(), false);
+  }
+
+  const never = () => new AbortController().signal;
+
+  it("joins the chunks and gives the text", async () => {
+    const result = await stdinReader(
+      Readable.from([Buffer.from("one\r\n"), Buffer.from("two")]),
+    ).readStdin(never());
+    expect(result).toEqual({ kind: "text", text: "one\r\ntwo" });
+  });
+
+  it("decodes a character that is cut between two chunks", async () => {
+    const bytes = Buffer.from("café \u{1f600}!", "utf8");
+    const chunks = [bytes.subarray(0, 4), bytes.subarray(4, 7), bytes.subarray(7)];
+    const result = await stdinReader(Readable.from(chunks)).readStdin(never());
+    expect(result).toEqual({ kind: "text", text: "café \u{1f600}!" });
+  });
+
+  it("removes one byte order mark at the start and no other", async () => {
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+    const once = await stdinReader(
+      Readable.from([Buffer.concat([bom, Buffer.from("Hi")])]),
+    ).readStdin(never());
+    expect(once).toEqual({ kind: "text", text: "Hi" });
+    const twice = await stdinReader(
+      Readable.from([Buffer.concat([bom, bom, Buffer.from("Hi")])]),
+    ).readStdin(never());
+    expect(twice).toEqual({ kind: "text", text: "﻿Hi" });
+  });
+
+  it("refuses bytes that are not UTF-8 and does not replace them", async () => {
+    const result = await stdinReader(Readable.from([Buffer.from([0x48, 0xff, 0x69])])).readStdin(
+      never(),
+    );
+    expect(result).toEqual({ kind: "not-utf8" });
+  });
+
+  it("refuses UTF-16 text as not UTF-8", async () => {
+    const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("Hi", "utf16le")]);
+    expect(await stdinReader(Readable.from([utf16])).readStdin(never())).toEqual({
+      kind: "not-utf8",
+    });
+  });
+
+  it("gives an empty text for an input with nothing in it, also when it has ended already", async () => {
+    expect(await stdinReader(Readable.from([])).readStdin(never())).toEqual({
+      kind: "text",
+      text: "",
+    });
+    const ended = Readable.from([]);
+    await stdinReader(ended).readStdin(never());
+    expect(ended.readableEnded).toBe(true);
+    expect(await stdinReader(ended).readStdin(never())).toEqual({ kind: "text", text: "" });
+  });
+
+  it("reads exactly the limit, and stops with too-large one byte over it", async () => {
+    const exact = await stdinReader(Readable.from([Buffer.alloc(LIMIT, 0x61)])).readStdin(never());
+    expect(exact.kind === "text" && exact.text.length).toBe(LIMIT);
+    const over = await stdinReader(Readable.from([Buffer.alloc(LIMIT + 1, 0x61)])).readStdin(
+      never(),
+    );
+    expect(over).toEqual({ kind: "too-large" });
+  });
+
+  it("stops reading early when the input is far over the limit", async () => {
+    let produced = 0;
+    const source = new Readable({
+      read() {
+        produced += 1;
+        this.push(produced > 200 ? null : Buffer.alloc(1_000_000, 0x61));
+      },
+    });
+    const result = await stdinReader(source).readStdin(never());
+    expect(result).toEqual({ kind: "too-large" });
+    expect(produced).toBeLessThan(20);
+    expect(source.listenerCount("data")).toBe(0);
+    expect(source.isPaused()).toBe(true);
+  });
+
+  it("gives read-failed when the input fails or closes before its end", async () => {
+    const failing = new Readable({
+      read() {
+        this.destroy(new Error("boom"));
+      },
+    });
+    expect(await stdinReader(failing).readStdin(never())).toEqual({ kind: "read-failed" });
+    const closed = new Readable({
+      read() {
+        this.destroy();
+      },
+    });
+    expect(await stdinReader(closed).readStdin(never())).toEqual({ kind: "read-failed" });
+  });
+
+  it("stops at once when the signal aborts, and leaves nothing listening", async () => {
+    const source = new Readable({ read() {} });
+    const controller = new AbortController();
+    const reading = stdinReader(source).readStdin(controller.signal);
+    source.push(Buffer.from("partial"));
+    await settle();
+    controller.abort();
+    expect(await reading).toEqual({ kind: "interrupted" });
+    expect(source.listenerCount("data")).toBe(0);
+    expect(source.listenerCount("end")).toBe(0);
+    expect(source.listenerCount("error")).toBe(0);
+    expect(source.isPaused()).toBe(true);
+  });
+
+  it("gives interrupted without reading when the signal is aborted already", async () => {
+    const source = new Readable({ read() {} });
+    expect(await stdinReader(source).readStdin(AbortSignal.abort())).toEqual({
+      kind: "interrupted",
+    });
+    expect(source.listenerCount("data")).toBe(0);
+  });
+});
+
+describe("replying from standard input", () => {
+  const T = RECEIVED_AT;
+  const stdinSetup = (stdin: StdinStep[], store?: FakeStore) =>
+    setup([], store, { kind: "running" }, { inputMode: "stdin", stdin });
+  const tailOfNotSent = "Nothing was sent; the request is still waiting.";
+
+  /** Starts the screen and lets it read and place the reply. `running` ends with the exit code. */
+  async function placed(t: ReturnType<typeof stdinSetup>) {
+    const running = t.start();
+    await settle();
+    return { running };
+  }
+
+  it("takes an omitted mode as interactive: it shows the request and reads typed lines", async () => {
+    const t = setup(["Hi"]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).toContain(PROMPT);
+    expect(t.reader.calls).toBe(1);
+    expect(t.reader.stdinCalls).toBe(0);
+    t.controller.abort();
+    await running;
+  });
+
+  it("sends the whole input to the only waiting request and tells so in one line, exit 0", async () => {
+    const t = stdinSetup(["Hi\n"]);
+    t.addWaiting();
+    const { running } = await placed(t);
+    expect(t.replyBody()).toBe("Hi");
+    expect(t.replyKind()).toBe("text");
+    await t.serveBroker.pollOnce();
+    await t.clock.advance(500);
+    expect(await running).toBe(0);
+    expect(t.stdout()).toEqual(["Sent reply to request a1b2c3."]);
+    expect(t.stderr()).toEqual([]);
+    expect(t.reader.calls).toBe(0);
+    expect(t.reader.asked).toEqual([]);
+  });
+
+  it("shows no conversation, no prompt and no question about skipping", async () => {
+    const t = stdinSetup(["Hi"]);
+    t.addWaiting();
+    const { running } = await placed(t);
+    expect(t.stdout()).toEqual([]);
+    t.controller.abort();
+    await running;
+    expect(t.raw()).not.toContain("Request 1 of");
+    expect(t.raw()).not.toContain(WAITING);
+  });
+
+  it("applies the normalizing of line ends and the end of the text before it sends", async () => {
+    const t = stdinSetup(["line one\r\nline two\r\n\r\n"]);
+    t.addWaiting();
+    const { running } = await placed(t);
+    expect(t.replyBody()).toBe("line one\nline two");
+    t.controller.abort();
+    await running;
+  });
+
+  it("sends a reply with a json kind to a request that asks for json", async () => {
+    const t = stdinSetup(['{"passed": true}\n']);
+    t.addWaiting(ID, [{ role: "user", content: "Hello" }], { replyKind: "json" });
+    const { running } = await placed(t);
+    expect(t.replyBody()).toBe('{"passed": true}');
+    expect(t.replyKind()).toBe("json");
+    t.controller.abort();
+    await running;
+  });
+
+  it("answers the first of two waiting requests only", async () => {
+    const t = stdinSetup(["Hi"]);
+    t.addWaiting(ID2);
+    t.addWaiting(ID);
+    const { running } = await placed(t);
+    expect(t.replyBody(ID)).toBe("Hi");
+    expect(t.replyBody(ID2)).toBeUndefined();
+    t.controller.abort();
+    await running;
+    expect(t.store.entries.get(ID2)?.state).toMatchObject({ state: "waiting" });
+  });
+
+  it("keeps the request it chose when one with a smaller id arrives while it reads", async () => {
+    const holder: { add: () => void } = { add: () => {} };
+    const t = stdinSetup([
+      () => {
+        holder.add();
+        return "Hi";
+      },
+    ]);
+    holder.add = () => t.addWaiting(ID);
+    t.addWaiting(ID2);
+    const { running } = await placed(t);
+    expect(t.replyBody(ID2)).toBe("Hi");
+    expect(t.replyBody(ID)).toBeUndefined();
+    t.controller.abort();
+    await running;
+  });
+
+  it("shows nothing while no request waits, then answers the one that arrives", async () => {
+    const t = stdinSetup(["Hi"]);
+    const running = t.start();
+    await settle();
+    for (let index = 0; index < 4; index += 1) {
+      await t.clock.advance(500);
+    }
+    expect(t.stdout()).toEqual([]);
+    expect(t.stderr()).toEqual([]);
+    expect(t.reader.stdinCalls).toBe(0);
+    t.addWaiting();
+    await t.clock.advance(500);
+    expect(t.reader.stdinCalls).toBe(1);
+    expect(t.replyBody()).toBe("Hi");
+    t.controller.abort();
+    await running;
+  });
+
+  it("ends without a word and with exit 130 on Ctrl+C while it waits for a request", async () => {
+    const t = stdinSetup(["Hi"]);
+    const running = t.start();
+    await settle();
+    t.controller.abort();
+    expect(await running).toBe(130);
+    expect(t.stdout()).toEqual([]);
+    expect(t.stderr()).toEqual([]);
+  });
+
+  it("does not mention a request it cannot show or a request that arrives, and reads nothing else", async () => {
+    const t = stdinSetup(["WAIT"]);
+    t.store.addRaw(ID2, {
+      request: "unsupported",
+      state: createStateFile(ID2, "waiting", T, null),
+    });
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    t.addWaiting("20261009T140514000Z-0a0b0c");
+    await t.clock.advance(2000);
+    expect(t.stdout()).toEqual([]);
+    expect(t.stderr()).toEqual([]);
+    t.controller.abort();
+    await running;
+  });
+
+  describe("what cannot be sent", () => {
+    const failures: Array<[string, StdinStep, string]> = [
+      [
+        "an input that is not UTF-8",
+        { kind: "not-utf8" },
+        "Error: the input is not valid UTF-8. Nothing was sent; the request is still waiting.",
+      ],
+      [
+        "an input that cannot be read",
+        { kind: "read-failed" },
+        "Error: could not read standard input. Nothing was sent; the request is still waiting.",
+      ],
+      [
+        "an input over the limit",
+        { kind: "too-large" },
+        `Error: the reply is larger than 10 MB. ${tailOfNotSent}`,
+      ],
+      ["an empty input", "", `Error: the reply is empty. ${tailOfNotSent}`],
+      ["an input of only line ends", "\r\n\n\n", `Error: the reply is empty. ${tailOfNotSent}`],
+    ];
+
+    it.each(failures)("%s: one Error line, exit 1, nothing placed", async (_name, step, line) => {
+      const t = stdinSetup([step]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([line]);
+      expect(t.stdout()).toEqual([]);
+      expect(t.replyBody()).toBeUndefined();
+      expect(t.store.count("placeReply")).toBe(0);
+      expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
+    });
+
+    it("says not valid JSON with the position, for a request that asks for json", async () => {
+      const t = stdinSetup(["not json"]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], { replyKind: "json" });
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([
+        `Error: the reply is not valid JSON (unexpected character at line 1, column 2). ${tailOfNotSent}`,
+      ]);
+      expect(t.raw()).not.toContain("not json");
+      expect(t.replyBody()).toBeUndefined();
+    });
+
+    it("checks empty before json", async () => {
+      const t = stdinSetup(["\n"]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], { replyKind: "json" });
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([`Error: the reply is empty. ${tailOfNotSent}`]);
+    });
+
+    it("refuses a reply whose written form is over the limit, though its text is under it", async () => {
+      const body = '"'.repeat(5_500_000);
+      expect(body.length).toBeLessThan(MAX_FILE_BYTES);
+      const t = stdinSetup([body]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([`Error: the reply is larger than 10 MB. ${tailOfNotSent}`]);
+      expect(t.replyBody()).toBeUndefined();
+    });
+
+    it("checks json before the size", async () => {
+      const t = stdinSetup(['"'.repeat(5_500_000)]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], { replyKind: "json" });
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()[0]).toContain("Error: the reply is not valid JSON (");
+    });
+
+    it("refuses a valid json reply whose written form is over the limit", async () => {
+      const body = `[${'"",'.repeat(2_200_000)}""]`;
+      const t = stdinSetup([body]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], { replyKind: "json" });
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([`Error: the reply is larger than 10 MB. ${tailOfNotSent}`]);
+    });
+
+    it("sends a reply whose written form is exactly the limit", async () => {
+      const base = serializeFile(createReplyFile("", T, "text")).length;
+      const t = stdinSetup(["a".repeat(MAX_FILE_BYTES - base)]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      expect(Buffer.byteLength(t.store.entries.get(ID)?.files.get("reply.json") ?? "")).toBe(
+        MAX_FILE_BYTES,
+      );
+      t.controller.abort();
+      await running;
+    });
+  });
+
+  describe("how the request ended", () => {
+    const at = "2026-10-09T14:05:12.000Z";
+    const endings: Array<[string, ReturnType<typeof createStateFile>, string]> = [
+      [
+        "cancelled",
+        createStateFile(ID, "cancelled", at, at, "client disconnected"),
+        "Error: request a1b2c3 was cancelled (the client disconnected). Nothing was sent.",
+      ],
+      [
+        "timed out",
+        createStateFile(ID, "timed_out", at, at, "wait limit of 30 seconds reached"),
+        "Error: request a1b2c3 timed out (the wait limit passed). Nothing was sent.",
+      ],
+      [
+        "answered in another window",
+        createStateFile(ID, "replied", at, at),
+        "Error: request a1b2c3 was already answered in another window. Nothing was sent.",
+      ],
+      [
+        "skipped in another window",
+        createStateFile(ID, "skipped", at, at, "skipped by the human"),
+        "Error: request a1b2c3 was already answered in another window. Nothing was sent.",
+      ],
+      [
+        "ended with an invalid reply",
+        createStateFile(ID, "invalid_reply", at, at, "reply file is not valid JSON"),
+        "Error: request a1b2c3 has already ended. Nothing was sent.",
+      ],
+      [
+        "abandoned",
+        createStateFile(ID, "abandoned", at, at, "server restarted"),
+        "Error: request a1b2c3 has already ended. Nothing was sent.",
+      ],
+    ];
+
+    it.each(endings)("stops the reading when the request is %s", async (_name, state, line) => {
+      const t = stdinSetup(["WAIT"]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      const entry = t.store.entries.get(ID);
+      if (entry !== undefined) {
+        entry.state = state;
+      }
+      await t.clock.advance(500);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([line]);
+      expect(t.stdout()).toEqual([]);
+      expect(t.replyBody()).toBeUndefined();
+    });
+
+    it.each(endings)(
+      "tells the same after the reply was placed, when the request is %s",
+      async (_name, state, line) => {
+        const t = stdinSetup(["Hi"]);
+        t.addWaiting();
+        const { running } = await placed(t);
+        expect(t.replyBody()).toBe("Hi");
+        const entry = t.store.entries.get(ID);
+        if (entry !== undefined) {
+          entry.state = state;
+        }
+        await t.clock.advance(500);
+        expect(await running).toBe(1);
+        expect(t.stderr()).toEqual([line]);
+        expect(t.stdout()).toEqual([]);
+      },
+    );
+
+    it("says another window answered when a hand-written reply took the place", async () => {
+      const t = stdinSetup([
+        () => {
+          t.store.putFile(ID, "reply.json", serializeFile(createReplyFile("theirs", T)));
+          return "Hi";
+        },
+      ]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      await t.serveBroker.pollOnce();
+      await t.clock.advance(500);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([
+        "Error: request a1b2c3 was already answered in another window. Nothing was sent.",
+      ]);
+      expect(t.store.entries.get(ID)?.files.get("reply.accepted.json")).toContain("theirs");
+    });
+
+    it("says the request has ended when the hand-written reply that took the place was invalid", async () => {
+      const t = stdinSetup([
+        () => {
+          t.store.putFile(ID, "reply.json", "{broken");
+          return "Hi";
+        },
+      ]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      await t.serveBroker.pollOnce();
+      await t.clock.advance(500);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual(["Error: request a1b2c3 has already ended. Nothing was sent."]);
+    });
+  });
+
+  describe("Ctrl+C and failures to write", () => {
+    it("shows the Quit line and exits 130 when Ctrl+C comes while it reads", async () => {
+      const t = stdinSetup(["WAIT"]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      t.controller.abort();
+      expect(await running).toBe(130);
+      expect(t.stdout()).toEqual(["Quit. Request a1b2c3 is still waiting."]);
+      expect(t.stderr()).toEqual([]);
+      expect(t.replyBody()).toBeUndefined();
+    });
+
+    it("keeps the placed reply, shows nothing and exits 130 when Ctrl+C comes after it was placed", async () => {
+      const t = stdinSetup(["Hi"]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      t.controller.abort();
+      expect(await running).toBe(130);
+      expect(t.stdout()).toEqual([]);
+      expect(t.stderr()).toEqual([]);
+      expect(t.replyBody()).toBe("Hi");
+    });
+
+    it("says it could not write the reply, once, and exits 1 with the request still waiting", async () => {
+      const t = stdinSetup(["Hi"]);
+      t.addWaiting();
+      t.store.fail("placeReply", 5);
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual(["Error: could not write the reply. input/output error."]);
+      expect(t.stdout()).toEqual([]);
+      expect(t.store.count("placeReply")).toBe(1);
+      expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
+    });
+  });
+
+  describe("the size of what is typed", () => {
+    const again = "Type your reply again. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).";
+
+    it("refuses a typed reply whose written form is over the limit and asks again", async () => {
+      const t = setup(['"'.repeat(5_500_000), "ok"]);
+      t.addWaiting();
+      const running = t.start();
+      await settle();
+      const lines = t.stdout();
+      const at = lines.indexOf("Not sent: your reply is larger than 10 MB.");
+      expect(at).toBeGreaterThan(-1);
+      expect(lines[at + 1]).toBe(again);
+      expect(t.reader.calls).toBe(2);
+      expect(t.replyBody()).toBe("ok");
+      t.controller.abort();
+      await running;
+    });
+
+    it("asks for the json again for a request that asks for json", async () => {
+      const t = setup([`[${'"",'.repeat(2_200_000)}""]`, "[]"]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], { replyKind: "json" });
+      const running = t.start();
+      await settle();
+      const lines = t.stdout();
+      const at = lines.indexOf("Not sent: your reply is larger than 10 MB.");
+      expect(at).toBeGreaterThan(-1);
+      expect(lines[at + 1]).toBe(
+        "Type the JSON again. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).",
+      );
+      expect(t.replyBody()).toBe("[]");
+      t.controller.abort();
+      await running;
+    });
   });
 });

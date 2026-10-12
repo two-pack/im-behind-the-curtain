@@ -15,8 +15,8 @@ import type { Clock } from "../clock.js";
 import { EXIT, IoFailure } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger, Screen } from "../log.js";
-import type { ReplyFileKind, ReplyKind } from "../model.js";
-import { endOfInputHint } from "../platform.js";
+import { MAX_FILE_BYTES, type ReplyFileKind, type ReplyKind } from "../model.js";
+import { type AnswerInputMode, endOfInputHint } from "../platform.js";
 import { conversationLines, escapeAllControls, escapeControls } from "./conversation-view.js";
 
 /** Every sentence the screen shows, in one place. */
@@ -42,12 +42,34 @@ const TEXT = {
   prompt: () => `Type your reply. Finish with ${endOfInputHint()}.`,
   jsonPrompt: () => `Type the JSON. Finish with ${endOfInputHint()}.`,
   jsonAgain: () => `Type the JSON again. Finish with ${endOfInputHint()}.`,
+  again: () => `Type your reply again. Finish with ${endOfInputHint()}.`,
+  tooLarge: "Not sent: your reply is larger than 10 MB.",
   requiredShape: "Required shape:",
   anyJson: "Any JSON value is accepted as long as it is valid JSON.",
   notJson: (reason: string) => `Not sent: your reply is not valid JSON (${reason}).`,
   serveNotRunning: (dir: string) => `Error: imbehind serve is not running for ${dir}.`,
   startServe: "Start it with: imbehind serve",
   cannotRead: (dir: string, detail: string) => `Error: cannot read ${dir}: ${detail}.`,
+} as const;
+
+/** The sentences of the reply from standard input. */
+const STDIN_TEXT = {
+  sent: (id: string) => `Sent reply to request ${shortId(id)}.`,
+  notUtf8: "Error: the input is not valid UTF-8. Nothing was sent; the request is still waiting.",
+  readFailed:
+    "Error: could not read standard input. Nothing was sent; the request is still waiting.",
+  empty: "Error: the reply is empty. Nothing was sent; the request is still waiting.",
+  notJson: (reason: string) =>
+    `Error: the reply is not valid JSON (${reason}). Nothing was sent; the request is still waiting.`,
+  tooLarge:
+    "Error: the reply is larger than 10 MB. Nothing was sent; the request is still waiting.",
+  cancelled: (id: string) =>
+    `Error: request ${shortId(id)} was cancelled (the client disconnected). Nothing was sent.`,
+  timedOut: (id: string) =>
+    `Error: request ${shortId(id)} timed out (the wait limit passed). Nothing was sent.`,
+  elsewhere: (id: string) =>
+    `Error: request ${shortId(id)} was already answered in another window. Nothing was sent.`,
+  ended: (id: string) => `Error: request ${shortId(id)} has already ended. Nothing was sent.`,
 } as const;
 
 /** The word shown after "Reply:" for each kind of reply. */
@@ -63,10 +85,26 @@ export type ReadResult =
 /** The answer to one question: a line, the end of the input, or Ctrl+C. */
 export type LineResult = { kind: "line"; text: string } | { kind: "end" } | { kind: "interrupted" };
 
+/**
+ * The result of reading the whole standard input: the text, or why there is none.
+ * `interrupted` is Ctrl+C, or the screen stopping the read because the request ended.
+ */
+export type StdinRead =
+  | { kind: "text"; text: string }
+  | { kind: "not-utf8" }
+  | { kind: "read-failed" }
+  | { kind: "too-large" }
+  | { kind: "interrupted" };
+
 /** Reads what the person types. */
 export interface ReplyReader {
   /** Reads one reply: the lines the person types, until they end the input. */
   readReply(signal: AbortSignal): Promise<ReadResult>;
+  /**
+   * Reads the whole standard input as one reply: strict UTF-8, one byte order mark at
+   * the start removed, and no more than the limit of bytes read.
+   */
+  readStdin(signal: AbortSignal): Promise<StdinRead>;
   /** Shows `prompt` and reads the one line that answers it. */
   readLine(prompt: string, signal: AbortSignal): Promise<LineResult>;
   /** Writes one line above what the person is typing, and draws the typed text again. */
@@ -110,8 +148,66 @@ export function createReplyReader(
       }
       return readOneLine(reader, prompt, signal);
     },
+    readStdin: (signal) => readWholeInput(input, signal),
     notify: (text) => showAboveInput(reader, text),
   };
+}
+
+/** The text of the bytes as strict UTF-8, which also drops one byte order mark at the start. */
+function decodeInput(bytes: Buffer): StdinRead {
+  try {
+    return { kind: "text", text: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+  } catch {
+    return { kind: "not-utf8" };
+  }
+}
+
+/**
+ * Reads `input` to its end, but not past the limit. Whatever the result, it stops listening and
+ * pauses the input, so a long input is not read on after the answer is known.
+ */
+function readWholeInput(input: Readable, signal: AbortSignal): Promise<StdinRead> {
+  if (signal.aborted) {
+    return Promise.resolve({ kind: "interrupted" });
+  }
+  if (input.readableEnded) {
+    return Promise.resolve({ kind: "text", text: "" });
+  }
+  return new Promise<StdinRead>((resolve) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const finish = (result: StdinRead): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      input.off("data", onData);
+      input.off("end", onEnd);
+      input.off("error", onFailure);
+      input.off("close", onFailure);
+      signal.removeEventListener("abort", onAbort);
+      input.pause();
+      resolve(result);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+      total += bytes.length;
+      if (total > MAX_FILE_BYTES) {
+        finish({ kind: "too-large" });
+        return;
+      }
+      chunks.push(bytes);
+    };
+    const onEnd = (): void => finish(decodeInput(Buffer.concat(chunks, total)));
+    const onFailure = (): void => finish({ kind: "read-failed" });
+    const onAbort = (): void => finish({ kind: "interrupted" });
+    signal.addEventListener("abort", onAbort, { once: true });
+    input.on("error", onFailure);
+    input.on("close", onFailure);
+    input.on("end", onEnd);
+    input.on("data", onData);
+  });
 }
 
 export interface ReplyReaderOptions {
@@ -296,10 +392,15 @@ export interface AnswerConsoleOptions {
   storageDir: string;
   /** Looks at the lock of the storage directory once, when the screen starts. */
   checkServe: () => Promise<ServeStatus>;
+  /** How the input is used. Left out, it is `interactive`. */
+  inputMode?: AnswerInputMode;
 }
 
-/** What a request that ended while the person was busy tells: the client left, or time ran out. */
-type Closed = Extract<Confirmation, { kind: "cancelled" | "timed_out" }>;
+/**
+ * What a request that ended while the person was busy tells. For a typed reply it is the client
+ * leaving or time running out. For a reply from standard input it is any end.
+ */
+type Closed = Confirmation;
 
 type Typed =
   | { kind: "text"; text: string }
@@ -324,6 +425,20 @@ function endingLine(result: Confirmation): string | undefined {
       return TEXT.ended;
     default:
       return undefined;
+  }
+}
+
+/** The Error line for a request that is over, for a reply from standard input. */
+function closedLine(id: string, ending: Confirmation): string {
+  switch (ending.kind) {
+    case "cancelled":
+      return STDIN_TEXT.cancelled(id);
+    case "timed_out":
+      return STDIN_TEXT.timedOut(id);
+    case "elsewhere":
+      return STDIN_TEXT.elsewhere(id);
+    default:
+      return STDIN_TEXT.ended(id);
   }
 }
 
@@ -353,10 +468,14 @@ export class AnswerConsole {
     }
     const unsubscribe = this.options.broker.subscribe((event) => this.relay(event));
     try {
-      return await this.loop(signal);
+      return await (this.inputMode() === "stdin" ? this.replyFromStdin(signal) : this.loop(signal));
     } finally {
       unsubscribe();
     }
+  }
+
+  private inputMode(): AnswerInputMode {
+    return this.options.inputMode ?? "interactive";
   }
 
   /** Checks that a serve is running. A sentence goes to standard error when it fails. */
@@ -426,6 +545,111 @@ export class AnswerConsole {
         write(TEXT.unsupported(id));
       }
     }
+  }
+
+  /**
+   * The reply from standard input. The first waiting request is the target
+   * and stays so. The input is read while the target is watched, checked, placed, and the outcome
+   * is told in one line. Returns the exit code.
+   */
+  private async replyFromStdin(signal: AbortSignal): Promise<number> {
+    const target = await this.waitForTarget(signal);
+    if (target === undefined) {
+      return EXIT.interrupted;
+    }
+    const read = await this.watched(target.id, signal, (stop) =>
+      this.options.reader.readStdin(stop),
+    );
+    if ("closed" in read) {
+      return this.stdinFailure(closedLine(target.id, read.closed));
+    }
+    return this.afterStdinRead(target, read.value, signal);
+  }
+
+  /** The waiting request with the smallest id. Nothing is shown while there is none. */
+  private async waitForTarget(signal: AbortSignal): Promise<WaitingExchange | undefined> {
+    while (!signal.aborted) {
+      const first = (await this.list())?.waiting[0];
+      if (first !== undefined) {
+        return first;
+      }
+      await this.options.clock.sleep(this.options.pollIntervalMs, signal);
+    }
+    return undefined;
+  }
+
+  private async afterStdinRead(
+    target: WaitingExchange,
+    read: StdinRead,
+    signal: AbortSignal,
+  ): Promise<number> {
+    switch (read.kind) {
+      case "interrupted":
+        this.options.screen.line(TEXT.quit(target.id));
+        return EXIT.interrupted;
+      case "not-utf8":
+        return this.stdinFailure(STDIN_TEXT.notUtf8);
+      case "read-failed":
+        return this.stdinFailure(STDIN_TEXT.readFailed);
+      case "too-large":
+        return this.stdinFailure(STDIN_TEXT.tooLarge);
+      default:
+        return this.sendFromStdin(target, read.text, signal);
+    }
+  }
+
+  private stdinFailure(line: string): number {
+    this.options.errorScreen.line(line);
+    return EXIT.failure;
+  }
+
+  /** The checks of a reply from standard input, in order: empty, json, the size of the file. */
+  private stdinProblem(kind: ReplyKind, text: string): string | undefined {
+    const { broker } = this.options;
+    if (text === "") {
+      return STDIN_TEXT.empty;
+    }
+    const check = broker.checkReply(kind, text);
+    if (!check.ok) {
+      return STDIN_TEXT.notJson(check.reason);
+    }
+    return broker.replyFitsLimit(text, kind) ? undefined : STDIN_TEXT.tooLarge;
+  }
+
+  private async sendFromStdin(
+    target: WaitingExchange,
+    raw: string,
+    signal: AbortSignal,
+  ): Promise<number> {
+    const kind = target.request.replyKind;
+    const text = normalizeReply(raw);
+    const problem = this.stdinProblem(kind, text);
+    if (problem !== undefined) {
+      return this.stdinFailure(problem);
+    }
+    let placed: Awaited<ReturnType<ExchangeBroker["placeReply"]>>;
+    try {
+      placed = await this.options.broker.placeReply(target.id, text, kind);
+    } catch (error) {
+      if (!(error instanceof IoFailure)) {
+        throw error;
+      }
+      return this.stdinFailure(TEXT.writeFailed(error.detail));
+    }
+    this.placed.add(target.id);
+    const ending = await this.waitForEnding(
+      target.id,
+      placed.kind === "placed" ? placed.bytes : undefined,
+      signal,
+    );
+    if (ending === undefined) {
+      return EXIT.interrupted;
+    }
+    if (ending.kind === "sent") {
+      this.options.screen.line(STDIN_TEXT.sent(target.id));
+      return EXIT.success;
+    }
+    return this.stdinFailure(closedLine(target.id, ending));
   }
 
   private async idle(signal: AbortSignal): Promise<void> {
@@ -591,12 +815,24 @@ export class AnswerConsole {
       if (signal.aborted) {
         return;
       }
-      if (state.kind === "cancelled" || state.kind === "timed_out") {
+      if (this.hasEnded(state)) {
         onClosed(state);
         return;
       }
-      await this.noticeNewRequests(id, state.kind === "pending", signal);
+      if (this.inputMode() === "interactive") {
+        await this.noticeNewRequests(id, state.kind === "pending", signal);
+      }
     }
+  }
+
+  /**
+   * Whether the watched request is over for the reading. A typed reply stops for the client
+   * leaving or the wait limit. A reply from standard input stops for any end.
+   */
+  private hasEnded(state: Confirmation): boolean {
+    return this.inputMode() === "stdin"
+      ? state.kind !== "pending"
+      : state.kind === "cancelled" || state.kind === "timed_out";
   }
 
   /** Tells the count when a request came that the last look had not seen. */
@@ -629,12 +865,20 @@ export class AnswerConsole {
    * reason is shown, and the same request asks again.
    */
   private accepts(kind: ReplyKind, text: string): boolean {
-    const check = this.options.broker.checkReply(kind, text);
+    const { broker, screen } = this.options;
+    const check = broker.checkReply(kind, text);
     if (!check.ok) {
-      this.options.screen.line(TEXT.notJson(check.reason));
-      this.options.screen.line(TEXT.jsonAgain());
+      screen.line(TEXT.notJson(check.reason));
+      screen.line(TEXT.jsonAgain());
+      return false;
     }
-    return check.ok;
+    // The size of the written file comes after the check of the json.
+    if (!broker.replyFitsLimit(text, kind)) {
+      screen.line(TEXT.tooLarge);
+      screen.line(kind === "json" ? TEXT.jsonAgain() : TEXT.again());
+      return false;
+    }
+    return true;
   }
 
   private async send(
@@ -668,16 +912,29 @@ export class AnswerConsole {
     bytes: string | undefined,
     signal: AbortSignal,
   ): Promise<number | undefined> {
-    const { screen, clock, pollIntervalMs } = this.options;
+    const ending = await this.waitForEnding(id, bytes, signal);
+    if (ending === undefined) {
+      return EXIT.interrupted;
+    }
+    this.options.screen.line(endingLine(ending) ?? TEXT.ended);
+    return undefined;
+  }
+
+  /** Looks at the request every poll interval until it has ended. Nothing when `signal` aborts. */
+  private async waitForEnding(
+    id: string,
+    bytes: string | undefined,
+    signal: AbortSignal,
+  ): Promise<Confirmation | undefined> {
+    const { clock, pollIntervalMs } = this.options;
     while (!signal.aborted) {
-      const line = endingLine(await this.confirm(id, bytes));
-      if (line !== undefined) {
-        screen.line(line);
-        return undefined;
+      const result = await this.confirm(id, bytes);
+      if (endingLine(result) !== undefined) {
+        return result;
       }
       await clock.sleep(pollIntervalMs, signal);
     }
-    return EXIT.interrupted;
+    return undefined;
   }
 
   /**

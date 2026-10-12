@@ -9,6 +9,7 @@ import {
 import type {
   ExchangeStorage,
   ReplyFileName,
+  ReplyFileRead,
   Stored,
   StoredReply,
 } from "../../src/store/exchange-store.js";
@@ -28,11 +29,36 @@ export class FakeStore implements ExchangeStorage {
   readonly entries = new Map<string, Entry>();
   readonly calls: Record<string, number> = {};
   private readonly failures = new Map<string, number>();
+  private readonly reasons = new Map<string, IoReason>();
   private readonly gates = new Map<string, Promise<void>>();
+  /** Bytes that a reply.json holds when they are not text (the file itself stays as a string). */
+  private readonly rawReplies = new Map<string, Uint8Array>();
+  /** Requests whose reply.json counts as larger than the limit, without holding that much. */
+  private readonly oversize = new Set<string>();
 
-  /** Makes the next `times` calls of an operation fail with an input/output failure. */
-  fail(operation: string, times = 1): void {
+  /**
+   * Makes the next `times` calls of an operation fail with an input/output failure. `reason`
+   * replaces the reason that the operation would give.
+   */
+  fail(operation: string, times = 1, reason?: IoReason): void {
     this.failures.set(operation, times);
+    if (reason === undefined) {
+      this.reasons.delete(operation);
+    } else {
+      this.reasons.set(operation, reason);
+    }
+  }
+
+  /** Makes the reply.json of a request hold these bytes, which may not be valid text. */
+  putRawReply(id: string, bytes: Uint8Array): void {
+    this.entries.get(id)?.files.set("reply.json", "");
+    this.rawReplies.set(id, bytes);
+  }
+
+  /** Makes the reply.json of a request count as larger than the limit. */
+  putOversizeReply(id: string): void {
+    this.entries.get(id)?.files.set("reply.json", "");
+    this.oversize.add(id);
   }
 
   /** Makes an operation wait for the given promise before it runs. */
@@ -61,7 +87,7 @@ export class FakeStore implements ExchangeStorage {
     const remaining = this.failures.get(operation) ?? 0;
     if (remaining > 0) {
       this.failures.set(operation, remaining - 1);
-      throw new IoFailure(reason, ioError("EIO"));
+      throw new IoFailure(this.reasons.get(operation) ?? reason, ioError("EIO"));
     }
   }
 
@@ -140,21 +166,34 @@ export class FakeStore implements ExchangeStorage {
     entry.files.set("reply.json", bytes);
   }
 
-  async acceptReply(id: string): Promise<void> {
+  async acceptReply(id: string, bytes: Uint8Array): Promise<void> {
     await this.enter("acceptReply", "link failed");
     const entry = this.entries.get(id);
-    const reply = entry?.files.get("reply.json");
-    if (entry === undefined || reply === undefined) {
+    if (entry === undefined) {
       throw new IoFailure("link failed", ioError("ENOENT"));
     }
     if (entry.files.has("reply.accepted.json")) {
       throw new AlreadyExistsError();
     }
-    entry.files.set("reply.accepted.json", reply);
+    entry.files.set("reply.accepted.json", Buffer.from(bytes).toString("utf8"));
+  }
+
+  async readReplyFile(id: string): Promise<ReplyFileRead | undefined> {
+    await this.enter("readReply", "unreadable");
+    const text = this.entries.get(id)?.files.get("reply.json");
+    if (text === undefined) {
+      return undefined;
+    }
+    if (this.oversize.has(id)) {
+      return { kind: "too-large" };
+    }
+    return { kind: "bytes", bytes: this.rawReplies.get(id) ?? Buffer.from(text, "utf8") };
   }
 
   async removeReply(id: string): Promise<void> {
     await this.enter("removeReply", "failed");
+    this.rawReplies.delete(id);
+    this.oversize.delete(id);
     this.entries.get(id)?.files.delete("reply.json");
   }
 
@@ -185,6 +224,10 @@ export class FakeStore implements ExchangeStorage {
 
   /** Puts a reply file in place the way a user tool or another answer would. */
   putFile(id: string, name: ReplyFileName, bytes: string): void {
+    if (name === "reply.json") {
+      this.rawReplies.delete(id);
+      this.oversize.delete(id);
+    }
     this.entries.get(id)?.files.set(name, bytes);
   }
 }
