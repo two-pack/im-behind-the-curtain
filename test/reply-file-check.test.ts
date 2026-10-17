@@ -6,6 +6,7 @@ import {
   isInvalidReplyReason,
   MAX_FILE_BYTES,
   type ReplyKind,
+  type ToolDefinitions,
 } from "../src/model.js";
 
 const BOM = [0xef, 0xbb, 0xbf];
@@ -14,8 +15,12 @@ function bytesOf(value: unknown): Uint8Array {
   return Buffer.from(typeof value === "string" ? value : JSON.stringify(value), "utf8");
 }
 
-function invalid(bytes: Uint8Array, replyKind: ReplyKind): string | undefined {
-  const verdict = checkReplyFile(bytes, replyKind);
+function invalid(
+  bytes: Uint8Array,
+  replyKind: ReplyKind,
+  toolDefinitions?: ToolDefinitions,
+): string | undefined {
+  const verdict = checkReplyFile(bytes, replyKind, toolDefinitions);
   return verdict.kind === "invalid" ? verdict.reason : undefined;
 }
 
@@ -278,5 +283,65 @@ describe("the list of reasons (NFR10)", () => {
     }
     expect(isInvalidReplyReason("reply body is not valid JSON (secret)")).toBe(false);
     expect(isInvalidReplyReason("anything else")).toBe(false);
+  });
+});
+
+describe("a reply file that calls tools", () => {
+  const CALLS = JSON.stringify([
+    {
+      id: "call_1",
+      type: "function",
+      function: { name: "f", arguments: "{}" },
+    },
+  ]);
+  const BAD_CALLS = JSON.stringify([
+    { id: "", type: "function", function: { name: "f", arguments: "{}" } },
+  ]);
+  const file = (body: string, kind = "text") => bytesOf({ formatVersion: 1, kind, body });
+
+  it("is valid when the calls fit, for both reply kinds of the request", () => {
+    for (const replyKind of ["text", "json"] as const) {
+      expect(checkReplyFile(file(CALLS), replyKind, "tools").kind).toBe("valid");
+      expect(checkReplyFile(file(CALLS, "json"), replyKind, "both").kind).toBe("valid");
+    }
+  });
+
+  it("is invalid with a fixed reason when the calls do not fit", () => {
+    const expected = INVALID_REPLY_REASONS.badToolCalls("call 1 needs a non-empty string id");
+    for (const replyKind of ["text", "json"] as const) {
+      expect(invalid(file(BAD_CALLS), replyKind, "tools")).toBe(expected);
+    }
+    expect(isInvalidReplyReason(expected)).toBe(true);
+  });
+
+  it("never carries a typed character in the reason", () => {
+    const body = JSON.stringify([
+      {
+        id: "secret-token",
+        type: "secret-token",
+        function: { name: "secret-token" },
+      },
+    ]);
+    const reason = invalid(file(body), "text", "tools");
+    expect(reason).toBeDefined();
+    expect(reason).not.toContain("secret-token");
+    expect(isInvalidReplyReason(reason ?? "")).toBe(true);
+  });
+
+  it("is judged as text when the request has no definitions, or no default is given", () => {
+    expect(checkReplyFile(file(BAD_CALLS), "text").kind).toBe("valid");
+    expect(checkReplyFile(file(BAD_CALLS), "text", "none").kind).toBe("valid");
+  });
+
+  it("does not look at the calls of a skip reply", () => {
+    const skip = bytesOf({ formatVersion: 1, kind: "skip", body: "" });
+    expect(checkReplyFile(skip, "text", "tools").kind).toBe("valid");
+  });
+
+  it("keeps the earlier reasons first: a body that is not json for a json request", () => {
+    expect(invalid(file("not json"), "json", "tools")).toBe(
+      "reply body is not valid JSON (unexpected character at line 1, column 2)",
+    );
+    expect(checkReplyFile(file("Hello"), "text", "tools").kind).toBe("valid");
   });
 });

@@ -14,8 +14,11 @@ import {
   type RequestFile,
   type StateFile,
   serializeFile,
+  type ToolDefinitions,
+  type ToolReply,
 } from "../model.js";
 import type { ExchangeStorage } from "../store/exchange-store.js";
+import { classifyReply } from "../tool-calls.js";
 import { checkReply, type ReplyCheck } from "./reply-check.js";
 import { checkReplyFile } from "./reply-file-check.js";
 
@@ -35,7 +38,8 @@ export type BrokerEventHandler = (event: BrokerEvent) => void;
  * client is gone.
  */
 export type ExchangeOutcome =
-  | { kind: "replied"; id: string; body: string }
+  /** `reply` is what `body` is for the client, decided once when the reply was accepted. */
+  | { kind: "replied"; id: string; body: string; reply: ToolReply }
   | { kind: "skipped"; id: string }
   | { kind: "timed_out"; id: string; limitSeconds: number }
   | { kind: "cancelled"; id: string }
@@ -89,8 +93,14 @@ interface Ending {
 
 /** What the check of a reply.json found: the reply and the bytes it was judged on, or a reason. */
 type Judged =
-  | { kind: "valid"; reply: ReplyFile; bytes: Uint8Array }
+  | { kind: "valid"; reply: ReplyFile; toolReply: ToolReply; bytes: Uint8Array }
   | { kind: "invalid"; reason: string };
+
+/** What the reply to a request is judged by. */
+interface ReplyRules {
+  replyKind: ReplyKind;
+  toolDefinitions: ToolDefinitions;
+}
 
 export interface BrokerOptions {
   store: ExchangeStorage;
@@ -137,8 +147,11 @@ export class ExchangeBroker {
   private readonly finished = new Set<string>();
   /** Requests whose request.json serve has read once, or wrote itself, in this run. */
   private readonly requestChecked = new Set<string>();
-  /** The reply kind of the requests that serve saved in this run, so their request.json is not read. */
-  private readonly replyKinds = new Map<string, ReplyKind>();
+  /**
+   * What the reply to a request is judged by (the reply kind and the tool definitions), for the
+   * requests that serve saved in this run, so their request.json is not read.
+   */
+  private readonly replyRules = new Map<string, ReplyRules>();
   /** Requests whose last attempt failed. A later success reports a recovery. */
   private readonly failing = new Set<string>();
   /** True while the listing of the storage directory is failing. */
@@ -194,7 +207,10 @@ export class ExchangeBroker {
       throw error;
     }
     this.requestChecked.add(id);
-    this.replyKinds.set(id, request.replyKind);
+    this.replyRules.set(id, {
+      replyKind: request.replyKind,
+      toolDefinitions: request.toolDefinitions ?? "none",
+    });
     return { id, outcome };
   }
 
@@ -382,8 +398,8 @@ export class ExchangeBroker {
    * The one check of a reply before it is placed. The answer screen calls it, and
    * so does the later unit that checks hand-written replies.
    */
-  checkReply(kind: ReplyKind, body: string): ReplyCheck {
-    return checkReply(kind, body);
+  checkReply(kind: ReplyKind, body: string, toolDefinitions: ToolDefinitions = "none"): ReplyCheck {
+    return checkReply(kind, body, toolDefinitions);
   }
 
   /**
@@ -564,12 +580,28 @@ export class ExchangeBroker {
    */
   private async receiveAccepted(id: string, hasReplyFile: boolean): Promise<void> {
     const reply = await this.acceptedReply(id);
+    const rules = reply === undefined ? undefined : await this.replyRulesOf(id);
     // After shutdown nothing is claimed, linked or written. The check comes right
     // before the claim and again before each later step, because every await can let it happen.
-    if (this.stopped || reply === undefined || !this.claim(id)) {
+    // Without the definitions of the request the reply cannot be classified, so a later poll tries.
+    if (this.stopped || reply === undefined || rules === undefined || !this.claim(id)) {
       return;
     }
-    await this.finish(id, replyEnding(id, reply, this.clock.now().toISOString(), hasReplyFile));
+    await this.finish(id, this.acceptedEnding(id, reply, rules, hasReplyFile));
+  }
+
+  /** The ending for a reply that was accepted: classified by the definitions of its request. */
+  private acceptedEnding(
+    id: string,
+    reply: ReplyFile,
+    rules: ReplyRules,
+    removeReplyFile: boolean,
+  ): Ending {
+    const now = this.clock.now().toISOString();
+    const toolReply = toolReplyOf(reply, rules.toolDefinitions);
+    return toolReply.kind === "invalid"
+      ? invalidEnding(id, toolReply.reason, now)
+      : replyEnding(id, reply, toolReply, now, removeReplyFile);
   }
 
   /**
@@ -589,7 +621,7 @@ export class ExchangeBroker {
       return;
     }
     await this.linkAccepted(id, judged.bytes);
-    await this.finish(id, replyEnding(id, judged.reply, now, true));
+    await this.finish(id, replyEnding(id, judged.reply, judged.toolReply, now, true));
   }
 
   /**
@@ -605,14 +637,18 @@ export class ExchangeBroker {
     if (read.kind === "too-large") {
       return { kind: "invalid", reason: INVALID_REPLY_REASONS.tooLarge };
     }
-    const replyKind = await this.replyKindOf(id);
-    if (replyKind === undefined) {
+    const rules = await this.replyRulesOf(id);
+    if (rules === undefined) {
       return undefined;
     }
-    const verdict = checkReplyFile(read.bytes, replyKind);
-    return verdict.kind === "valid"
-      ? { kind: "valid", reply: verdict.reply, bytes: read.bytes }
-      : verdict;
+    const verdict = checkReplyFile(read.bytes, rules.replyKind, rules.toolDefinitions);
+    if (verdict.kind !== "valid") {
+      return verdict;
+    }
+    const toolReply = toolReplyOf(verdict.reply, rules.toolDefinitions);
+    return toolReply.kind === "invalid"
+      ? toolReply
+      : { kind: "valid", reply: verdict.reply, toolReply, bytes: read.bytes };
   }
 
   /**
@@ -620,13 +656,18 @@ export class ExchangeBroker {
    * request.json is read. Nothing when request.json cannot show it, so the reply file is judged
    * on a later poll instead of skipping the json check.
    */
-  private async replyKindOf(id: string): Promise<ReplyKind | undefined> {
-    const known = this.replyKinds.get(id);
+  private async replyRulesOf(id: string): Promise<ReplyRules | undefined> {
+    const known = this.replyRules.get(id);
     if (known !== undefined) {
       return known;
     }
     const request = await this.store.readRequest(id);
-    return request.kind === "ok" ? request.value.replyKind : undefined;
+    return request.kind === "ok"
+      ? {
+          replyKind: request.value.replyKind,
+          toolDefinitions: request.value.toolDefinitions,
+        }
+      : undefined;
   }
 
   /**
@@ -730,7 +771,7 @@ export class ExchangeBroker {
     }
     this.finished.add(id);
     this.deferred.delete(id);
-    this.replyKinds.delete(id);
+    this.replyRules.delete(id);
   }
 
   /** Tells the log and the client how the request ended, once, and clears what it left. */
@@ -817,11 +858,40 @@ export class ExchangeBroker {
   }
 }
 
-/** The ending for a reply: replied with its text, or skipped. */
-function replyEnding(id: string, reply: ReplyFile, now: string, removeReplyFile: boolean): Ending {
+/**
+ * What a reply is for the client. A reply that does not fit its definitions was refused by the
+ * check before it was accepted, so `invalid` is not expected here; it ends the request with the
+ * fixed reason instead of being sent as text. A skip has no text and is `text` here.
+ */
+function toolReplyOf(
+  reply: ReplyFile,
+  toolDefinitions: ToolDefinitions,
+): ToolReply | { kind: "invalid"; reason: string } {
+  if (reply.kind === "skip") {
+    return { kind: "text" };
+  }
+  const result = classifyReply(reply.body, toolDefinitions);
+  return result.kind === "invalid"
+    ? {
+        kind: "invalid",
+        reason: INVALID_REPLY_REASONS.badToolCalls(result.problem),
+      }
+    : result;
+}
+
+/** The ending for a reply: replied with its text and what it is, or skipped. */
+function replyEnding(
+  id: string,
+  reply: ReplyFile,
+  toolReply: ToolReply,
+  now: string,
+  removeReplyFile: boolean,
+): Ending {
   const skipped = reply.kind === "skip";
   return {
-    outcome: skipped ? { kind: "skipped", id } : { kind: "replied", id, body: reply.body },
+    outcome: skipped
+      ? { kind: "skipped", id }
+      : { kind: "replied", id, body: reply.body, reply: toolReply },
     state: skipped
       ? createStateFile(id, "skipped", now, now, "skipped by the human")
       : createStateFile(id, "replied", now, now),

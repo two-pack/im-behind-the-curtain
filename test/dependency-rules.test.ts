@@ -76,6 +76,27 @@ describe("the dependency rules (logical-components: the leaf modules)", () => {
     ]);
   });
 
+  it("treats tool-calls as a leaf module that the adapter side and the answer side may use", async () => {
+    const violations = await cruise({
+      "model.ts": LEAF,
+      "tool-calls.ts": 'import { value } from "./model.js";\nexport const calls = value;\n',
+      "broker/reply-check.ts":
+        'import { calls } from "../tool-calls.js";\nexport const check = calls;\n',
+      "http/server.ts": 'import { calls } from "../tool-calls.js";\nexport const serve = calls;\n',
+    });
+    expect(violations).toEqual([]);
+  });
+
+  it("reports a tool-calls module that imports a module that is not a leaf", async () => {
+    const violations = await cruise({
+      "clock.ts": LEAF,
+      "tool-calls.ts": 'import { value } from "./clock.js";\nexport const calls = value;\n',
+    });
+    expect(violations.map((violation) => `${violation.from} -> ${violation.to}`)).toEqual([
+      "src/tool-calls.ts -> src/clock.ts",
+    ]);
+  });
+
   it("still allows an import the design allows", async () => {
     const violations = await cruise({
       "errors.ts": LEAF,

@@ -320,7 +320,6 @@ describe("rejected bodies", () => {
 });
 
 describe("requests turned away as unsupported", () => {
-  const TOOLS = "Tool calls are not supported. Send the request without tools.";
   const IMAGES = "Images are not supported. A human reads requests as text.";
 
   const CASES: [string, Record<string, unknown>, string][] = [
@@ -332,8 +331,14 @@ describe("requests turned away as unsupported", () => {
       },
       IMAGES,
     ],
-    ["tools", { model: "m", messages: [{ role: "user", content: "Hi" }], tools: [{}] }, TOOLS],
-    ["a tool role", { model: "m", messages: [{ role: "tool", content: "x" }] }, TOOLS],
+    [
+      "an unknown part type",
+      {
+        model: "m",
+        messages: [{ role: "user", content: [{ type: "input_audio" }] }],
+      },
+      'Unsupported content part type: "input_audio".',
+    ],
   ];
 
   for (const [name, request, message] of CASES) {
@@ -1028,6 +1033,244 @@ describe("streaming", () => {
     const rejected = await send(port, { body: '{"stream": true' });
     expect(rejected.status).toBe(400);
     expect(rejected.headers["content-type"]).toContain("application/json");
+  });
+});
+
+describe("tool calls", () => {
+  const TOOL = {
+    type: "function",
+    function: { name: "get_weather", parameters: {} },
+  };
+  const CALLS = [
+    {
+      id: "call_1",
+      type: "function",
+      index: 0,
+      function: {
+        name: "get_weather",
+        arguments: '{"city": "Tokyo"}',
+        note: "extra",
+      },
+    },
+    {
+      id: "call_2",
+      type: "function",
+      function: { name: "search", arguments: "" },
+    },
+  ];
+
+  /** Sends a request, waits for it to be stored, and puts the reply (kind text) on it. */
+  async function exchange(extra: Record<string, unknown>, replyBody: string) {
+    const context = await startServer();
+    const pending = send(context.port, { body: chat("Hello", extra) });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    await answer(context, id, replyBody);
+    return { reply: await pending, id, context };
+  }
+
+  it("stores a request with tools, tool messages and tool calls, and waits for a reply", async () => {
+    const context = await startServer();
+    const messages = [
+      { role: "user", content: "Weather?" },
+      { role: "assistant", content: null, tool_calls: [CALLS[0]] },
+      { role: "tool", tool_call_id: "call_1", content: "sunny" },
+    ];
+    const pending = send(context.port, {
+      body: JSON.stringify({
+        model: "m",
+        messages,
+        tools: [TOOL],
+        tool_choice: "auto",
+      }),
+    });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    const stored = context.store.entries.get(id)?.request;
+    expect(stored).toMatchObject({
+      formatVersion: 2,
+      toolDefinitions: "tools",
+    });
+    expect(stored).toMatchObject({
+      originalRequest: { tools: [TOOL], tool_choice: "auto" },
+    });
+    await answer(context, id, "It is sunny.");
+    expect((await pending).json().choices[0]?.message.content).toBe("It is sunny.");
+  });
+
+  it("answers tool_calls with null content, the typed calls unchanged, and finish_reason tool_calls", async () => {
+    const { reply, id } = await exchange({ tools: [TOOL] }, JSON.stringify(CALLS));
+    expect(reply.status).toBe(200);
+    expect(reply.json()).toEqual({
+      id: `chatcmpl-${id}`,
+      object: "chat.completion",
+      created: 1791813940,
+      model: "whatever",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content: null, tool_calls: CALLS },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+  });
+
+  it("answers a text reply to a request with tools as plain text", async () => {
+    const { reply } = await exchange({ tools: [TOOL] }, "No tool is needed.");
+    expect(reply.json().choices[0]).toEqual({
+      index: 0,
+      message: { role: "assistant", content: "No tool is needed." },
+      finish_reason: "stop",
+    });
+  });
+
+  it("answers a json array of other things as text, even when the request has tools", async () => {
+    const { reply } = await exchange({ tools: [TOOL] }, '[{"id": "call_1"}]');
+    expect(reply.json().choices[0]?.message.content).toBe('[{"id": "call_1"}]');
+  });
+
+  it("answers function_call for a request that defines functions only", async () => {
+    const one = JSON.stringify([CALLS[0]]);
+    const { reply } = await exchange({ functions: [{ name: "get_weather" }] }, one);
+    expect(reply.json().choices[0]).toEqual({
+      index: 0,
+      message: {
+        role: "assistant",
+        content: null,
+        function_call: { name: "get_weather", arguments: '{"city": "Tokyo"}' },
+      },
+      finish_reason: "function_call",
+    });
+  });
+
+  it("answers tool_calls when the request defines both tools and functions", async () => {
+    const { reply } = await exchange(
+      { tools: [TOOL], functions: [{ name: "f" }] },
+      JSON.stringify(CALLS),
+    );
+    expect(reply.json().choices[0]).toMatchObject({
+      finish_reason: "tool_calls",
+    });
+  });
+
+  it("answers tool_calls for a structured output request too", async () => {
+    const { reply } = await exchange(
+      { tools: [TOOL], response_format: { type: "json_object" } },
+      JSON.stringify(CALLS),
+    );
+    expect(reply.json().choices[0]).toMatchObject({
+      finish_reason: "tool_calls",
+    });
+  });
+
+  async function streamedExchange(extra: Record<string, unknown>, replyBody: string) {
+    const context = await startServer();
+    const watching = sendWatching(context.port, chat("Hello", { stream: true, ...extra }));
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    await answer(context, id, replyBody);
+    const reply = await watching.pending;
+    return { reply, events: eventsOf(reply.text), id };
+  }
+
+  it("streams tool calls: null content, one chunk per call without extra fields, tool_calls", async () => {
+    const { reply, events, id } = await streamedExchange(
+      { tools: [TOOL], stream_options: { include_usage: true } },
+      JSON.stringify(CALLS),
+    );
+    expect(reply.headers["content-type"]).toContain("text/event-stream");
+    expect(events).toHaveLength(6);
+    expect(events[5]).toBe("[DONE]");
+    const chunks = events.slice(0, 5).map((event) => JSON.parse(event));
+    const common = {
+      id: `chatcmpl-${id}`,
+      object: "chat.completion.chunk",
+      created: 1791813940,
+      model: "whatever",
+    };
+    const call = (index: number, id: string, name: string, args: string) => ({
+      ...common,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index,
+                id,
+                type: "function",
+                function: { name, arguments: args },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    });
+    expect(chunks).toEqual([
+      {
+        ...common,
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant", content: null },
+            finish_reason: null,
+          },
+        ],
+      },
+      call(0, "call_1", "get_weather", '{"city": "Tokyo"}'),
+      call(1, "call_2", "search", ""),
+      {
+        ...common,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      },
+      {
+        ...common,
+        choices: [],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      },
+    ]);
+    expect(reply.text).not.toContain("extra");
+  });
+
+  it("streams a function call for a request that defines functions only", async () => {
+    const { events } = await streamedExchange(
+      { functions: [{ name: "get_weather" }] },
+      JSON.stringify([CALLS[0]]),
+    );
+    expect(events).toHaveLength(4);
+    expect(JSON.parse(events[1] as string).choices[0]).toEqual({
+      index: 0,
+      delta: {
+        function_call: { name: "get_weather", arguments: '{"city": "Tokyo"}' },
+      },
+      finish_reason: null,
+    });
+    expect(JSON.parse(events[2] as string).choices[0].finish_reason).toBe("function_call");
+  });
+
+  it("streams a text reply to a request with tools as text", async () => {
+    const { events } = await streamedExchange({ tools: [TOOL] }, "Hi");
+    expect(JSON.parse(events[1] as string).choices[0].delta).toEqual({
+      content: "Hi",
+    });
+    expect(JSON.parse(events[2] as string).choices[0].finish_reason).toBe("stop");
+  });
+
+  it("answers invalid_reply with a fixed reason that does not carry the typed text", async () => {
+    const bad = JSON.stringify([{ id: "secret-token", type: "secret-token", function: {} }]);
+    const { reply, context, id } = await exchange({ tools: [TOOL] }, bad);
+    expect(reply.status).toBe(502);
+    expect(reply.json().error).toMatchObject({
+      code: "invalid_reply",
+      message:
+        'The reply file was invalid: reply tool calls are not valid (call 1 needs the type "function").',
+    });
+    expect(reply.text).not.toContain("secret-token");
+    expect(context.out.join("")).not.toContain("secret-token");
+    expect(stateName(context, id)).toBe("invalid_reply");
   });
 });
 

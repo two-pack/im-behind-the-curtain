@@ -205,7 +205,6 @@ describe("the order of the checks", () => {
 });
 
 describe("requests that are turned away as unsupported", () => {
-  const TOOLS = "Tool calls are not supported. Send the request without tools.";
   const IMAGES = "Images are not supported. A human reads requests as text.";
   const ROLE_CRITIC = 'Unsupported message role: "critic".';
   const CONTENT = "Message content must be a string, null, or an array of text parts.";
@@ -227,12 +226,30 @@ describe("requests that are turned away as unsupported", () => {
     return parseChatCompletionsRequest(body({ model: "m", messages, ...extra })).ok;
   }
 
-  it("rejects a message with the role tool or function with the tools message", () => {
-    for (const role of ["tool", "function"]) {
-      expect(turnedAway([{ role, content: "x" }])).toEqual(unsupported(TOOLS));
+  function acceptedRequest(messages: unknown[], extra: Record<string, unknown> = {}) {
+    const result = parseChatCompletionsRequest(body({ model: "m", messages, ...extra }));
+    if (!result.ok) {
+      throw new Error(`expected the request to be accepted: ${result.rejection.message}`);
     }
-    expect(turnedAway([{ role: "tool" }])).toEqual(unsupported(TOOLS));
-    expect(turnedAway([{ role: "tool", content: [IMAGE_PART] }])).toEqual(unsupported(TOOLS));
+    return result.request;
+  }
+
+  it("accepts a message with the role tool or function, and keeps its tool fields", () => {
+    for (const role of ["tool", "function"]) {
+      const request = acceptedRequest([{ role, content: "x", tool_call_id: "call_1", name: "f" }]);
+      expect(request.conversation).toEqual([
+        { role, content: "x", tool_call_id: "call_1", name: "f" },
+      ]);
+    }
+    expect(
+      acceptedRequest([{ role: "tool", content: [{ type: "text", text: "a" }] }]).conversation,
+    ).toEqual([{ role: "tool", content: "a" }]);
+  });
+
+  it("still turns away a tool message that has no content, or an image", () => {
+    expect(turnedAway([{ role: "tool" }])).toEqual(invalid(CONTENT));
+    expect(turnedAway([{ role: "function", name: "f" }])).toEqual(invalid(CONTENT));
+    expect(turnedAway([{ role: "tool", content: [IMAGE_PART] }])).toEqual(unsupported(IMAGES));
   });
 
   it("treats a role that differs only in case as an unknown role", () => {
@@ -241,15 +258,42 @@ describe("requests that are turned away as unsupported", () => {
     );
   });
 
-  it("rejects an assistant message with tool_calls or function_call", () => {
+  it("accepts an assistant message with tool_calls or function_call, with or without content", () => {
     const calls = [{ id: "1", type: "function", function: { name: "f", arguments: "{}" } }];
-    expect(turnedAway([{ role: "assistant", tool_calls: calls }])).toEqual(unsupported(TOOLS));
-    expect(turnedAway([{ role: "assistant", content: "x", tool_calls: calls }])).toEqual(
-      unsupported(TOOLS),
-    );
-    expect(turnedAway([{ role: "assistant", function_call: { name: "f" } }])).toEqual(
-      unsupported(TOOLS),
-    );
+    const call = { name: "f", arguments: "{}" };
+    expect(acceptedRequest([{ role: "assistant", tool_calls: calls }]).conversation).toEqual([
+      { role: "assistant", content: "", tool_calls: calls },
+    ]);
+    expect(
+      acceptedRequest([{ role: "assistant", content: null, tool_calls: calls }]).conversation,
+    ).toEqual([{ role: "assistant", content: "", tool_calls: calls }]);
+    expect(
+      acceptedRequest([{ role: "assistant", content: "x", tool_calls: calls }]).conversation,
+    ).toEqual([{ role: "assistant", content: "x", tool_calls: calls }]);
+    expect(acceptedRequest([{ role: "assistant", function_call: call }]).conversation).toEqual([
+      { role: "assistant", content: "", function_call: call },
+    ]);
+  });
+
+  it("still turns away an assistant message with no content and no tool call", () => {
+    expect(turnedAway([{ role: "assistant" }])).toEqual(invalid(CONTENT));
+    expect(turnedAway([{ role: "assistant", tool_calls: null }])).toEqual(invalid(CONTENT));
+    expect(turnedAway([{ role: "assistant", function_call: null }])).toEqual(invalid(CONTENT));
+  });
+
+  it("stores null content as an empty string", () => {
+    expect(acceptedRequest([{ role: "user", content: null }]).conversation).toEqual([
+      { role: "user", content: "" },
+    ]);
+  });
+
+  it("stores a history whose tool_calls or function_call is malformed as it came", () => {
+    const messages = [
+      { role: "assistant", content: "", tool_calls: "not an array" },
+      { role: "assistant", content: "", tool_calls: [5, { function: 3 }] },
+      { role: "assistant", content: "", function_call: "get_weather" },
+    ];
+    expect(acceptedRequest(messages).conversation).toEqual(messages);
   });
 
   it("accepts empty or null tool fields, and tool fields on other roles", () => {
@@ -305,15 +349,45 @@ describe("requests that are turned away as unsupported", () => {
     }
   });
 
-  it("rejects tools or functions with at least one entry", () => {
+  it("accepts tools or functions with at least one entry, whatever the entry looks like", () => {
     for (const extra of [
       { tools: [{ type: "function" }] },
       { tools: [null] },
       { functions: [{ name: "f" }] },
       { functions: [5] },
     ]) {
-      expect(turnedAway(VALID.messages, extra)).toEqual(unsupported(TOOLS));
+      expect(accepted(VALID.messages, extra)).toBe(true);
     }
+  });
+
+  it("tells which definitions the request has", () => {
+    const toolDefinitionsOf = (extra: Record<string, unknown>) =>
+      acceptedRequest(VALID.messages, extra).toolDefinitions;
+    expect(toolDefinitionsOf({})).toBe("none");
+    expect(toolDefinitionsOf({ tools: [], functions: [] })).toBe("none");
+    expect(toolDefinitionsOf({ tools: null, functions: "x" })).toBe("none");
+    expect(toolDefinitionsOf({ tools: [{ type: "function" }] })).toBe("tools");
+    expect(toolDefinitionsOf({ tools: [{ type: "function" }], functions: [] })).toBe("tools");
+    expect(toolDefinitionsOf({ functions: [{ name: "f" }] })).toBe("functions");
+    expect(toolDefinitionsOf({ tools: [null], functions: [5] })).toBe("both");
+  });
+
+  it("ignores tool_choice and parallel_tool_calls, and keeps tools and functions as sent", () => {
+    const original = {
+      ...VALID,
+      tools: [
+        {
+          type: "function",
+          function: { name: "f", parameters: { type: "object" } },
+        },
+        5,
+      ],
+      functions: [{ name: "g" }],
+      tool_choice: { type: "function", function: { name: "nobody" } },
+      parallel_tool_calls: "maybe",
+    };
+    const result = parseChatCompletionsRequest(body(original));
+    expect(result.ok && result.request.originalRequest).toEqual(original);
   });
 
   it("accepts empty, null, missing or non-array tools and functions", () => {
@@ -333,33 +407,35 @@ describe("requests that are turned away as unsupported", () => {
 
   it("decides by the first failing message, and by the first failing check in it", () => {
     expect(turnedAway([{ role: "critic" }, { role: "tool" }])).toEqual(invalid(ROLE_CRITIC));
-    expect(turnedAway([{ role: "tool" }, { role: "critic" }])).toEqual(unsupported(TOOLS));
-    expect(turnedAway([{ role: "tool", content: [IMAGE_PART] }])).toEqual(unsupported(TOOLS));
+    expect(turnedAway([{ role: "tool", content: "x" }, { role: "critic" }])).toEqual(
+      invalid(ROLE_CRITIC),
+    );
+    expect(turnedAway([{ role: "tool" }, { role: "critic" }])).toEqual(invalid(CONTENT));
     expect(
       turnedAway([{ role: "assistant", content: [IMAGE_PART], tool_calls: [{ id: "1" }] }]),
-    ).toEqual(unsupported(TOOLS));
+    ).toEqual(unsupported(IMAGES));
     expect(turnedAway([{ role: "user", content: 5 }, { role: "tool" }])).toEqual(invalid(CONTENT));
     expect(
       turnedAway([{ role: "user", content: [{ type: "file" }, { text: "no type" }] }]),
     ).toEqual(unsupported('Unsupported content part type: "file".'));
   });
 
-  it("checks tools and functions after the messages and before n", () => {
+  it("turns away n of 2 or more even when the request has tools", () => {
     const withTools = { tools: [{ type: "function" }], n: 2 };
-    expect(turnedAway(VALID.messages, withTools)).toEqual(unsupported(TOOLS));
+    expect(turnedAway(VALID.messages, withTools).code).toBe("invalid_request");
     expect(turnedAway([{ role: "critic" }], withTools)).toEqual(invalid(ROLE_CRITIC));
     expect(turnedAway(VALID.messages, { n: 2 }).code).toBe("invalid_request");
   });
 
   it("reports unsupported_content as a client error, not a server error", () => {
-    expect(errorBody("unsupported_content", TOOLS)).toEqual({
-      error: { message: TOOLS, type: "invalid_request_error", code: "unsupported_content" },
+    expect(errorBody("unsupported_content", IMAGES)).toEqual({
+      error: { message: IMAGES, type: "invalid_request_error", code: "unsupported_content" },
     });
   });
 });
 
 describe("unknown fields", () => {
-  it("accepts unknown fields at the top and inside a message, and keeps only role and content", () => {
+  it("accepts unknown fields at the top and inside a message, and keeps only role, content and the tool fields", () => {
     const result = parseChatCompletionsRequest(
       body({
         model: "m",
@@ -369,7 +445,7 @@ describe("unknown fields", () => {
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.request.conversation).toEqual([{ role: "user", content: "Hi" }]);
+      expect(result.request.conversation).toEqual([{ role: "user", content: "Hi", name: "alice" }]);
       expect(result.request.originalRequest).toMatchObject({ foo: "bar" });
     }
   });
@@ -477,6 +553,79 @@ describe("building the response", () => {
       model: "whatever",
       choices: [{ index: 0, message: { role: "assistant", content: "Hi" }, finish_reason: "stop" }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+  });
+
+  const BASE = {
+    requestId: "20261009T140512123Z-a1b2c3",
+    model: "whatever",
+    content: "[]",
+    nowSeconds: 1791813940,
+  };
+
+  it("builds a text response when the reply is text, as before", () => {
+    const completion = buildCompletion({
+      ...BASE,
+      content: "Hi",
+      reply: { kind: "text" },
+    });
+    expect(completion.choices[0]).toEqual({
+      index: 0,
+      message: { role: "assistant", content: "Hi" },
+      finish_reason: "stop",
+    });
+  });
+
+  it("builds tool_calls with null content and passes the typed calls on unchanged", () => {
+    const raw = {
+      id: "call_1",
+      type: "function",
+      index: 0,
+      function: {
+        name: "get_weather",
+        arguments: '{"city": "Tokyo"}',
+        note: "extra",
+      },
+    };
+    const completion = buildCompletion({
+      ...BASE,
+      reply: {
+        kind: "tool_calls",
+        calls: [
+          {
+            raw,
+            id: "call_1",
+            name: "get_weather",
+            arguments: '{"city": "Tokyo"}',
+          },
+        ],
+      },
+    });
+    expect(completion.choices[0]).toEqual({
+      index: 0,
+      message: { role: "assistant", content: null, tool_calls: [raw] },
+      finish_reason: "tool_calls",
+    });
+    expect(completion.usage).toEqual({
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    });
+  });
+
+  it("builds function_call with null content, and no id or type", () => {
+    const completion = buildCompletion({
+      ...BASE,
+      reply: { kind: "function_call", name: "get_weather", arguments: "{}" },
+    });
+    expect(completion.choices[0]).toEqual({
+      index: 0,
+      message: {
+        role: "assistant",
+        content: null,
+        function_call: { name: "get_weather", arguments: "{}" },
+      },
+      finish_reason: "function_call",
     });
   });
 });
@@ -661,6 +810,152 @@ describe("building the stream", () => {
       (chunk.choices as { delta: { content?: string } }[]).map((choice) => choice.delta.content),
     );
     expect(contents.filter((content) => content === "a".repeat(5000))).toHaveLength(1);
+  });
+
+  const common = {
+    id: "chatcmpl-20261009T140640321Z-d4e5f6",
+    object: "chat.completion.chunk",
+    created: 1791814000,
+    model: "whatever",
+  };
+  const FIRST = {
+    id: "call_1",
+    name: "get_weather",
+    arguments: '{"city": "Tokyo"}',
+  };
+  const SECOND = { id: "call_2", name: "search", arguments: "" };
+
+  function item(call: { id: string; name: string; arguments: string }) {
+    return {
+      raw: {
+        id: call.id,
+        type: "function",
+        index: 9,
+        function: { name: call.name, arguments: call.arguments, note: "extra" },
+      },
+      ...call,
+    };
+  }
+
+  function streamedCall(call: { id: string; name: string; arguments: string }, index: number) {
+    return {
+      ...common,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index,
+                id: call.id,
+                type: "function",
+                function: { name: call.name, arguments: call.arguments },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    };
+  }
+
+  it("streams tool calls: a null content first, one chunk per call, and an empty last delta", () => {
+    const events = buildStreamEvents({
+      ...INPUT,
+      reply: { kind: "tool_calls", calls: [item(FIRST), item(SECOND)] },
+    });
+    expect(parsed(events)).toEqual([
+      {
+        ...common,
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant", content: null },
+            finish_reason: null,
+          },
+        ],
+      },
+      streamedCall(FIRST, 0),
+      streamedCall(SECOND, 1),
+      {
+        ...common,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      },
+      "[DONE]",
+    ]);
+  });
+
+  it("drops the extra fields of a call in a stream", () => {
+    const events = parsed(
+      buildStreamEvents({
+        ...INPUT,
+        reply: { kind: "tool_calls", calls: [item(FIRST)] },
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain("extra");
+    expect(JSON.stringify(events)).not.toContain('"index":9');
+  });
+
+  it("puts the usage chunk after the last chunk of a tool call stream", () => {
+    const events = parsed(
+      buildStreamEvents({
+        ...INPUT,
+        includeUsage: true,
+        reply: { kind: "tool_calls", calls: [item(FIRST)] },
+      }),
+    );
+    expect(events).toHaveLength(5);
+    expect(events[2]).toMatchObject({
+      choices: [{ finish_reason: "tool_calls" }],
+    });
+    expect(events[3]).toEqual({
+      ...common,
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    expect(events[4]).toBe("[DONE]");
+  });
+
+  it("streams a function call as one chunk and the finish reason function_call", () => {
+    const events = parsed(
+      buildStreamEvents({
+        ...INPUT,
+        reply: { kind: "function_call", name: "get_weather", arguments: "{}" },
+      }),
+    );
+    expect(events).toEqual([
+      {
+        ...common,
+        choices: [
+          {
+            index: 0,
+            delta: { role: "assistant", content: null },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        ...common,
+        choices: [
+          {
+            index: 0,
+            delta: { function_call: { name: "get_weather", arguments: "{}" } },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        ...common,
+        choices: [{ index: 0, delta: {}, finish_reason: "function_call" }],
+      },
+      "[DONE]",
+    ]);
+  });
+
+  it("streams a text reply as before when the reply is text", () => {
+    expect(buildStreamEvents({ ...INPUT, reply: { kind: "text" } })).toEqual(
+      buildStreamEvents(INPUT),
+    );
   });
 });
 

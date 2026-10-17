@@ -463,6 +463,7 @@ function respondTo(
       model: request.model,
       content: outcome.body,
       nowSeconds,
+      reply: outcome.reply,
     };
     if (request.stream) {
       respondStream(response, buildStreamEvents({ ...input, includeUsage: request.includeUsage }));

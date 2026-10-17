@@ -65,7 +65,10 @@ async function waitForServer(baseUrl: string, serve: ChildProcess, until: number
 }
 
 /** Runs `imbehind answer` with the reply on standard input and returns its exit code. */
-function answer(env: NodeJS.ProcessEnv): Promise<{ code: number | null; stderr: string }> {
+function answer(
+  env: NodeJS.ProcessEnv,
+  reply: string,
+): Promise<{ code: number | null; stderr: string }> {
   const child = spawn(process.execPath, [BIN, "answer"], {
     env,
     stdio: ["pipe", "ignore", "pipe"],
@@ -74,8 +77,35 @@ function answer(env: NodeJS.ProcessEnv): Promise<{ code: number | null; stderr: 
   child.stderr?.on("data", (chunk: Buffer) => {
     stderr += chunk.toString("utf8");
   });
-  child.stdin?.end(`${REPLY}\n`);
+  child.stdin?.end(`${reply}\n`);
   return new Promise((resolve) => child.on("close", (code) => resolve({ code, stderr })));
+}
+
+interface Choice {
+  message?: { content?: string | null; tool_calls?: unknown };
+  finish_reason?: string;
+}
+
+/** Sends one request, answers it from standard input and returns the first choice of the response. */
+async function exchange(
+  env: NodeJS.ProcessEnv,
+  baseUrl: string,
+  until: number,
+  request: Record<string, unknown>,
+  reply: string,
+): Promise<Choice | undefined> {
+  const pending = fetch(`${baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "whatever", ...request }),
+    signal: AbortSignal.timeout(Math.max(1, until - Date.now())),
+  });
+  const sent = await answer(env, reply);
+  if (sent.code !== 0) {
+    throw new Error(`answer ended with exit code ${sent.code}: ${sent.stderr.trim()}`);
+  }
+  const body = (await (await pending).json()) as { choices?: Choice[] };
+  return body.choices?.[0];
 }
 
 async function roundTrip(dir: string): Promise<void> {
@@ -89,26 +119,28 @@ async function roundTrip(dir: string): Promise<void> {
   });
   try {
     await waitForServer(baseUrl, serve, until);
-    const request = fetch(`${baseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "whatever",
-        messages: [{ role: "user", content: "Hello" }],
-      }),
-      signal: AbortSignal.timeout(Math.max(1, until - Date.now())),
-    });
-    const sent = await answer(env);
-    if (sent.code !== 0) {
-      throw new Error(`answer ended with exit code ${sent.code}: ${sent.stderr.trim()}`);
-    }
-    const response = await request;
-    const body = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    const content = body.choices?.[0]?.message?.content;
-    if (content !== REPLY) {
+    const messages = [{ role: "user", content: "Hello" }];
+    const text = await exchange(env, baseUrl, until, { messages }, REPLY);
+    if (text?.message?.content !== REPLY) {
       throw new Error(
-        `the client got ${JSON.stringify(content)} instead of ${JSON.stringify(REPLY)}`,
+        `the client got ${JSON.stringify(text?.message?.content)} instead of ${JSON.stringify(REPLY)}`,
       );
+    }
+    // A request with tools, answered with tool calls typed as the reply.
+    const tools = [{ type: "function", function: { name: "get_weather" } }];
+    const calls = [
+      {
+        id: "call_1",
+        type: "function",
+        function: { name: "get_weather", arguments: "{}" },
+      },
+    ];
+    const called = await exchange(env, baseUrl, until, { messages, tools }, JSON.stringify(calls));
+    if (
+      called?.finish_reason !== "tool_calls" ||
+      JSON.stringify(called.message?.tool_calls) !== JSON.stringify(calls)
+    ) {
+      throw new Error(`the client got ${JSON.stringify(called)} instead of the tool calls`);
     }
   } finally {
     serve.kill();

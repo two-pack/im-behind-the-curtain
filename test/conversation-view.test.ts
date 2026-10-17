@@ -4,6 +4,7 @@ import {
   conversationLines,
   escapeAllControls,
   escapeControls,
+  toolListLines,
 } from "../src/answer/conversation-view.js";
 import type { Message, Role } from "../src/model.js";
 
@@ -225,5 +226,237 @@ describe("the layout of a message", () => {
       "User:",
       "Assistant:",
     ]);
+  });
+
+  it("names the tool and function roles too", () => {
+    const lines = conversationLines([message("tool", "sunny"), message("function", "old")], PATH);
+    expect(lines).toEqual(["Tool:", "  sunny", "", "Function:", "  old", ""]);
+  });
+});
+
+describe("showing tool calls", () => {
+  const call = (name: unknown, args: unknown, id = "call_1") => ({
+    id,
+    type: "function",
+    function: { name, arguments: args },
+  });
+
+  function assistant(extra: Partial<Message>, content = ""): Message {
+    return { role: "assistant", content, ...extra };
+  }
+
+  function linesOf(item: Message): string[] {
+    return conversationLines([item], PATH);
+  }
+
+  it("shows the name and the arguments of a call, and not (empty) for an empty content", () => {
+    const item = assistant({
+      tool_calls: [call("get_weather", '{"city": "Tokyo"}')],
+    });
+    expect(linesOf(item)).toEqual([
+      "Assistant:",
+      '  tool_call: get_weather({"city": "Tokyo"})',
+      "",
+    ]);
+  });
+
+  it("shows every call of a message, after its content", () => {
+    const item = assistant(
+      {
+        tool_calls: [call("a", "1"), call("b", "2", "call_2"), call("c", "3", "call_3")],
+      },
+      "Let me check.",
+    );
+    expect(linesOf(item)).toEqual([
+      "Assistant:",
+      "  Let me check.",
+      "  tool_call: a(1)",
+      "  tool_call: b(2)",
+      "  tool_call: c(3)",
+      "",
+    ]);
+  });
+
+  it("shows a function_call", () => {
+    const item = assistant({
+      function_call: { name: "get_weather", arguments: "{}" },
+    });
+    expect(linesOf(item)).toEqual(["Assistant:", "  function_call: get_weather({})", ""]);
+  });
+
+  it("cuts the arguments to 80 characters of Unicode and adds ... when it cuts", () => {
+    // Hiragana A and I, written as code points so that this file has no Japanese in it.
+    const exact = String.fromCodePoint(0x3042).repeat(80);
+    const long = `${exact}${String.fromCodePoint(0x3044)}`;
+    const emoji = "😀".repeat(81);
+    expect(linesOf(assistant({ tool_calls: [call("f", exact)] }))[1]).toBe(
+      `  tool_call: f(${exact})`,
+    );
+    expect(linesOf(assistant({ tool_calls: [call("f", long)] }))[1]).toBe(
+      `  tool_call: f(${exact}...)`,
+    );
+    expect(linesOf(assistant({ tool_calls: [call("f", emoji)] }))[1]).toBe(
+      `  tool_call: f(${"😀".repeat(80)}...)`,
+    );
+  });
+
+  it("cuts a 10 MB argument without reading more than the first 81 code points", () => {
+    const huge = "😀".repeat(5 * 1024 * 1024);
+    const iteratorOwner = String.prototype as unknown as Record<symbol, unknown>;
+    const original = iteratorOwner[Symbol.iterator] as () => IterableIterator<string>;
+    let read = 0;
+    iteratorOwner[Symbol.iterator] = function (this: string): IterableIterator<string> {
+      const inner = original.call(this);
+      return {
+        [Symbol.iterator]() {
+          return this;
+        },
+        next() {
+          const step = inner.next();
+          if (!step.done) {
+            read += 1;
+          }
+          return step;
+        },
+      };
+    };
+    let lines: string[];
+    try {
+      lines = linesOf(assistant({ tool_calls: [call("f", huge)] }));
+    } finally {
+      iteratorOwner[Symbol.iterator] = original;
+    }
+    expect(lines[1]).toBe(`  tool_call: f(${"😀".repeat(80)}...)`);
+    expect(read).toBeLessThanOrEqual(200);
+  });
+
+  it("shows an unreadable element as (unreadable tool call), and the rest as usual", () => {
+    const item = assistant({
+      tool_calls: [
+        call("a", "1"),
+        5,
+        null,
+        { function: { arguments: "x" } },
+        { function: { name: 3 } },
+      ],
+    });
+    expect(linesOf(item)).toEqual([
+      "Assistant:",
+      "  tool_call: a(1)",
+      "  tool_call: (unreadable tool call)",
+      "  tool_call: (unreadable tool call)",
+      "  tool_call: (unreadable tool call)",
+      "  tool_call: (unreadable tool call)",
+      "",
+    ]);
+  });
+
+  it("shows tool_calls that is not an array as one unreadable element", () => {
+    for (const broken of ["not an array", 5, {}, true]) {
+      expect(linesOf(assistant({ tool_calls: broken }))).toEqual([
+        "Assistant:",
+        "  tool_call: (unreadable tool call)",
+        "",
+      ]);
+    }
+  });
+
+  it("shows a function_call that is not an object or has no name as unreadable", () => {
+    for (const broken of ["get_weather", 5, [], {}, { name: 5 }]) {
+      expect(linesOf(assistant({ function_call: broken }))).toEqual([
+        "Assistant:",
+        "  function_call: (unreadable tool call)",
+        "",
+      ]);
+    }
+  });
+
+  it("does not take null or an empty list for an unreadable call", () => {
+    expect(linesOf(assistant({ tool_calls: null, function_call: null }))).toEqual([
+      "Assistant:",
+      "  (empty)",
+      "",
+    ]);
+    expect(linesOf(assistant({ tool_calls: [] }))).toEqual(["Assistant:", "  (empty)", ""]);
+    expect(linesOf(assistant({ tool_calls: null }, "Hi"))).toEqual(["Assistant:", "  Hi", ""]);
+  });
+
+  it("shows arguments that are not a string as their JSON, and missing ones as nothing", () => {
+    expect(linesOf(assistant({ tool_calls: [call("f", { city: "Tokyo" })] }))[1]).toBe(
+      '  tool_call: f({"city":"Tokyo"})',
+    );
+    expect(linesOf(assistant({ tool_calls: [{ function: { name: "f" } }] }))[1]).toBe(
+      "  tool_call: f()",
+    );
+    expect(linesOf(assistant({ function_call: { name: "f" } }))[1]).toBe("  function_call: f()");
+  });
+
+  it("writes no control character of a name or arguments to the terminal", () => {
+    const item = assistant({
+      tool_calls: [call("a\u001b[31mb", "x\ny\u0007")],
+    });
+    const [, shown] = linesOf(item);
+    expect(shown).toBe("  tool_call: a\\x1b[31mb(x\\x0ay\\x07)");
+    expect(conversationLines([message("tool", "ok\u001b")], PATH).join("")).not.toContain("\u001b");
+  });
+
+  it("shows a tool message together with its own content only", () => {
+    const item: Message = {
+      role: "tool",
+      content: "sunny",
+      tool_call_id: "call_1",
+      name: "f",
+    };
+    expect(linesOf(item)).toEqual(["Tool:", "  sunny", ""]);
+  });
+});
+
+describe("listing the tools of a request", () => {
+  it("lists the names of tools and functions", () => {
+    const original = {
+      tools: [
+        { type: "function", function: { name: "get_weather" } },
+        { type: "function", function: { name: "search" } },
+      ],
+      functions: [{ name: "legacy" }],
+    };
+    expect(toolListLines(original)).toEqual(["Tools: get_weather, search", "Functions: legacy"]);
+  });
+
+  it("names an entry without a name as (unnamed)", () => {
+    const original = {
+      tools: [
+        null,
+        5,
+        {},
+        { function: {} },
+        { function: { name: 7 } },
+        { function: { name: "a" } },
+      ],
+      functions: [{ name: "" }, {}],
+    };
+    expect(toolListLines(original)).toEqual([
+      "Tools: (unnamed), (unnamed), (unnamed), (unnamed), (unnamed), a",
+      "Functions: (unnamed), (unnamed)",
+    ]);
+  });
+
+  it("lists nothing for empty, missing or non-array tools and functions", () => {
+    expect(toolListLines({})).toEqual([]);
+    expect(toolListLines({ tools: [], functions: [] })).toEqual([]);
+    expect(toolListLines({ tools: null, functions: "x" })).toEqual([]);
+    expect(toolListLines({ tools: {}, functions: 5 })).toEqual([]);
+  });
+
+  it("lists one of the two when only that one has entries", () => {
+    expect(toolListLines({ functions: [{ name: "legacy" }] })).toEqual(["Functions: legacy"]);
+    expect(toolListLines({ tools: [{ function: { name: "a" } }], functions: [] })).toEqual([
+      "Tools: a",
+    ]);
+  });
+
+  it("writes no control character of a name to the terminal", () => {
+    const original = { tools: [{ function: { name: "a\nb\u001b" } }] };
+    expect(toolListLines(original)).toEqual(["Tools: a\\x0ab\\x1b"]);
   });
 });

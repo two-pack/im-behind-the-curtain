@@ -53,7 +53,7 @@ Each group says whether it is a Must (the first release cannot go without it) or
   - `choices` has one item: `index` 0, `message.role` `assistant`, `message.content` the reply, `finish_reason` `stop`
   - `usage` has `prompt_tokens`, `completion_tokens` and `total_tokens`, all 0
 - **FR1.6** A request with `n` of 2 or more is refused with an error, because only one reply can be returned. A missing `n` or an `n` of 1 is accepted.
-- **FR1.7** The roles `system`, `developer`, `user` and `assistant` are accepted. Any other role is refused with an error in the error shape. Roles that belong to tools are covered by FR9.
+- **FR1.7** The roles `system`, `developer`, `user`, `assistant`, `tool` and `function` are accepted. Any other role is refused with an error in the error shape. Messages that belong to tools are covered by FR9.
 - **FR1.8** A message whose `content` is an empty string or `null` is accepted. The human sees a fixed word that says it is empty.
 
 ### FR2 Structured output replies (Must)
@@ -69,7 +69,7 @@ Each group says whether it is a Must (the first release cannot go without it) or
 - **FR3.1** For a request with `stream: true`, the server answers with `Content-Type: text/event-stream` only after the human reply is complete. Each chunk is a line `data: <JSON>` followed by an empty line, and the last line is `data: [DONE]`.
 - **FR3.2** Every chunk has `id` (the same in all chunks of a request), `object` `chat.completion.chunk`, `created` (the same in all chunks), `model` (the model name of the request), and one item in `choices` with `index` 0.
 - **FR3.3** The first chunk has the delta `{"role": "assistant", "content": ""}`. Then come one or more chunks with the delta `{"content": <reply>}`. The last chunk has the delta `{}` and `finish_reason` `stop`. Earlier chunks have `finish_reason` `null`.
-- **FR3.4** A structured output request is streamed in the same form.
+- **FR3.4** A structured output request is streamed in the same form. A reply that calls tools is streamed in the form of FR9.7 and FR9.8.
 - **FR3.5** When `stream_options.include_usage` is true, a chunk with an empty `choices` array and a `usage` of zeros is sent just before `[DONE]`.
 - **FR3.6** If the request fails before the reply (skipped, timed out and so on), the server does not start a stream. It returns a normal HTTP error in the error shape.
 
@@ -112,11 +112,19 @@ Each group says whether it is a Must (the first release cannot go without it) or
 - **FR8.2** A request with any other part that is not text (audio, a file and so on) is refused at once, with an error that names the unsupported part type.
 - **FR8.3** A refused request is not stored and not shown to the human.
 
-### FR9 Refuse tool-related requests (Must)
+### FR9 Tools and tool calls (Must)
 
-- **FR9.1** A request whose `tools` or `functions` has one or more definitions is refused at once, with an error that says tool calls are not supported.
-- **FR9.2** A request with a message that has the role `tool` or `function`, or an `assistant` message with `tool_calls` or `function_call`, is refused with the same error.
-- **FR9.3** A refused request is not stored and not shown to the human. An empty `tools` or `functions` array is accepted.
+- **FR9.1** A request whose `tools` or `functions` has one or more definitions is accepted, stored and shown to the human. The entries are not checked, and `tool_choice` and `parallel_tool_calls` are ignored. An empty `tools` or `functions` array is accepted and counts as no definition.
+- **FR9.2** A request with a message that has the role `tool` or `function`, or an `assistant` message with `tool_calls` or `function_call`, is accepted and stored. An `assistant` message that has `tool_calls` or `function_call` may leave out `content`. A `content` that is `null` or missing is stored as an empty string. The fields `tool_call_id`, `name`, `tool_calls` and `function_call` of a message are stored as received, even when their form is wrong.
+- **FR9.3** `originalRequest` holds the body that the client sent, `tools` and `functions` included, unchanged.
+- **FR9.4** `imbehind answer` shows each message with its role name, `tool` and `function` included. For an `assistant` message it shows every call of `tool_calls` and `function_call` with the function name and the arguments, cut to 80 characters of Unicode with `...` at the end when cut. A call that cannot be read is shown as `(unreadable tool call)`. It lists the names of `tools` and `functions`, with `(unnamed)` for an entry without a name, and lists nothing when both are empty or missing. Control characters are shown in a visible form (FR4.10).
+- **FR9.5** A reply is a reply that calls tools only when the request has at least one definition in `tools` or `functions` and the reply is a JSON array that is not empty and whose every element is an object with a `function` key. Any other reply is text. A reply file of `kind` `text` and one of `kind` `json` are judged the same way.
+- **FR9.6** Tool calls must fit this form: each element has a non-empty string `id` that no earlier element of the reply uses, the `type` `function`, and a `function` with a non-empty string `name` and a string `arguments`. Other fields are allowed. The content of `arguments` is not checked. Tool calls that do not fit are not sent. The human is told which call and which field does not fit, without any typed character, and types the reply again. A reply file with such tool calls ends the request as `invalid_reply`.
+- **FR9.7** A reply that calls tools is returned for a request that is not streamed with `message.role` `assistant`, `message.content` `null`, `message.tool_calls` the array as typed, and `finish_reason` `tool_calls`. For a streamed request the chunks come in this order: a first chunk with the delta `{"role": "assistant", "content": null}`; one chunk for each call with a `tool_calls` delta that holds `index` (from 0), `id`, `type` and `function` with `name` and the whole `arguments`; and a last chunk with the delta `{}` and `finish_reason` `tool_calls`. Earlier chunks have `finish_reason` `null`. Fields other than these are dropped from a stream. The usage chunk of FR3.5 stays just before `[DONE]`.
+- **FR9.8** When a request defines `functions` and no `tools`, the reply must have exactly one call, in the form of FR9.6. It is returned with `message.content` `null`, `message.function_call` `{"name": ..., "arguments": ...}` and `finish_reason` `function_call`, without `id` and `type`. A stream has one chunk with the delta `{"function_call": {...}}` and a last chunk with `finish_reason` `function_call`. When a request defines both, the form of FR9.7 is used.
+- **FR9.9** For a structured output request (FR2.1) that also has tool definitions, a reply that calls tools is accepted and returned as in FR9.7. Any other reply must still be valid JSON (FR2.3).
+- **FR9.10** A reply from standard input (FR4.12) is judged by the same rules. If its tool calls do not fit, nothing is sent and the command exits with a failure code.
+- **FR9.11** The screen, standard input, the check of a reply file and the response use the same code to tell tool calls from text and to check them, so they cannot disagree.
 
 ### FR10 Storage directory and deletion of old files (Must)
 
@@ -142,7 +150,7 @@ Each group says whether it is a Must (the first release cannot go without it) or
 ### FR12 Documents and README (Must)
 
 - **FR12.1** The requirements and the specification are kept in `docs/`, in English.
-- **FR12.3** `README.md` and `README.ja.md` describe the first release. They name only the Chat Completions format and the model list, and they say that parts that are not text and tool-related requests are refused.
+- **FR12.3** `README.md` and `README.ja.md` describe the first release. They name only the Chat Completions format and the model list. They say that parts that are not text are refused and that `tools`, `tool_calls` and `function_call` are supported.
 - **FR12.4** The documents say that the wait time of the client must be raised, and give an example of how.
 - **FR12.5** The continuous integration has a job that builds, tests, formats and checks, and starts `imbehind serve` and makes one round trip.
 
@@ -155,10 +163,10 @@ An automated test installs the package that is about to be published from a loca
 
 ### FR14 Request and reply files (Should)
 
-- **FR14.1** The formats of the request file and the reply file are documented in `docs/storage-format.md`. Every file carries a field for the format version.
+- **FR14.1** The formats of the request file and the reply file are documented in `docs/storage-format.md`. Every file carries a field for the format version. The `formatVersion` of `request.json` is 2, and the version of the other files is 1. The server reads request files of both versions 1 and 2, and a reader that knows only version 1 treats a version 2 request file as a file it does not understand.
 - **FR14.2** If a user puts a reply file in the documented form into the storage directory, the server treats it like a reply from `imbehind answer` and returns it to the client.
 - **FR14.3** The documents tell how to write a reply file safely: write it under another name, then give it its final name when it is complete. The server reads only the final name.
-- **FR14.4** A reply file is not valid if it is not JSON, lacks a required field, has an unknown format version, holds a non-JSON reply for a JSON request, or is larger than 10 MB. The client gets an error that says the reply was not valid and why, and the state becomes `invalid_reply`.
+- **FR14.4** A reply file is not valid if it is not JSON, lacks a required field, has an unknown format version, holds a non-JSON reply for a JSON request, holds tool calls that do not fit (FR9.6), or is larger than 10 MB. The client gets an error that says the reply was not valid and why, and the state becomes `invalid_reply`.
 - **FR14.5** If both `imbehind answer` and a written file reply to the same request, only the one that arrived first is used.
 
 ## Non-functional requirements
@@ -168,7 +176,7 @@ An automated test installs the package that is about to be published from a loca
 | NFR1 | Runs on Linux, macOS and Windows. WSL counts as Linux. | All tests pass in CI on the three operating systems |
 | NFR2 | All tests are automated and run with the standard command of the language. | One standard command in a fresh clone runs every test |
 | NFR3 | New code has at least 80% line coverage. | CI measures coverage and fails below 80% |
-| NFR4 | The round trip is tested with a plain HTTP tool and with the official OpenAI SDK. | Both round trips are automated tests that pass in CI. The SDK tests cover replies with and without streaming: the SDK reads the response without an error and the reply text can be taken out |
+| NFR4 | The round trip is tested with a plain HTTP tool and with the official OpenAI SDK. | Both round trips are automated tests that pass in CI. The SDK tests cover replies with and without streaming: the SDK reads the response without an error and the reply text can be taken out. They also cover requests with tools: the SDK reads `tool_calls` and `function_call`, and builds the `tool_calls` of a stream |
 | NFR5 | CI checks tests, coverage, formatting and static checks on pull requests to `main` and on pushes to `main`. | A failure in any of them makes the CI result fail |
 | NFR6 | A request is shown by `imbehind answer` within 2 seconds of its arrival. | A test measures it on one machine |
 | NFR7 | The client receives the response within 2 seconds of the reply being sent. | A test measures it on one machine |
@@ -193,7 +201,9 @@ An automated test installs the package that is about to be published from a loca
 |---|---|
 | Anthropic Messages format | Planned as the first addition after the first release |
 | OpenAI Responses format | A later release |
-| Replies that call tools | A candidate for a later release. The first release refuses tool-related requests |
+| Behavior that depends on `tool_choice` or `parallel_tool_calls` | Will not be built. They are ignored |
+| Checking the form of the entries of `tools` and `functions`, or that `arguments` is JSON | Will not be built |
+| A response with both text and `tool_calls` | Will not be built |
 | A reply written after the human has seen an image | A candidate for a later release. The first release refuses images |
 | Merging retried requests that have the same content | A candidate for a later release |
 | Checking a structured reply against the requested shape | Will not be built |

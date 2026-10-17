@@ -37,7 +37,8 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 - Chat Completions形式の `POST /v1/chat/completions`。文章のメッセージ、構造化出力のためのJSONの返答、ストリーミングに対応します。モデル名とAPIキーは何でも構いません。
 - `GET /v1/models`。
-- 文章でない部品（画像、音声、ファイル）と、道具に関わる依頼（`tools`、`functions`、`tool_calls`）は、`code` が `unsupported_content` の `400` エラーで断ります。これらは保存しません。
+- ツール: `tools` や `functions` を持つ依頼と、`tool_calls`、`function_call`、ロール `tool` と `function` を持つメッセージは、保存して表示します。ツールを呼ばせたいときは、返答としてツール呼び出しのJSON配列を打ち込みます。クライアントには `tool_calls`（`functions` だけを送ったときは `function_call`）が返り、ストリームでも同じです。それ以外の返答は文章として返します。書き方は[仕様書](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md)（英語）にあります。
+- 文章でない部品（画像、音声、ファイル）は、`code` が `unsupported_content` の `400` エラーで断ります。保存しません。
 
 サーバーは、返答を既定で30分待ちます。クライアントのタイムアウトを同じかそれ以上にし、自動の再試行は切ってください。そうしないと、クライアントが先にあきらめて、同じ依頼をもう一度送ることがあります。[仕様書](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md)（英語）に、公式SDKでの設定例、すべての設定、サーバーが書くファイルがあります。
 
