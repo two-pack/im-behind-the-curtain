@@ -1653,6 +1653,183 @@ describe("reading the whole standard input", () => {
   });
 });
 
+describe("requests that have tools", () => {
+  const TOOL_ORIGINAL = {
+    model: "whatever",
+    tools: [{ type: "function", function: { name: "get_weather" } }],
+    functions: [{ name: "legacy" }],
+  };
+  const WITH_TOOLS: Partial<ConversationRequest> = {
+    toolDefinitions: "both",
+    originalRequest: TOOL_ORIGINAL,
+  };
+  const HINT =
+    'To call a tool, type a JSON array of calls: [{"id": "call_1", "type": "function", "function": {"name": "...", "arguments": "..."}}]';
+  const CALLS = JSON.stringify([
+    {
+      id: "call_1",
+      type: "function",
+      function: { name: "get_weather", arguments: "{}" },
+    },
+  ]);
+  const BAD_CALLS = JSON.stringify([
+    {
+      id: "secret-token",
+      type: "secret-token",
+      function: { name: "f", arguments: "{}" },
+    },
+  ]);
+  const AGAIN = "Type your reply again. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).";
+  const JSON_AGAIN = "Type the JSON again. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).";
+
+  it("shows the tool roles, the tool calls, the list of tools and how to call one", async () => {
+    const t = setup([]);
+    t.addWaiting(
+      ID,
+      [
+        { role: "user", content: "Weather?" },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "c1",
+              type: "function",
+              function: { name: "get_weather", arguments: "{}" },
+            },
+          ],
+        },
+        { role: "tool", content: "sunny", tool_call_id: "c1" },
+      ],
+      WITH_TOOLS,
+    );
+    const running = t.start();
+    await settle();
+    expect(t.stdout().slice(5)).toEqual([
+      "User:",
+      "  Weather?",
+      "",
+      "Assistant:",
+      "  tool_call: get_weather({})",
+      "",
+      "Tool:",
+      "  sunny",
+      "",
+      "Tools: get_weather",
+      "Functions: legacy",
+      "",
+      HINT,
+      PROMPT,
+    ]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("shows no list and no hint for a request without definitions", async () => {
+    const t = setup([]);
+    t.addWaiting();
+    const running = t.start();
+    await settle();
+    expect(t.raw()).not.toContain("Tools:");
+    expect(t.raw()).not.toContain("Functions:");
+    expect(t.raw()).not.toContain("To call a tool");
+    t.controller.abort();
+    await running;
+  });
+
+  it("sends tool calls that fit, as typed, with the kind text", async () => {
+    const t = setup([CALLS]);
+    t.addWaiting(ID, undefined, WITH_TOOLS);
+    const running = t.start();
+    await settle();
+    expect(t.replyBody()).toBe(CALLS);
+    expect(t.replyKind()).toBe("text");
+    t.controller.abort();
+    await running;
+  });
+
+  it("sends a text reply to a request with tools", async () => {
+    const t = setup(["No tool is needed."]);
+    t.addWaiting(ID, undefined, WITH_TOOLS);
+    const running = t.start();
+    await settle();
+    expect(t.replyBody()).toBe("No tool is needed.");
+    t.controller.abort();
+    await running;
+  });
+
+  it("does not send tool calls that do not fit, says which call and field, and asks again", async () => {
+    const t = setup([BAD_CALLS, CALLS]);
+    t.addWaiting(ID, undefined, WITH_TOOLS);
+    const running = t.start();
+    await settle();
+    const lines = t.stdout();
+    const at = lines.indexOf(
+      'Not sent: your tool calls are not valid (call 1 needs the type "function").',
+    );
+    expect(at).toBeGreaterThan(0);
+    expect(lines[at + 1]).toBe(AGAIN);
+    expect(lines.filter((line) => line.startsWith("--- Request"))).toHaveLength(1);
+    expect(t.reader.calls).toBe(2);
+    expect(t.replyBody()).toBe(CALLS);
+    expect(t.raw()).not.toContain("secret-token");
+    t.controller.abort();
+    await running;
+  });
+
+  it("asks for the JSON again when a json request gets tool calls that do not fit", async () => {
+    const t = setup([BAD_CALLS, CALLS]);
+    t.addWaiting(ID, undefined, { ...WITH_TOOLS, replyKind: "json" });
+    const running = t.start();
+    await settle();
+    const lines = t.stdout();
+    const at = lines.indexOf(
+      'Not sent: your tool calls are not valid (call 1 needs the type "function").',
+    );
+    expect(lines[at + 1]).toBe(JSON_AGAIN);
+    expect(t.replyBody()).toBe(CALLS);
+    expect(t.replyKind()).toBe("json");
+    t.controller.abort();
+    await running;
+  });
+
+  it("still wants JSON for a json request that has tools", async () => {
+    const t = setup(["plain words", CALLS]);
+    t.addWaiting(ID, undefined, { ...WITH_TOOLS, replyKind: "json" });
+    const running = t.start();
+    await settle();
+    expect(
+      t.stdout().some((line) => line.startsWith("Not sent: your reply is not valid JSON")),
+    ).toBe(true);
+    expect(t.replyBody()).toBe(CALLS);
+    t.controller.abort();
+    await running;
+  });
+
+  it("refuses several calls for a request that defines functions only", async () => {
+    const two = JSON.stringify([
+      { id: "a", type: "function", function: { name: "f", arguments: "" } },
+      { id: "b", type: "function", function: { name: "f", arguments: "" } },
+    ]);
+    const t = setup([two, CALLS]);
+    t.addWaiting(ID, undefined, {
+      toolDefinitions: "functions",
+      originalRequest: {
+        model: "whatever",
+        functions: [{ name: "get_weather" }],
+      },
+    });
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).toContain(
+      "Not sent: your tool calls are not valid (this request defines functions only, so exactly one call is allowed).",
+    );
+    expect(t.replyBody()).toBe(CALLS);
+    t.controller.abort();
+    await running;
+  });
+});
+
 describe("replying from standard input", () => {
   const T = RECEIVED_AT;
   const stdinSetup = (stdin: StdinStep[], store?: FakeStore) =>
@@ -1711,6 +1888,80 @@ describe("replying from standard input", () => {
     expect(t.replyBody()).toBe("line one\nline two");
     t.controller.abort();
     await running;
+  });
+
+  describe("tool calls", () => {
+    const CALLS = JSON.stringify([
+      {
+        id: "call_1",
+        type: "function",
+        function: { name: "f", arguments: "{}" },
+      },
+    ]);
+    const BAD_CALLS = JSON.stringify([
+      {
+        id: "secret-token",
+        type: "secret-token",
+        function: { name: "f", arguments: "{}" },
+      },
+    ]);
+    const WITH_TOOLS: Partial<ConversationRequest> = {
+      toolDefinitions: "tools",
+      originalRequest: {
+        model: "whatever",
+        tools: [{ function: { name: "f" } }],
+      },
+    };
+
+    it("sends tool calls that fit", async () => {
+      const t = stdinSetup([`${CALLS}\n`]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], WITH_TOOLS);
+      const { running } = await placed(t);
+      expect(t.replyBody()).toBe(CALLS);
+      await t.serveBroker.pollOnce();
+      await t.clock.advance(500);
+      expect(await running).toBe(0);
+      expect(t.stdout()).toEqual(["Sent reply to request a1b2c3."]);
+    });
+
+    it("sends nothing and ends with exit 1 for tool calls that do not fit", async () => {
+      const t = stdinSetup([`${BAD_CALLS}\n`]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], WITH_TOOLS);
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([
+        `Error: the tool calls are not valid (call 1 needs the type "function"). ${tailOfNotSent}`,
+      ]);
+      expect(t.raw()).not.toContain("secret-token");
+      expect(t.replyBody()).toBeUndefined();
+      expect(t.store.count("placeReply")).toBe(0);
+    });
+
+    it("sends the same text as a plain reply when the request has no definitions", async () => {
+      const t = stdinSetup([`${BAD_CALLS}\n`]);
+      t.addWaiting();
+      const { running } = await placed(t);
+      expect(t.replyBody()).toBe(BAD_CALLS);
+      t.controller.abort();
+      await running;
+    });
+
+    it("refuses several calls for a request that defines functions only", async () => {
+      const two = JSON.stringify([
+        { id: "a", type: "function", function: { name: "f", arguments: "" } },
+        { id: "b", type: "function", function: { name: "f", arguments: "" } },
+      ]);
+      const t = stdinSetup([two]);
+      t.addWaiting(ID, [{ role: "user", content: "Hello" }], {
+        toolDefinitions: "functions",
+        originalRequest: { model: "whatever", functions: [{ name: "f" }] },
+      });
+      const { running } = await placed(t);
+      expect(await running).toBe(1);
+      expect(t.stderr()).toEqual([
+        `Error: the tool calls are not valid (this request defines functions only, so exactly one call is allowed). ${tailOfNotSent}`,
+      ]);
+    });
   });
 
   it("sends a reply with a json kind to a request that asks for json", async () => {

@@ -204,7 +204,7 @@ interface CurlReply {
   status: number;
   body: {
     error?: { message: string; type: string; code: string };
-    choices?: { message: { content: string } }[];
+    choices?: { message: { content: string | null }; finish_reason?: string }[];
   };
 }
 
@@ -309,7 +309,6 @@ describe("requests that are turned away or let through", () => {
 });
 
 describe("requests that are turned away as unsupported", () => {
-  const TOOLS = "Tool calls are not supported. Send the request without tools.";
   const IMAGES = "Images are not supported. A human reads requests as text.";
   const USER = { role: "user", content: "Hello" };
 
@@ -343,29 +342,19 @@ describe("requests that are turned away as unsupported", () => {
     );
   });
 
-  it("refuses tools", async () => {
-    await refusedAs({ messages: [USER], tools: [{ type: "function" }] }, TOOLS);
-  });
-
-  it("refuses a message with the role tool", async () => {
-    await refusedAs(
-      { messages: [USER, { role: "tool", content: "42", tool_call_id: "1" }] },
-      TOOLS,
+  it("refuses n of 2 or more even when the request has tools", async () => {
+    const serve = await startServe();
+    const reply = await curlPost(
+      serve.baseUrl,
+      JSON.stringify({
+        model: "m",
+        messages: [USER],
+        tools: [{ type: "function" }],
+        n: 2,
+      }),
     );
-  });
-
-  it("refuses functions and a message with the role function", async () => {
-    await refusedAs({ messages: [USER], functions: [{ name: "f" }] }, TOOLS);
-    await refusedAs({ messages: [{ role: "function", name: "f", content: "42" }] }, TOOLS);
-  });
-
-  it("refuses an assistant message with tool_calls or function_call", async () => {
-    const calls = [{ id: "1", type: "function", function: { name: "f", arguments: "{}" } }];
-    await refusedAs({ messages: [USER, { role: "assistant", tool_calls: calls }] }, TOOLS);
-    await refusedAs(
-      { messages: [USER, { role: "assistant", function_call: { name: "f" } }] },
-      TOOLS,
-    );
+    expect(reply.status).toBe(400);
+    expect(reply.body.error).toMatchObject({ code: "invalid_request" });
   });
 
   it("accepts empty tools and gets the reply", async () => {
@@ -377,6 +366,122 @@ describe("requests that are turned away as unsupported", () => {
     );
     expect(reply.status).toBe(200);
     await waitFor(() => answer.stdout().includes("Sent."));
+  });
+});
+
+describe("a round trip with tools, sent with curl", () => {
+  const USER = { role: "user", content: "What is the weather in Tokyo?" };
+  const TOOL = {
+    type: "function",
+    function: { name: "get_weather", parameters: { type: "object" } },
+  };
+  const CALLS = [
+    {
+      id: "call_1",
+      type: "function",
+      index: 0,
+      function: {
+        name: "get_weather",
+        arguments: '{"city": "Tokyo"}',
+        note: "extra",
+      },
+    },
+  ];
+
+  it("stores the tools as sent, shows them, and returns the typed tool_calls", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader([JSON.stringify(CALLS)]));
+    const original = {
+      model: "m",
+      messages: [USER],
+      tools: [TOOL],
+      tool_choice: "auto",
+    };
+    const reply = await curlPost(serve.baseUrl, JSON.stringify(original));
+
+    expect(reply.status).toBe(200);
+    expect(reply.body.choices?.[0]).toEqual({
+      index: 0,
+      message: { role: "assistant", content: null, tool_calls: CALLS },
+      finish_reason: "tool_calls",
+    });
+    await waitFor(() => answer.stdout().includes("Sent."));
+    expect(answer.stdout()).toContain("Tools: get_weather\n");
+    const id = await waitForRequestId(serve.storageDir);
+    const stored = JSON.parse(
+      await readFile(path.join(serve.storageDir, "requests", id, "request.json"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(stored).toMatchObject({
+      formatVersion: 2,
+      toolDefinitions: "tools",
+    });
+    expect(stored.originalRequest).toEqual(original);
+  });
+
+  it("returns a typed text reply to a request with tools as text", async () => {
+    const serve = await startServe();
+    startAnswer(serve.storageDir, new ScriptedReader(["It is sunny."]));
+    const reply = await curlPost(
+      serve.baseUrl,
+      JSON.stringify({ model: "m", messages: [USER], tools: [TOOL] }),
+    );
+    expect(reply.body.choices?.[0]).toEqual({
+      index: 0,
+      message: { role: "assistant", content: "It is sunny." },
+      finish_reason: "stop",
+    });
+  });
+
+  it("accepts the history of a tool call: the screen shows the call and the tool message", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["It is sunny."]));
+    const messages = [
+      USER,
+      { role: "assistant", content: null, tool_calls: CALLS },
+      { role: "tool", tool_call_id: "call_1", content: "sunny, 24 C" },
+    ];
+    const reply = await curlPost(serve.baseUrl, JSON.stringify({ model: "m", messages }));
+    expect(reply.status).toBe(200);
+    await waitFor(() => answer.stdout().includes("Sent."));
+    expect(answer.stdout()).toContain('tool_call: get_weather({"city": "Tokyo"})');
+    expect(answer.stdout()).toContain("Tool:\n  sunny, 24 C\n");
+  });
+
+  it("returns function_call for a request that defines functions only", async () => {
+    const serve = await startServe();
+    startAnswer(serve.storageDir, new ScriptedReader([JSON.stringify(CALLS)]));
+    const reply = await curlPost(
+      serve.baseUrl,
+      JSON.stringify({
+        model: "m",
+        messages: [USER],
+        functions: [{ name: "get_weather" }],
+      }),
+    );
+    expect(reply.body.choices?.[0]).toEqual({
+      index: 0,
+      message: {
+        role: "assistant",
+        content: null,
+        function_call: { name: "get_weather", arguments: '{"city": "Tokyo"}' },
+      },
+      finish_reason: "function_call",
+    });
+  });
+
+  it("asks the human to type again for tool calls that do not fit, and sends nothing before", async () => {
+    const serve = await startServe();
+    const bad = JSON.stringify([{ id: "", type: "function", function: { name: "f" } }]);
+    const answer = startAnswer(serve.storageDir, new ScriptedReader([bad, JSON.stringify(CALLS)]));
+    const reply = await curlPost(
+      serve.baseUrl,
+      JSON.stringify({ model: "m", messages: [USER], tools: [TOOL] }),
+    );
+    expect(reply.status).toBe(200);
+    await waitFor(() => answer.stdout().includes("Sent."));
+    expect(answer.stdout()).toContain(
+      "Not sent: your tool calls are not valid (call 1 needs a non-empty string id).",
+    );
   });
 });
 

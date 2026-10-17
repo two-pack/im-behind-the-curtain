@@ -124,7 +124,17 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
     await expect(
       client.chat.completions.create({
         model: "whatever",
-        messages: [{ role: "tool", content: "x", tool_call_id: "1" }],
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,AAAA" },
+              },
+            ],
+          },
+        ],
       }),
     ).rejects.toMatchObject({
       status: 400,
@@ -151,6 +161,173 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
     expect(completion.choices[0]?.message.content).toBe("Hi");
     await waitFor(() => answer.stdout().includes("Sent."));
     expect(answer.stdout()).toContain("User:\n  Hello, world\n");
+  });
+});
+
+describe("tools with the official OpenAI SDK", () => {
+  const TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "get_weather",
+        parameters: {
+          type: "object",
+          properties: { city: { type: "string" } },
+        },
+      },
+    },
+  ];
+  const MESSAGES = [{ role: "user" as const, content: "What is the weather in Tokyo?" }];
+  const CALLS = [
+    {
+      id: "call_1",
+      type: "function",
+      function: {
+        name: "get_weather",
+        arguments: '{"city": "Tokyo"}',
+        note: "extra",
+      },
+    },
+    {
+      id: "call_2",
+      type: "function",
+      function: { name: "get_time", arguments: "{}" },
+    },
+  ];
+
+  function client(baseUrl: string): OpenAI {
+    return new OpenAI({
+      apiKey: "k",
+      baseURL: `${baseUrl}/v1`,
+      maxRetries: 0,
+      timeout: 20_000,
+    });
+  }
+
+  it("reads tool_calls from a response that is not streamed", async () => {
+    const serve = await startServe();
+    startAnswer(serve.storageDir, new ScriptedReader([JSON.stringify(CALLS)]));
+    const completion = await client(serve.baseUrl).chat.completions.create({
+      model: "whatever",
+      messages: MESSAGES,
+      tools: TOOLS,
+    });
+    const choice = completion.choices[0];
+    expect(choice?.finish_reason).toBe("tool_calls");
+    expect(choice?.message.content).toBeNull();
+    expect(choice?.message.tool_calls).toEqual(CALLS);
+  });
+
+  it("builds the tool_calls of a streamed response, and drops the extra fields", async () => {
+    const serve = await startServe();
+    startAnswer(serve.storageDir, new ScriptedReader([JSON.stringify(CALLS)]));
+    const stream = client(serve.baseUrl).chat.completions.stream({
+      model: "whatever",
+      messages: MESSAGES,
+      tools: TOOLS,
+    });
+    const completion = await stream.finalChatCompletion();
+    const choice = completion.choices[0];
+    expect(choice?.finish_reason).toBe("tool_calls");
+    expect(choice?.message.content).toBeNull();
+    expect(choice?.message.tool_calls).toEqual([
+      {
+        id: "call_1",
+        type: "function",
+        function: { name: "get_weather", arguments: '{"city": "Tokyo"}' },
+      },
+      {
+        id: "call_2",
+        type: "function",
+        function: { name: "get_time", arguments: "{}" },
+      },
+    ]);
+  });
+
+  it("sends one chunk per call with an index, an id, a name and the whole arguments", async () => {
+    const serve = await startServe();
+    startAnswer(serve.storageDir, new ScriptedReader([JSON.stringify(CALLS)]));
+    const stream = await client(serve.baseUrl).chat.completions.create({
+      model: "whatever",
+      messages: MESSAGES,
+      tools: TOOLS,
+      stream: true,
+    });
+    const deltas = [];
+    let finish: string | null | undefined;
+    for await (const chunk of stream) {
+      deltas.push(chunk.choices[0]?.delta);
+      finish = chunk.choices[0]?.finish_reason ?? finish;
+    }
+    expect(deltas[0]).toMatchObject({ role: "assistant", content: null });
+    expect(deltas[1]?.tool_calls).toEqual([
+      {
+        index: 0,
+        id: "call_1",
+        type: "function",
+        function: { name: "get_weather", arguments: '{"city": "Tokyo"}' },
+      },
+    ]);
+    expect(deltas[2]?.tool_calls?.[0]).toMatchObject({
+      index: 1,
+      id: "call_2",
+    });
+    expect(finish).toBe("tool_calls");
+  });
+
+  it("reads function_call from a request that defines functions only, also streamed", async () => {
+    const serve = await startServe();
+    const one = JSON.stringify([CALLS[0]]);
+    startAnswer(serve.storageDir, new ScriptedReader([one, one]));
+    const completion = await client(serve.baseUrl).chat.completions.create({
+      model: "whatever",
+      messages: MESSAGES,
+      functions: [{ name: "get_weather" }],
+    });
+    expect(completion.choices[0]?.finish_reason).toBe("function_call");
+    expect(completion.choices[0]?.message.function_call).toEqual({
+      name: "get_weather",
+      arguments: '{"city": "Tokyo"}',
+    });
+    const streamed = await client(serve.baseUrl)
+      .chat.completions.stream({
+        model: "whatever",
+        messages: MESSAGES,
+        functions: [{ name: "get_weather" }],
+      })
+      .finalChatCompletion();
+    expect(streamed.choices[0]?.message.function_call).toEqual({
+      name: "get_weather",
+      arguments: '{"city": "Tokyo"}',
+    });
+  });
+
+  it("sends the result of a tool back and gets a text answer", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["It is sunny."]));
+    const completion = await client(serve.baseUrl).chat.completions.create({
+      model: "whatever",
+      tools: TOOLS,
+      messages: [
+        ...MESSAGES,
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call_1",
+              type: "function",
+              function: { name: "get_weather", arguments: '{"city": "Tokyo"}' },
+            },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "sunny, 24 C" },
+      ],
+    });
+    expect(completion.choices[0]?.message.content).toBe("It is sunny.");
+    expect(completion.choices[0]?.finish_reason).toBe("stop");
+    await waitFor(() => answer.stdout().includes("Sent."));
+    expect(answer.stdout()).toContain("Tool:\n  sunny, 24 C\n");
   });
 });
 

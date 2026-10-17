@@ -128,7 +128,12 @@ describe("accepting a reply", () => {
     expect(entry?.files.has("reply.json")).toBe(false);
     expect(entry?.files.get("reply.accepted.json")).toBe(replyBytes("Hi"));
     expect(entry?.state).toMatchObject({ state: "replied", endedAt: clock.now().toISOString() });
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(events).toEqual([{ type: "replied", id }]);
   });
 
@@ -139,7 +144,12 @@ describe("accepting a reply", () => {
     store.putFile(id, "reply.json", replyBytes("second"));
     await broker.pollOnce();
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "first" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "first",
+      reply: { kind: "text" },
+    });
     expect(store.entries.get(id)?.files.has("reply.json")).toBe(false);
     expect(store.count("acceptReply")).toBe(0);
   });
@@ -151,7 +161,12 @@ describe("accepting a reply", () => {
     await broker.pollOnce();
     await settle();
     expect(stateOf(store, id)).toBe("replied");
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(store.count("acceptReply")).toBe(0);
     expect(store.count("removeReply")).toBe(0);
   });
@@ -164,7 +179,12 @@ describe("accepting a reply", () => {
     await broker.pollOnce();
     await settle();
     expect(stateOf(store, id)).toBe("waiting");
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(events).toEqual([
       { type: "replied", id },
       { type: "error", id, reason: "write failed" },
@@ -188,7 +208,12 @@ describe("accepting a reply", () => {
     await broker.pollOnce();
     await settle();
     expect(stateOf(store, id)).toBe("replied");
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(store.entries.get(id)?.files.has("reply.json")).toBe(false);
   });
 
@@ -257,7 +282,12 @@ describe("failures in reading and writing", () => {
     expect(events).toEqual([{ type: "error", id, reason: "read failed" }]);
     await broker.pollOnce();
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
   });
 
   it("reports a failed listing without an id and keeps polling", async () => {
@@ -641,7 +671,12 @@ describe("json replies", () => {
     expect(entry?.files.has("reply.json")).toBe(false);
     expect(entry?.files.has("reply.accepted.json")).toBe(true);
     expect(stateOf(store, id)).toBe("replied");
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body,
+      reply: { kind: "text" },
+    });
     expect(events).toEqual([{ type: "replied", id }]);
   });
 
@@ -740,7 +775,12 @@ describe("how a request ends", () => {
     ]);
     await broker.pollOnce();
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "fixed" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "fixed",
+      reply: { kind: "text" },
+    });
     expect(events.at(-2)).toEqual({ type: "replied", id });
     expect(events.at(-1)).toEqual({ type: "recovered", id });
   });
@@ -995,7 +1035,12 @@ describe("only the first ending counts", () => {
     release();
     await polling;
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(stateOf(store, id)).toBe("replied");
     expect(store.count("writeState")).toBe(1);
     expect(events).toEqual([{ type: "replied", id }]);
@@ -1045,7 +1090,12 @@ describe("only the first ending counts", () => {
     release();
     await polling;
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(stateOf(store, id)).toBe("replied");
     expect(store.count("writeState")).toBe(1);
   });
@@ -1107,7 +1157,12 @@ describe("only the first ending counts", () => {
     expect(events).toEqual([{ type: "error", id, reason: "link failed" }]);
     await broker.pollOnce();
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(events.slice(1)).toEqual([
       { type: "replied", id },
       { type: "recovered", id },
@@ -1187,7 +1242,12 @@ describe("only the first ending counts", () => {
     store.putFile(id, "reply.json", replyBytes("Hi"));
     store.fail("removeReply");
     await broker.pollOnce();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(stateOf(store, id)).toBe("waiting");
     await broker.pollOnce();
     expect(stateOf(store, id)).toBe("replied");
@@ -1271,7 +1331,12 @@ describe("checking a reply file before it is accepted (BR27)", () => {
     await polling;
     await settle();
     expect(store.entries.get(id)?.files.get("reply.accepted.json")).toBe(replyBytes("first"));
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "first" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "first",
+      reply: { kind: "text" },
+    });
     expect(stateOf(store, id)).toBe("replied");
   });
 
@@ -1290,7 +1355,12 @@ describe("checking a reply file before it is accepted (BR27)", () => {
     store.putFile(id, "reply.json", `﻿${replyBytes("Hi")}`);
     await broker.pollOnce();
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "Hi" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hi",
+      reply: { kind: "text" },
+    });
     expect(store.entries.get(id)?.files.get("reply.accepted.json")).toBe(`﻿${replyBytes("Hi")}`);
   });
 
@@ -1304,7 +1374,12 @@ describe("checking a reply file before it is accepted (BR27)", () => {
     );
     await broker.pollOnce();
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "a\r\nb\n\n" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "a\r\nb\n\n",
+      reply: { kind: "text" },
+    });
   });
 
   it("accepts a skip reply written by hand as skipped, for a json request too", async () => {
@@ -1337,6 +1412,7 @@ describe("checking a reply file before it is accepted (BR27)", () => {
       kind: "replied",
       id: textRequest.id,
       body: "not json",
+      reply: { kind: "text" },
     });
     expect(jsonOne.outcomeOf()).toEqual({
       kind: "invalid_reply",
@@ -1488,7 +1564,12 @@ describe("ending a request with an invalid reply file (BR28)", () => {
     store.putFile(id, "reply.json", "{broken");
     await broker.pollOnce();
     await settle();
-    expect(outcomeOf()).toEqual({ kind: "replied", id, body: "first" });
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "first",
+      reply: { kind: "text" },
+    });
     expect(events).toEqual([{ type: "replied", id }]);
     expect(store.entries.get(id)?.state).toMatchObject({ state: "replied" });
   });
@@ -1895,5 +1976,176 @@ describe("what the sweeper learns about a request", () => {
     expect(await broker.listRequestIds()).toEqual([ID_1]);
     expect(await broker.removeRequest(ID_1)).toBe("removed");
     expect(await broker.listRequestIds()).toEqual([]);
+  });
+});
+
+describe("replies that call tools", () => {
+  const withTools: ConversationRequest = {
+    ...request,
+    toolDefinitions: "tools",
+  };
+  const CALLS = JSON.stringify([
+    {
+      id: "call_1",
+      type: "function",
+      function: { name: "f", arguments: "{}" },
+    },
+  ]);
+  const BAD_CALLS = JSON.stringify([{ id: "call_1", type: "function", function: { name: "f" } }]);
+  const BAD_REASON = "reply tool calls are not valid (call 1 needs function.arguments as a string)";
+
+  async function submitWith(broker: ExchangeBroker, conversation: ConversationRequest) {
+    const submitted = await broker.submit(conversation);
+    let outcome: ExchangeOutcome | undefined;
+    submitted.outcome.then((value) => {
+      outcome = value;
+    });
+    return { id: submitted.id, outcomeOf: () => outcome };
+  }
+
+  it("offers the check of a reply with the definitions of the request", () => {
+    const { broker } = setup();
+    expect(broker.checkReply("text", BAD_CALLS, "tools")).toEqual({
+      ok: false,
+      reason: "call 1 needs function.arguments as a string",
+      problem: "tool_calls",
+    });
+    expect(broker.checkReply("text", BAD_CALLS, "none")).toEqual({ ok: true });
+    expect(broker.checkReply("text", CALLS, "tools")).toEqual({ ok: true });
+  });
+
+  it("accepts calls that fit and passes the body on as typed", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWith(broker, withTools);
+    store.putFile(id, "reply.json", replyBytes(CALLS));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: CALLS,
+      reply: {
+        kind: "tool_calls",
+        calls: [
+          {
+            raw: JSON.parse(CALLS)[0],
+            id: "call_1",
+            name: "f",
+            arguments: "{}",
+          },
+        ],
+      },
+    });
+    expect(stateOf(store, id)).toBe("replied");
+  });
+
+  it("classifies a reply once, as a function call for a request with functions only", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWith(broker, {
+      ...request,
+      toolDefinitions: "functions",
+    });
+    store.putFile(id, "reply.json", replyBytes(CALLS));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: CALLS,
+      reply: { kind: "function_call", name: "f", arguments: "{}" },
+    });
+  });
+
+  it("classifies plain text as text even when the request has tools", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWith(broker, withTools);
+    store.putFile(id, "reply.json", replyBytes("Hello"));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hello",
+      reply: { kind: "text" },
+    });
+  });
+
+  it("classifies a reply that was accepted earlier with the definitions of the request", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWith(broker, withTools);
+    store.putFile(id, "reply.accepted.json", replyBytes(CALLS));
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("replied");
+    expect(outcomeOf()).toMatchObject({
+      kind: "replied",
+      id,
+      reply: { kind: "tool_calls" },
+    });
+  });
+
+  it("ends the request as invalid_reply with a fixed reason when the calls do not fit", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWith(broker, withTools);
+    store.putFile(id, "reply.json", replyBytes(BAD_CALLS));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "invalid_reply",
+      id,
+      reason: BAD_REASON,
+    });
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(events).toEqual([{ type: "invalid_reply", id, reason: BAD_REASON }]);
+    expect(store.entries.get(id)?.files.has("reply.json")).toBe(true);
+  });
+
+  it("takes the same body as text when the request has no definitions", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWith(broker, request);
+    store.putFile(id, "reply.json", replyBytes(BAD_CALLS));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: BAD_CALLS,
+      reply: { kind: "text" },
+    });
+  });
+
+  it("reads the definitions from request.json for a request this run did not save", async () => {
+    const { store, broker, events } = setup();
+    const id = "20260101T000000000Z-abcdef";
+    store.addRaw(id, {
+      request: createRequestFile(id, NOW, withTools),
+      state: createStateFile(id, "waiting", NOW, null),
+    });
+    store.putFile(id, "reply.json", replyBytes(BAD_CALLS));
+    await broker.pollOnce();
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(events).toEqual([{ type: "invalid_reply", id, reason: BAD_REASON }]);
+  });
+
+  it("checks the calls of a json request too, and still wants JSON", async () => {
+    const { store, broker } = setup();
+    const jsonWithTools: ConversationRequest = {
+      ...withTools,
+      replyKind: "json",
+    };
+    const fits = await submitWith(broker, jsonWithTools);
+    const notFit = await submitWith(broker, jsonWithTools);
+    const text = await submitWith(broker, jsonWithTools);
+    store.putFile(fits.id, "reply.json", replyBytes(CALLS));
+    store.putFile(notFit.id, "reply.json", replyBytes(BAD_CALLS));
+    store.putFile(text.id, "reply.json", replyBytes("Hello"));
+    await broker.pollOnce();
+    await settle();
+    expect(fits.outcomeOf()).toMatchObject({ kind: "replied" });
+    expect(notFit.outcomeOf()).toMatchObject({
+      kind: "invalid_reply",
+      reason: BAD_REASON,
+    });
+    expect(text.outcomeOf()).toMatchObject({ kind: "invalid_reply" });
   });
 });

@@ -1,6 +1,6 @@
 # Storage format
 
-`imbehind serve` keeps every request as a small folder of JSON files. The files are the only state: nothing is hidden in memory that a restart would lose. Any tool can read them, and a tool can also write a reply, instead of using `imbehind answer`. This document is the contract for that. It describes format version 1.
+`imbehind serve` keeps every request as a small folder of JSON files. The files are the only state: nothing is hidden in memory that a restart would lose. Any tool can read them, and a tool can also write a reply, instead of using `imbehind answer`. This document is the contract for that. It describes format version 2 of `request.json` and format version 1 of the other files.
 
 `imbehind path` prints the storage directory (see the specification for the default and for how to choose it).
 
@@ -25,13 +25,18 @@
 
 ## Format version
 
-Every file has the field `formatVersion`, which is the whole number `1` in this version. A reader must treat a file with another `formatVersion` as a file it does not understand. `imbehind serve` does so for `reply.json` (reason `reply file has an unknown format version`).
+Every file has the field `formatVersion`, a whole number. The `formatVersion` of `request.json` is `2`. The `formatVersion` of `state.json` and `reply.json` stay at `1`. A reader must treat a file with a `formatVersion` it does not know as a file it does not understand. `imbehind serve` does so for `reply.json` (reason `reply file has an unknown format version`).
+
+- This version reads both `1` and `2` for `request.json`. A request file of version 1, written by an older version, has no `toolDefinitions` field, and it is read as if `toolDefinitions` were `none`.
+- This version writes version 2 for every request, not only for requests that have tools.
+- An older version of `imbehind` that knows only version 1 treats a version 2 `request.json` as a file it cannot read: its `imbehind answer` does not list these requests, and its `imbehind serve` reports them as unreadable. Any tool of yours that reads `request.json` must accept `2` as well as `1`.
+- A version 2 file whose `toolDefinitions` is missing or is not one of the four values below is not readable.
 
 ## request.json
 
 | Field | Type | Meaning |
 |---|---|---|
-| `formatVersion` | number | `1` |
+| `formatVersion` | number | `2`. A file written by an older version has `1`. |
 | `id` | string | The request id. |
 | `receivedAt` | string | When the request arrived, as an ISO 8601 UTC time. |
 | `format` | string | The API format of the request. `chat.completions`. |
@@ -40,8 +45,13 @@ Every file has the field `formatVersion`, which is the whole number `1` in this 
 | `requiredShape` | object or null | The JSON Schema the client asked for, or `null`. It is shown to the human and is not checked. |
 | `stream` | boolean | The client asked for a stream. |
 | `includeUsage` | boolean | The client asked for the usage chunk of a stream. |
-| `conversation` | array | The messages, each `{ "role": "system" \| "developer" \| "user" \| "assistant", "content": string }`. |
-| `originalRequest` | object | The body the client sent, as it arrived. |
+| `toolDefinitions` | string | Which definitions the request carries: `tools`, `functions`, `both` or `none`. An empty array counts as no definition. It decides how a reply is told from tool calls. |
+| `conversation` | array | The messages, each `{ "role": "system" \| "developer" \| "user" \| "assistant" \| "tool" \| "function", "content": string }` and, only when the client sent them, the tool fields below. |
+| `originalRequest` | object | The body the client sent, as it arrived, `tools` and `functions` included. |
+
+### Tool fields of a message
+
+A message in `conversation` can also have `tool_call_id`, `name`, `tool_calls` and `function_call`. A field is there only when the client sent it, and its value is stored exactly as received, with whatever type the client used. Nothing is checked or changed, so a form that is wrong (a `tool_calls` that is not an array, a `function_call` that is a string) is stored too, and `imbehind answer` shows it as `(unreadable tool call)`. A `content` that was `null` or missing is stored as an empty string. A message that the client sent without these fields has only `role` and `content`.
 
 ## state.json
 
@@ -78,10 +88,27 @@ A request leaves `waiting` once and then never changes. The first thing that hap
 
 - `text` and `json` both return `body` to the client as the content of the reply, exactly as written. Nothing is trimmed or changed.
 - If the request has `replyKind` `json`, the `body` must be JSON text (RFC 8259: any top-level value, white space allowed around the tokens, and no comments, trailing commas, `NaN` or `Infinity`). This is checked for `text` and `json` alike, because it is the request that asks for JSON. If the request has `replyKind` `text`, the `body` is not checked, even for `kind` `json`.
+- A reply that calls tools is a `body` that is a JSON array of calls, and it is written in the same file as any reply. See "Replies that call tools".
 - `skip` ends the request without a reply. The client receives the error `skipped_by_human`, whatever the `replyKind` is.
 - Unknown fields are ignored.
 - The size limit is 10485760 bytes for the whole file. A file over the limit is refused without being read.
 - The file must be UTF-8. One byte order mark at the start is allowed.
+
+## Replies that call tools
+
+There is no new `kind`. The `body` of a `text` or `json` reply is read as tool calls only when the request has `toolDefinitions` other than `none`, and the `body` is a JSON array that is not empty and whose every element is an object with a `function` key. Any other `body` is text, so a near miss (an array with one element that has no `function` key) is returned to the client as text.
+
+```json
+{
+  "formatVersion": 1,
+  "kind": "text",
+  "body": "[{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Tokyo\\\"}\"}}]"
+}
+```
+
+Each call needs a non-empty string `id` that no earlier call of the reply uses, the `type` `function`, and a `function` with a non-empty string `name` and a string `arguments`. Other fields are allowed. `arguments` is not checked to be JSON. If `toolDefinitions` is `functions`, the array must have exactly one call. The checks apply to `text` and `json` replies alike, and a `skip` reply has no body to check.
+
+For a request with `replyKind` `json`, a reply that calls tools passes check 7 (it is JSON) and is then judged by check 8.
 
 ## Writing a reply file
 
@@ -121,10 +148,13 @@ When a waiting request has a `reply.json` and no `reply.accepted.json`, `imbehin
 | 5 | `kind` is not `text`, `json` or `skip`. | `reply file has an unknown kind` |
 | 6 | `body` is empty for `text` or `json`, or not empty for `skip`. | `reply file has a body that does not fit its kind` |
 | 7 | The request asks for JSON, `kind` is not `skip`, and `body` is not JSON text. | `reply body is not valid JSON (<detail>)` |
+| 8 | `kind` is not `skip`, and `body` calls tools (see "Replies that call tools") but the calls do not fit. | `reply tool calls are not valid (<detail>)` |
 
 The `<detail>` of check 7 is one of `unexpected end of input at line <n>`, `unexpected character at line <n>, column <m>` or `extra data after the JSON value at line <n>, column <m>`. It tells where reading stopped and never repeats the text.
 
-A file that passes all seven checks is accepted. The exact bytes that were checked are kept as `reply.accepted.json`. If a tool changes `reply.json` after the check, the change is not used.
+The `<detail>` of check 8 is one of `call <n> needs a non-empty string id`, `call <n> has the same id as an earlier call`, `call <n> needs the type "function"`, `call <n> needs function.name as a non-empty string`, `call <n> needs function.arguments as a string`, or `this request defines functions only, so exactly one call is allowed`. `<n>` counts the calls from 1, and the first call that does not fit decides. It never repeats the text either.
+
+A file that passes all eight checks is accepted. The exact bytes that were checked are kept as `reply.accepted.json`. If a tool changes `reply.json` after the check, the change is not used.
 
 ## When the reply file is not valid
 

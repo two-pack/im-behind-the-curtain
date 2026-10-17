@@ -4,6 +4,8 @@ import {
   createRequestFile,
   createStateFile,
   FORMAT_VERSION,
+  INVALID_REPLY_REASONS,
+  isInvalidReplyReason,
   parseReplyFile,
   parseRequestFile,
   parseStateFile,
@@ -30,7 +32,7 @@ function validRequestJson(): Record<string, unknown> {
 }
 
 describe("writing files", () => {
-  it("writes formatVersion 1 into every file it creates", () => {
+  it("writes formatVersion 2 into a request file and 1 into the other files it creates", () => {
     const request = createRequestFile(ID, RECEIVED_AT, {
       format: "chat.completions",
       model: "m",
@@ -44,7 +46,8 @@ describe("writing files", () => {
     const waiting = createStateFile(ID, "waiting", RECEIVED_AT, null);
     const reply = createReplyFile("Hi", RECEIVED_AT);
     expect(FORMAT_VERSION).toBe(1);
-    expect(request.formatVersion).toBe(1);
+    expect(request.formatVersion).toBe(2);
+    expect(request.toolDefinitions).toBe("none");
     expect(waiting.formatVersion).toBe(1);
     expect(reply.formatVersion).toBe(1);
   });
@@ -90,8 +93,9 @@ describe("reading a request file", () => {
     }
   });
 
-  it("treats a file whose formatVersion is not 1 as unreadable", () => {
-    expect(parseRequestFile({ ...validRequestJson(), formatVersion: 2 }).kind).toBe("unreadable");
+  it("treats a file whose formatVersion is not 1 or 2 as unreadable", () => {
+    expect(parseRequestFile({ ...validRequestJson(), formatVersion: 3 }).kind).toBe("unreadable");
+    expect(parseRequestFile({ ...validRequestJson(), formatVersion: "2" }).kind).toBe("unreadable");
     const withoutVersion = validRequestJson();
     delete withoutVersion.formatVersion;
     expect(parseRequestFile(withoutVersion).kind).toBe("unreadable");
@@ -242,5 +246,154 @@ describe("reading a reply file", () => {
     expect(parseReplyFile({ formatVersion: 2, kind: "text", body: "x" }).kind).toBe("unreadable");
     expect(parseReplyFile({ formatVersion: 1, kind: "text", body: 5 }).kind).toBe("unreadable");
     expect(parseReplyFile("nope").kind).toBe("unreadable");
+  });
+});
+
+describe("tool messages in the conversation", () => {
+  const CALLS = [
+    {
+      id: "call_1",
+      type: "function",
+      function: { name: "f", arguments: "{}" },
+    },
+  ];
+  const WIDE_CONVERSATION = [
+    { role: "system", content: "s" },
+    { role: "user", content: "u", name: "alice" },
+    { role: "assistant", content: "", tool_calls: CALLS },
+    { role: "tool", content: "result", tool_call_id: "call_1", name: "f" },
+    {
+      role: "assistant",
+      content: "",
+      function_call: { name: "f", arguments: "{}" },
+    },
+    { role: "function", content: "old result", name: "f" },
+  ];
+
+  function requestJson(extra: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...validRequestJson(),
+      formatVersion: 2,
+      toolDefinitions: "none",
+      ...extra,
+    };
+  }
+
+  function conversationOf(json: Record<string, unknown>): unknown {
+    const parsed = parseRequestFile(json);
+    return parsed.kind === "ok" ? parsed.value.conversation : parsed.kind;
+  }
+
+  it("reads and writes the tool roles and the tool fields without changing them", () => {
+    expect(conversationOf(requestJson({ conversation: WIDE_CONVERSATION }))).toEqual(
+      WIDE_CONVERSATION,
+    );
+  });
+
+  it("keeps a message without tool fields as role and content only", () => {
+    const [first] = conversationOf(requestJson({ conversation: WIDE_CONVERSATION })) as object[];
+    expect(Object.keys(first ?? {})).toEqual(["role", "content"]);
+  });
+
+  it("keeps a broken tool_calls or function_call as it is, and does not treat the file as unreadable", () => {
+    const broken = [
+      { role: "assistant", content: "", tool_calls: "not an array" },
+      { role: "assistant", content: "", tool_calls: [5, null] },
+      { role: "assistant", content: "", function_call: "get_weather" },
+      {
+        role: "assistant",
+        content: "x",
+        tool_calls: null,
+        function_call: null,
+      },
+    ];
+    expect(conversationOf(requestJson({ conversation: broken }))).toEqual(broken);
+  });
+
+  it("round-trips a request file written with tool messages", () => {
+    const file = createRequestFile(ID, RECEIVED_AT, {
+      format: "chat.completions",
+      model: "m",
+      replyKind: "text",
+      requiredShape: null,
+      stream: false,
+      includeUsage: false,
+      conversation: [{ role: "tool", content: "r", tool_call_id: "call_1" }],
+      originalRequest: { model: "m", tools: [{ type: "function" }] },
+      toolDefinitions: "tools",
+    });
+    const parsed = parseRequestFile(JSON.parse(serializeFile(file)));
+    expect(parsed.kind === "ok" && parsed.value).toEqual(file);
+  });
+});
+
+describe("the request file version and toolDefinitions", () => {
+  function toolDefinitionsOf(json: Record<string, unknown>): unknown {
+    const parsed = parseRequestFile(json);
+    return parsed.kind === "ok" ? parsed.value.toolDefinitions : parsed.kind;
+  }
+
+  it("reads a version 1 file and takes its toolDefinitions as none", () => {
+    expect(toolDefinitionsOf(validRequestJson())).toBe("none");
+    expect(toolDefinitionsOf({ ...validRequestJson(), toolDefinitions: "tools" })).toBe("none");
+  });
+
+  it("reads the four values of a version 2 file", () => {
+    for (const value of ["tools", "functions", "both", "none"]) {
+      expect(
+        toolDefinitionsOf({
+          ...validRequestJson(),
+          formatVersion: 2,
+          toolDefinitions: value,
+        }),
+      ).toBe(value);
+    }
+  });
+
+  it("treats a version 2 file with a missing or unknown toolDefinitions as unreadable", () => {
+    expect(toolDefinitionsOf({ ...validRequestJson(), formatVersion: 2 })).toBe("unreadable");
+    expect(
+      toolDefinitionsOf({
+        ...validRequestJson(),
+        formatVersion: 2,
+        toolDefinitions: "all",
+      }),
+    ).toBe("unreadable");
+  });
+
+  it("keeps the version of a version 1 file as 1 and writes 2 for every new file", () => {
+    const parsed = parseRequestFile(validRequestJson());
+    expect(parsed.kind === "ok" && parsed.value.formatVersion).toBe(1);
+  });
+
+  it("does not use version 2 for the state file or the reply file", () => {
+    expect(parseStateFile({ formatVersion: 2, state: "waiting" }).kind).toBe("unreadable");
+    expect(createReplyFile("x", RECEIVED_AT).formatVersion).toBe(1);
+  });
+});
+
+describe("the fixed reasons for tool calls", () => {
+  it("recognizes the reason of a reply file whose tool calls are not valid", () => {
+    expect(
+      isInvalidReplyReason(
+        INVALID_REPLY_REASONS.badToolCalls("call 2 needs a non-empty string id"),
+      ),
+    ).toBe(true);
+    expect(
+      isInvalidReplyReason(
+        INVALID_REPLY_REASONS.badToolCalls(
+          "this request defines functions only, so exactly one call is allowed",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not recognize a reason that carries other text", () => {
+    expect(
+      isInvalidReplyReason(INVALID_REPLY_REASONS.badToolCalls("call 2 needs secret-token")),
+    ).toBe(false);
+    expect(
+      isInvalidReplyReason("reply tool calls are not valid (call x needs a non-empty string id)"),
+    ).toBe(false);
   });
 });

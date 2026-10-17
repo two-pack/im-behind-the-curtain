@@ -15,9 +15,14 @@ import type { Clock } from "../clock.js";
 import { EXIT, IoFailure } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger, Screen } from "../log.js";
-import { MAX_FILE_BYTES, type ReplyFileKind, type ReplyKind } from "../model.js";
+import { MAX_FILE_BYTES, type ReplyFileKind, type ReplyKind, type RequestFile } from "../model.js";
 import { type AnswerInputMode, endOfInputHint } from "../platform.js";
-import { conversationLines, escapeAllControls, escapeControls } from "./conversation-view.js";
+import {
+  conversationLines,
+  escapeAllControls,
+  escapeControls,
+  toolListLines,
+} from "./conversation-view.js";
 
 /** Every sentence the screen shows, in one place. */
 const TEXT = {
@@ -47,6 +52,9 @@ const TEXT = {
   requiredShape: "Required shape:",
   anyJson: "Any JSON value is accepted as long as it is valid JSON.",
   notJson: (reason: string) => `Not sent: your reply is not valid JSON (${reason}).`,
+  badToolCalls: (reason: string) => `Not sent: your tool calls are not valid (${reason}).`,
+  toolHint:
+    'To call a tool, type a JSON array of calls: [{"id": "call_1", "type": "function", "function": {"name": "...", "arguments": "..."}}]',
   serveNotRunning: (dir: string) => `Error: imbehind serve is not running for ${dir}.`,
   startServe: "Start it with: imbehind serve",
   cannotRead: (dir: string, detail: string) => `Error: cannot read ${dir}: ${detail}.`,
@@ -61,6 +69,8 @@ const STDIN_TEXT = {
   empty: "Error: the reply is empty. Nothing was sent; the request is still waiting.",
   notJson: (reason: string) =>
     `Error: the reply is not valid JSON (${reason}). Nothing was sent; the request is still waiting.`,
+  badToolCalls: (reason: string) =>
+    `Error: the tool calls are not valid (${reason}). Nothing was sent; the request is still waiting.`,
   tooLarge:
     "Error: the reply is larger than 10 MB. Nothing was sent; the request is still waiting.",
   cancelled: (id: string) =>
@@ -604,16 +614,18 @@ export class AnswerConsole {
   }
 
   /** The checks of a reply from standard input, in order: empty, json, the size of the file. */
-  private stdinProblem(kind: ReplyKind, text: string): string | undefined {
+  private stdinProblem(request: RequestFile, text: string): string | undefined {
     const { broker } = this.options;
     if (text === "") {
       return STDIN_TEXT.empty;
     }
-    const check = broker.checkReply(kind, text);
+    const check = broker.checkReply(request.replyKind, text, request.toolDefinitions);
     if (!check.ok) {
-      return STDIN_TEXT.notJson(check.reason);
+      return check.problem === "tool_calls"
+        ? STDIN_TEXT.badToolCalls(check.reason)
+        : STDIN_TEXT.notJson(check.reason);
     }
-    return broker.replyFitsLimit(text, kind) ? undefined : STDIN_TEXT.tooLarge;
+    return broker.replyFitsLimit(text, request.replyKind) ? undefined : STDIN_TEXT.tooLarge;
   }
 
   private async sendFromStdin(
@@ -623,7 +635,7 @@ export class AnswerConsole {
   ): Promise<number> {
     const kind = target.request.replyKind;
     const text = normalizeReply(raw);
-    const problem = this.stdinProblem(kind, text);
+    const problem = this.stdinProblem(target.request, text);
     if (problem !== undefined) {
       return this.stdinFailure(problem);
     }
@@ -695,10 +707,26 @@ export class AnswerConsole {
     for (const line of conversationLines(request.conversation, path)) {
       screen.line(line);
     }
+    this.showToolList(request.originalRequest);
     if (request.replyKind === "json") {
       this.showRequiredShape(request.requiredShape);
     }
+    if (request.toolDefinitions !== "none") {
+      screen.line(TEXT.toolHint);
+    }
     screen.line(request.replyKind === "json" ? TEXT.jsonPrompt() : TEXT.prompt());
+  }
+
+  /** The names of the tools and functions the request defines, then an empty line; or nothing. */
+  private showToolList(original: Record<string, unknown>): void {
+    const lines = toolListLines(original);
+    if (lines.length === 0) {
+      return;
+    }
+    for (const line of lines) {
+      this.options.screen.line(line);
+    }
+    this.options.screen.line("");
   }
 
   /** The shape the client asked for, nested by two spaces, or the note that any JSON will do. */
@@ -743,7 +771,7 @@ export class AnswerConsole {
       screen.line(TEXT.emptyReply);
       return undefined;
     }
-    return this.accepts(item.request.replyKind, text) ? { kind: "text", text } : undefined;
+    return this.accepts(item.request, text) ? { kind: "text", text } : undefined;
   }
 
   /** Nothing was typed: asks whether to skip. Only y or Y skips. */
@@ -864,12 +892,17 @@ export class AnswerConsole {
    * The check of the reply before it is placed. A reply that fails is not sent: the
    * reason is shown, and the same request asks again.
    */
-  private accepts(kind: ReplyKind, text: string): boolean {
+  private accepts(request: RequestFile, text: string): boolean {
     const { broker, screen } = this.options;
-    const check = broker.checkReply(kind, text);
+    const kind = request.replyKind;
+    const check = broker.checkReply(kind, text, request.toolDefinitions);
     if (!check.ok) {
-      screen.line(TEXT.notJson(check.reason));
-      screen.line(TEXT.jsonAgain());
+      screen.line(
+        check.problem === "tool_calls"
+          ? TEXT.badToolCalls(check.reason)
+          : TEXT.notJson(check.reason),
+      );
+      screen.line(kind === "json" ? TEXT.jsonAgain() : TEXT.again());
       return false;
     }
     // The size of the written file comes after the check of the json.

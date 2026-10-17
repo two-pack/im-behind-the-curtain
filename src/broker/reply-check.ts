@@ -12,7 +12,14 @@
  * overflow the call stack.
  */
 
-export type ReplyCheck = { ok: true } | { ok: false; reason: string };
+import type { ToolDefinitions } from "../model.js";
+import { classifyReply } from "../tool-calls.js";
+
+/**
+ * `problem` is set only when the reply is tool calls that do not fit. A reason that is not JSON
+ * has none. The reason is a fixed phrase either way.
+ */
+export type ReplyCheck = { ok: true } | { ok: false; reason: string; problem?: "tool_calls" };
 
 /** Where reading stopped: `end` is the end of the input, the others point at a character. */
 interface Failure {
@@ -243,13 +250,21 @@ function describeFailure(text: string, failure: Failure): string {
   return `extra data after the JSON value at line ${line}, column ${column}`;
 }
 
-/** Checks a reply of the given kind. A text reply is always accepted. */
-export function checkReply(kind: "text" | "json", body: string): ReplyCheck {
-  if (kind === "text") {
-    return { ok: true };
+/**
+ * Checks a reply of the given kind. A json reply must be JSON. A reply that calls tools, for a
+ * request with these definitions, must fit the tool call shape; other text is always accepted.
+ */
+export function checkReply(
+  kind: "text" | "json",
+  body: string,
+  toolDefinitions: ToolDefinitions = "none",
+): ReplyCheck {
+  const failure = kind === "json" ? findFailure(body) : undefined;
+  if (failure !== undefined) {
+    return { ok: false, reason: describeFailure(body, failure) };
   }
-  const failure = findFailure(body);
-  return failure === undefined
-    ? { ok: true }
-    : { ok: false, reason: describeFailure(body, failure) };
+  const classified = classifyReply(body, toolDefinitions);
+  return classified.kind === "invalid"
+    ? { ok: false, reason: classified.problem, problem: "tool_calls" }
+    : { ok: true };
 }

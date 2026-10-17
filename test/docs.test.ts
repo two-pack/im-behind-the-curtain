@@ -51,9 +51,35 @@ describe("docs/storage-format.md", () => {
     }
   });
 
-  it("says that the format version of all three files is 1", () => {
+  it("says that the format version of request.json is 2 and that of the other two files is 1", () => {
     expect(text).toContain("`formatVersion`");
-    expect(text).toMatch(/formatVersion`[^\n]*\b1\b/);
+    expect(text).toMatch(/`formatVersion` of `request\.json` is `2`/);
+    expect(text).toMatch(/`state\.json` and `reply\.json` (stay|are) (at )?(version )?`?1`?/);
+  });
+
+  it("says that a reader of version 1 must treat a version 2 request file as one it does not understand", () => {
+    expect(text).toMatch(/version 1[^\n]*\b(older|earlier)\b|\b(older|earlier)\b[^\n]*version 1/i);
+    expect(text).toMatch(/every request/i);
+    expect(text).toMatch(/reads? (both )?`?1`? and `?2`?|versions? 1 and 2/i);
+  });
+
+  it("describes toolDefinitions and the tool fields of a message", () => {
+    expect(text).toContain("`toolDefinitions`");
+    for (const value of ["tools", "functions", "both", "none"]) {
+      expect(text, value).toContain(`\`${value}\``);
+    }
+    for (const field of ["tool_call_id", "tool_calls", "function_call"]) {
+      expect(text, field).toContain(`\`${field}\``);
+    }
+    expect(text).toMatch(/as (it was )?received|exactly as (the client )?sent/i);
+    expect(text).toContain("(unreadable tool call)");
+  });
+
+  it("describes the shape of a reply that calls tools and its reason", () => {
+    expect(text).toContain("`tool_calls`");
+    expect(text).toContain(INVALID_REPLY_REASONS.badToolCalls("<detail>"));
+    expect(text).toMatch(/function.*key/i);
+    expect(text).toMatch(/exactly one/i);
   });
 
   it("names the states a request can end in, invalid_reply included", () => {
@@ -91,6 +117,7 @@ describe("docs/storage-format.md", () => {
       INVALID_REPLY_REASONS.unknownKind,
       INVALID_REPLY_REASONS.bodyMismatch,
       INVALID_REPLY_REASONS.bodyNotJson("<detail>"),
+      INVALID_REPLY_REASONS.badToolCalls("<detail>"),
     ];
     let from = 0;
     for (const reason of reasons) {
@@ -187,16 +214,28 @@ describe("README.md and README.ja.md", () => {
     }
   });
 
-  it("tell that parts that are not text and tool-related requests are refused with unsupported_content", async () => {
+  it("tell that parts that are not text are refused with unsupported_content", async () => {
     for (const name of READMES) {
-      const text = await document(name);
-      expect(text, name).toContain("unsupported_content");
-      expect(text, name).toContain("tool_calls");
-      expect(text, name).toMatch(/`tools`/);
+      expect(await document(name), name).toContain("unsupported_content");
     }
     expect(await document("README.md")).toMatch(/image, audio, a file/);
     // The Japanese word for "image", written as code points.
     expect(await document("README.ja.md")).toContain(String.fromCodePoint(0x753b, 0x50cf));
+  });
+
+  it("tell that tools and tool calls are supported, and no longer say they are refused", async () => {
+    for (const name of READMES) {
+      const text = await document(name);
+      expect(text, name).toContain("tool_calls");
+      expect(text, name).toMatch(/`tools`/);
+      expect(text, name).toContain("function_call");
+      expect(text, name).not.toContain("tool-related requests");
+    }
+    expect(await document("README.md")).not.toMatch(/\btools?\b[^.\n]*\b(are|is) refused/i);
+    // The Japanese words for "tool-related requests", written as code points.
+    expect(await document("README.ja.md")).not.toContain(
+      String.fromCodePoint(0x9053, 0x5177, 0x306b, 0x95a2, 0x308f, 0x308b, 0x4f9d, 0x983c),
+    );
   });
 
   it("do not say that images are saved", async () => {
@@ -245,6 +284,54 @@ describe("README.md and README.ja.md", () => {
     expect(japanese.map((line) => line.split(" ")[0])).toEqual(
       english.map((line) => line.split(" ")[0]),
     );
+  });
+});
+
+describe("docs/requirements.md and docs/specification.md, tools", () => {
+  it("accepts tool-related requests in the requirements instead of refusing them", async () => {
+    const text = await document("docs", "requirements.md");
+    expect(text).toMatch(/^### FR9 Tools and tool calls \(Must\)$/m);
+    expect(text).not.toContain("Refuse tool-related requests");
+    expect(text).not.toContain("tool-related requests are refused");
+    expect(text).not.toMatch(/Replies that call tools \| A candidate/);
+    for (const id of ["FR9.1", "FR9.5", "FR9.9"]) {
+      expect(text, id).toContain(id);
+    }
+    for (const word of ["tool_calls", "function_call", "finish_reason", "formatVersion"]) {
+      expect(text, word).toContain(word);
+    }
+  });
+
+  it("lists in the refusal table only what is still refused", async () => {
+    const text = await document("docs", "specification.md");
+    const row = text.split("\n").find((line) => line.includes("| 400 | `unsupported_content` |"));
+    expect(row).toBeDefined();
+    expect(row).toContain("image");
+    expect(row).not.toMatch(/tools|functions|tool_calls|function_call/);
+    expect(text).not.toContain("Tool calls are not supported");
+    expect(text).not.toContain("Empty `tools` and `functions` arrays are accepted.");
+  });
+
+  it("tells how to type tool calls, what the stream looks like, and what the screen shows", async () => {
+    const text = await document("docs", "specification.md");
+    expect(text).toMatch(/^### Tool calls$/m);
+    const section = text.split(/^### Tool calls$/m)[1]?.split(/^### /m)[0] ?? "";
+    for (const word of [
+      "tool_calls",
+      "function_call",
+      "finish_reason",
+      "`function`",
+      "(unreadable tool call)",
+      "(unnamed)",
+      "tool_choice",
+      "parallel_tool_calls",
+      "index",
+      "80",
+    ]) {
+      expect(section, word).toContain(word);
+    }
+    expect(section).toMatch(/as text/i);
+    expect(section).toMatch(/dropped|left out|not (sent|included)/i);
   });
 });
 

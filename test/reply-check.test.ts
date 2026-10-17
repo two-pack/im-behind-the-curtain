@@ -159,3 +159,59 @@ describe("agreeing with the standard JSON reader (RFC 8259)", () => {
     }
   });
 });
+
+describe("a reply that calls tools", () => {
+  const CALLS = JSON.stringify([
+    {
+      id: "call_1",
+      type: "function",
+      function: { name: "f", arguments: "{}" },
+    },
+  ]);
+  const BAD_CALLS = JSON.stringify([
+    { id: "call_1", type: "function", function: { name: "f", arguments: {} } },
+  ]);
+
+  it("accepts calls that fit, for a text reply and for a json reply", () => {
+    for (const kind of ["text", "json"] as const) {
+      expect(checkReply(kind, CALLS, "tools")).toEqual({ ok: true });
+      expect(checkReply(kind, CALLS, "both")).toEqual({ ok: true });
+    }
+  });
+
+  it("refuses calls that do not fit, and says they are tool calls", () => {
+    for (const kind of ["text", "json"] as const) {
+      expect(checkReply(kind, BAD_CALLS, "tools")).toEqual({
+        ok: false,
+        reason: "call 1 needs function.arguments as a string",
+        problem: "tool_calls",
+      });
+    }
+  });
+
+  it("refuses several calls for a request that defines functions only", () => {
+    const two = JSON.stringify([
+      { id: "a", type: "function", function: { name: "f", arguments: "" } },
+      { id: "b", type: "function", function: { name: "f", arguments: "" } },
+    ]);
+    expect(checkReply("text", two, "functions")).toMatchObject({
+      ok: false,
+      problem: "tool_calls",
+    });
+    expect(checkReply("text", two, "both")).toEqual({ ok: true });
+  });
+
+  it("does not look for calls when the request has no definitions, or when the reply is text", () => {
+    expect(checkReply("text", BAD_CALLS)).toEqual({ ok: true });
+    expect(checkReply("text", BAD_CALLS, "none")).toEqual({ ok: true });
+    expect(checkReply("text", "Hello", "tools")).toEqual({ ok: true });
+  });
+
+  it("checks that a json reply is JSON before it looks for calls", () => {
+    expect(checkReply("json", "[{", "tools")).toEqual({
+      ok: false,
+      reason: "unexpected end of input at line 1",
+    });
+    expect(checkReply("json", '{"a": 1}', "tools")).toEqual({ ok: true });
+  });
+});
