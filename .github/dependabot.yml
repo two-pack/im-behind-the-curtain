@@ -6,6 +6,8 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 7
+    # Security updates only: version update pull requests are disabled.
+    open-pull-requests-limit: 0
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
