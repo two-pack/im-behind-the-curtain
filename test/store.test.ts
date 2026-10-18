@@ -376,7 +376,8 @@ describe("json requests and replies", () => {
     await store.createRequest(jsonRequest, sampleState());
     const onDisk = JSON.parse(await readFile(path.join(requests, ID, "request.json"), "utf8"));
     expect(onDisk).toMatchObject({
-      formatVersion: 1,
+      formatVersion: 2,
+      toolDefinitions: "none",
       replyKind: "json",
       requiredShape: shape,
       stream: true,

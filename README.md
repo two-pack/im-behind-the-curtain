@@ -37,7 +37,8 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 - `POST /v1/chat/completions` in the Chat Completions format: text messages, JSON replies for structured output, and streaming. Any model name and any API key will do.
 - `GET /v1/models`.
-- A part that is not text (image, audio, a file) and tool-related requests (`tools`, `functions`, `tool_calls`) are refused with a `400` error whose `code` is `unsupported_content`. They are not saved.
+- Tools: requests with `tools` or `functions`, and messages with `tool_calls`, `function_call` or the roles `tool` and `function`, are saved and shown. To play a model that calls a tool, type a JSON array of calls as the reply. The client then receives `tool_calls` (or `function_call` when only `functions` were sent), also in a stream. Other replies are sent as text. See [the specification](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md) for the form.
+- A part that is not text (image, audio, a file) is refused with a `400` error whose `code` is `unsupported_content`. It is not saved.
 
 The server waits for a reply for 30 minutes by default. Set the timeout of your client to at least that, and turn its automatic retries off, or the client may give up and send the request again. [The specification](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md) has examples for the official OpenAI SDKs, all settings, and the files that the server writes.
 

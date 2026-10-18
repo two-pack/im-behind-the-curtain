@@ -6,9 +6,12 @@
 import {
   type ConversationRequest,
   type Message,
+  pickToolFields,
   type ReplyKind,
   ROLES,
   type Role,
+  type ToolDefinitions,
+  type ToolReply,
 } from "../model.js";
 
 export type ErrorCode =
@@ -30,7 +33,6 @@ export const MESSAGES = {
   messageNotObject: "Each message must be an object.",
   contentType: "Message content must be a string, null, or an array of text parts.",
   images: "Images are not supported. A human reads requests as text.",
-  tools: "Tool calls are not supported. Send the request without tools.",
   tooManyChoices: 'Only one choice can be returned; "n" must be 1.',
   requestTooLarge: "Request body is larger than 10 MB.",
   notFound: "Not found.",
@@ -66,6 +68,19 @@ export interface ErrorBody {
   };
 }
 
+/** Why the response ends: a text reply, tool calls, or one legacy function call. */
+type FinishReason = "stop" | "tool_calls" | "function_call";
+
+/** The message of a response. The content is null when the reply calls tools. */
+type CompletionMessage =
+  | { role: "assistant"; content: string }
+  | { role: "assistant"; content: null; tool_calls: Record<string, unknown>[] }
+  | {
+      role: "assistant";
+      content: null;
+      function_call: { name: string; arguments: string };
+    };
+
 export interface ChatCompletion {
   id: string;
   object: "chat.completion";
@@ -74,8 +89,8 @@ export interface ChatCompletion {
   choices: [
     {
       index: 0;
-      message: { role: "assistant"; content: string };
-      finish_reason: "stop";
+      message: CompletionMessage;
+      finish_reason: FinishReason;
     },
   ];
   usage: { prompt_tokens: 0; completion_tokens: 0; total_tokens: 0 };
@@ -143,26 +158,22 @@ function hasEntries(value: unknown): boolean {
   return Array.isArray(value) && value.length > 0;
 }
 
-/** A message with the role tool or function. Its content is not read. */
-function checkToolRole(message: Record<string, unknown>): Failure | undefined {
-  return message.role === "tool" || message.role === "function"
-    ? unsupported(MESSAGES.tools)
-    : undefined;
-}
-
-/** A role that is none of the four. */
+/** A role that is none of the six. */
 function checkRole(message: Record<string, unknown>): Failure | undefined {
   return isRole(message.role) ? undefined : invalid(roleMessage(message.role));
 }
 
-/** An assistant message that calls a tool. Other roles are not looked at. */
-function checkToolCalls(message: Record<string, unknown>): Failure | undefined {
-  if (message.role !== "assistant") {
-    return undefined;
-  }
-  const calls = hasEntries(message.tool_calls);
-  const legacy = message.function_call !== null && message.function_call !== undefined;
-  return calls || legacy ? unsupported(MESSAGES.tools) : undefined;
+/** Whether a value is there: not missing and not null. What it holds is not looked at. */
+function isPresent(value: unknown): boolean {
+  return value !== undefined && value !== null;
+}
+
+/** An assistant message that has `tool_calls` or `function_call` may leave out its content. */
+function mayLeaveOutContent(message: Record<string, unknown>): boolean {
+  return (
+    message.role === "assistant" &&
+    (isPresent(message.tool_calls) || isPresent(message.function_call))
+  );
 }
 
 /** Any part of the content that is an image. */
@@ -193,18 +204,25 @@ function checkOtherParts(message: Record<string, unknown>): Failure | undefined 
 
 /** Checks on one message before its content is read, in order. */
 const MESSAGE_CHECKS: readonly Check<Record<string, unknown>>[] = [
-  checkToolRole,
   checkRole,
-  checkToolCalls,
   checkImageParts,
   checkOtherParts,
 ];
 
-/** Tools or functions with at least one definition. */
-function checkToolDefinitions(body: Record<string, unknown>): Failure | undefined {
-  return hasEntries(body.tools) || hasEntries(body.functions)
-    ? unsupported(MESSAGES.tools)
-    : undefined;
+/**
+ * Which definitions the body carries. An array with at least one entry counts; what the entries
+ * hold is not looked at.
+ */
+function readToolDefinitions(body: Record<string, unknown>): ToolDefinitions {
+  const tools = hasEntries(body.tools);
+  const functions = hasEntries(body.functions);
+  if (tools && functions) {
+    return "both";
+  }
+  if (tools) {
+    return "tools";
+  }
+  return functions ? "functions" : "none";
 }
 
 function textOfPart(part: unknown): string | undefined {
@@ -231,11 +249,19 @@ function readContent(content: unknown): string | undefined {
   return texts.every((text) => text !== undefined) ? texts.join("") : undefined;
 }
 
+/** The text of a message; a missing content is "" only for an assistant message with tool calls. */
+function messageText(message: Record<string, unknown>): string | undefined {
+  if (message.content === undefined && mayLeaveOutContent(message)) {
+    return "";
+  }
+  return readContent(message.content);
+}
+
 type MessageResult = { message: Message } | { error: Failure };
 
 /**
  * Checks one message in order: object, the checks of MESSAGE_CHECKS, then
- * content. Only the role and the text content are kept.
+ * content. The role, the text content and the tool fields are kept.
  */
 function convertMessage(item: unknown): MessageResult {
   if (!isRecord(item)) {
@@ -245,11 +271,13 @@ function convertMessage(item: unknown): MessageResult {
   if (failure !== undefined) {
     return { error: failure };
   }
-  const content = readContent(item.content);
+  const content = messageText(item);
   if (content === undefined) {
     return { error: invalid(MESSAGES.contentType) };
   }
-  return { message: { role: item.role as Role, content } };
+  return {
+    message: { role: item.role as Role, content, ...pickToolFields(item) },
+  };
 }
 
 /** Checks the messages one by one and stops at the first one that fails. */
@@ -301,8 +329,9 @@ function readStreaming(body: Record<string, unknown>): { stream: boolean; includ
 }
 
 /**
- * Checks a request body in this order: JSON object, messages, model, each message, tools and
- * functions, n. The first failure decides. Unknown fields are ignored.
+ * Checks a request body in this order: JSON object, messages, model, each message, n. The first
+ * failure decides. Unknown fields are ignored, and so are `tool_choice` and
+ * `parallel_tool_calls`. The entries of `tools` and `functions` are not checked.
  */
 export function parseChatCompletionsRequest(text: string): AdapterResult {
   const body = parseObject(text);
@@ -317,10 +346,6 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
   if ("error" in converted) {
     return reject(converted.error);
   }
-  const toolsError = checkToolDefinitions(body);
-  if (toolsError !== undefined) {
-    return reject(toolsError);
-  }
   if (typeof body.n === "number" && body.n >= 2) {
     return reject(invalid(MESSAGES.tooManyChoices));
   }
@@ -333,6 +358,7 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
       ...readStreaming(body),
       conversation: converted.messages,
       originalRequest: body,
+      toolDefinitions: readToolDefinitions(body),
     },
   };
 }
@@ -340,24 +366,48 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
 export interface CompletionInput {
   requestId: string;
   model: string;
+  /** The reply as typed. It is the content of the response when `reply` is text or missing. */
   content: string;
   nowSeconds: number;
+  /** What the reply is. Missing means text. */
+  reply?: ToolReply;
+}
+
+/** The message and the finish reason of a response for this reply. */
+function messageOf(input: CompletionInput): {
+  message: CompletionMessage;
+  finish: FinishReason;
+} {
+  const reply = input.reply;
+  if (reply?.kind === "tool_calls") {
+    const calls = reply.calls.map((call) => call.raw);
+    return {
+      message: { role: "assistant", content: null, tool_calls: calls },
+      finish: "tool_calls",
+    };
+  }
+  if (reply?.kind === "function_call") {
+    const call = { name: reply.name, arguments: reply.arguments };
+    return {
+      message: { role: "assistant", content: null, function_call: call },
+      finish: "function_call",
+    };
+  }
+  return {
+    message: { role: "assistant", content: input.content },
+    finish: "stop",
+  };
 }
 
 /** The response for a human reply. Usage is always zero. */
 export function buildCompletion(input: CompletionInput): ChatCompletion {
+  const { message, finish } = messageOf(input);
   return {
     id: `chatcmpl-${input.requestId}`,
     object: "chat.completion",
     created: input.nowSeconds,
     model: input.model,
-    choices: [
-      {
-        index: 0,
-        message: { role: "assistant", content: input.content },
-        finish_reason: "stop",
-      },
-    ],
+    choices: [{ index: 0, message, finish_reason: finish }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
 }
@@ -367,7 +417,11 @@ export interface StreamInput extends CompletionInput {
   includeUsage: boolean;
 }
 
-type StreamChoice = { index: 0; delta: Record<string, unknown>; finish_reason: "stop" | null };
+type StreamChoice = {
+  index: 0;
+  delta: Record<string, unknown>;
+  finish_reason: FinishReason | null;
+};
 
 interface StreamChunk {
   id: string;
@@ -384,9 +438,34 @@ function event(chunk: StreamChunk): string {
 }
 
 /**
- * The events of a streamed response, in order: the role, the whole reply in one
- * content chunk, stop, the usage chunk when asked, and `[DONE]`. Every chunk has the same id,
- * created and model.
+ * The deltas between the role chunk and the last chunk. A text reply is one content chunk. Tool
+ * calls are one chunk per call, with only the fields a client reads. A function call is one
+ * chunk.
+ */
+function bodyDeltas(input: CompletionInput): Record<string, unknown>[] {
+  const reply = input.reply;
+  if (reply?.kind === "tool_calls") {
+    return reply.calls.map((call, index) => ({
+      tool_calls: [
+        {
+          index,
+          id: call.id,
+          type: "function",
+          function: { name: call.name, arguments: call.arguments },
+        },
+      ],
+    }));
+  }
+  if (reply?.kind === "function_call") {
+    return [{ function_call: { name: reply.name, arguments: reply.arguments } }];
+  }
+  return [{ content: input.content }];
+}
+
+/**
+ * The events of a streamed response, in order: the role, the whole reply (one content chunk, one
+ * chunk per tool call, or one function call chunk), the last chunk with the finish reason, the
+ * usage chunk when asked, and `[DONE]`. Every chunk has the same id, created and model.
  */
 export function buildStreamEvents(input: StreamInput): string[] {
   const base = {
@@ -395,13 +474,20 @@ export function buildStreamEvents(input: StreamInput): string[] {
     created: input.nowSeconds,
     model: input.model,
   } as const;
-  const choice = (delta: Record<string, unknown>, finish: "stop" | null): StreamChoice[] => [
+  const choice = (delta: Record<string, unknown>, finish: FinishReason | null): StreamChoice[] => [
     { index: 0, delta, finish_reason: finish },
   ];
+  const isText = input.reply === undefined || input.reply.kind === "text";
   const chunks: StreamChunk[] = [
-    { ...base, choices: choice({ role: "assistant", content: "" }, null) },
-    { ...base, choices: choice({ content: input.content }, null) },
-    { ...base, choices: choice({}, "stop") },
+    {
+      ...base,
+      choices: choice({ role: "assistant", content: isText ? "" : null }, null),
+    },
+    ...bodyDeltas(input).map((delta) => ({
+      ...base,
+      choices: choice(delta, null),
+    })),
+    { ...base, choices: choice({}, messageOf(input).finish) },
   ];
   if (input.includeUsage) {
     chunks.push({

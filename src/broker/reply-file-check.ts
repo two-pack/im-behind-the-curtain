@@ -11,6 +11,7 @@ import {
   type ReplyFile,
   type ReplyFileKind,
   type ReplyKind,
+  type ToolDefinitions,
 } from "../model.js";
 import { checkReply } from "./reply-check.js";
 
@@ -21,8 +22,14 @@ export type ReplyFileVerdict =
 /** A reply file that is JSON with a text `kind` and a text `body`; the other fields are unchecked. */
 type Content = Record<string, unknown> & { kind: string; body: string };
 
+/** What a check knows about the request: its reply kind and which definitions it has. */
+interface RequestInfo {
+  replyKind: ReplyKind;
+  toolDefinitions: ToolDefinitions;
+}
+
 /** A check that returns the reason of a refusal, or undefined when the content passes it. */
-type Check = (content: Content, replyKind: ReplyKind) => string | undefined;
+type Check = (content: Content, request: RequestInfo) => string | undefined;
 
 const BYTE_ORDER_MARK = "﻿";
 const KNOWN_KINDS: readonly string[] = ["text", "json", "skip"];
@@ -56,12 +63,21 @@ function bodyFitsKind(content: Content): boolean {
 }
 
 /** A body that has to be JSON for this request, and is not. */
-function bodyNotJson(content: Content, replyKind: ReplyKind): string | undefined {
-  if (replyKind !== "json" || content.kind === "skip") {
+function bodyNotJson(content: Content, request: RequestInfo): string | undefined {
+  if (request.replyKind !== "json" || content.kind === "skip") {
     return undefined;
   }
   const check = checkReply("json", content.body);
   return check.ok ? undefined : INVALID_REPLY_REASONS.bodyNotJson(check.reason);
+}
+
+/** A body that calls tools in a way that does not fit, for a request that has definitions. */
+function badToolCalls(content: Content, request: RequestInfo): string | undefined {
+  if (content.kind === "skip") {
+    return undefined;
+  }
+  const check = checkReply("text", content.body, request.toolDefinitions);
+  return check.ok ? undefined : INVALID_REPLY_REASONS.badToolCalls(check.reason);
 }
 
 /** The checks of the content, in order. The first one that finds a reason decides. */
@@ -71,6 +87,7 @@ const CONTENT_CHECKS: readonly Check[] = [
   (content) => (KNOWN_KINDS.includes(content.kind) ? undefined : INVALID_REPLY_REASONS.unknownKind),
   (content) => (bodyFitsKind(content) ? undefined : INVALID_REPLY_REASONS.bodyMismatch),
   bodyNotJson,
+  badToolCalls,
 ];
 
 function replyOf(content: Content): ReplyFile {
@@ -88,8 +105,16 @@ function replyOf(content: Content): ReplyFile {
   return reply;
 }
 
-/** Judges the bytes of one reply.json for a request that asks for `replyKind`. */
-export function checkReplyFile(bytes: Uint8Array, replyKind: ReplyKind): ReplyFileVerdict {
+/**
+ * Judges the bytes of one reply.json for a request that asks for `replyKind` and has these tool
+ * definitions (none, when left out).
+ */
+export function checkReplyFile(
+  bytes: Uint8Array,
+  replyKind: ReplyKind,
+  toolDefinitions: ToolDefinitions = "none",
+): ReplyFileVerdict {
+  const request: RequestInfo = { replyKind, toolDefinitions };
   if (bytes.length > MAX_FILE_BYTES) {
     return { kind: "invalid", reason: INVALID_REPLY_REASONS.tooLarge };
   }
@@ -102,7 +127,7 @@ export function checkReplyFile(bytes: Uint8Array, replyKind: ReplyKind): ReplyFi
   }
   const content = parsed.value;
   for (const check of CONTENT_CHECKS) {
-    const reason = check(content, replyKind);
+    const reason = check(content, request);
     if (reason !== undefined) {
       return { kind: "invalid", reason };
     }

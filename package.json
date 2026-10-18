@@ -1,6 +1,6 @@
 {
   "name": "imbehind",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "An OpenAI Chat Completions compatible API server where a human writes the replies.",
   "license": "MIT",
   "type": "module",
@@ -45,7 +45,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
-    "@types/node": "22.20.5",
+    "@types/node": "26.6.4",
     "@vitest/coverage-v8": "5.0.3",
     "dependency-cruiser": "18.5.0",
     "knip": "6.41.0",
