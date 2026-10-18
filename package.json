@@ -36,7 +36,7 @@
     "lint": "biome check .",
     "test": "vitest run --coverage",
     "knip": "knip",
-    "deps": "depcruise src --config .dependency-cruiser.cjs",
+    "deps": "node test/tools/check-dependencies.ts",
     "check": "npm run typecheck && npm run lint && npm test && npm run knip && npm run deps",
     "prepublishOnly": "npm run build",
     "audit": "npm audit",
