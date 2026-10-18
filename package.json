@@ -36,7 +36,7 @@
     "lint": "biome check .",
     "test": "vitest run --coverage",
     "knip": "knip",
-    "deps": "depcruise src --config .dependency-cruiser.cjs",
+    "deps": "node test/tools/check-dependencies.ts",
     "check": "npm run typecheck && npm run lint && npm test && npm run knip && npm run deps",
     "prepublishOnly": "npm run build",
     "audit": "npm audit",
@@ -46,11 +46,12 @@
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
     "@types/node": "26.6.4",
+    "@typescript/native": "npm:typescript@7.0.2",
     "@vitest/coverage-v8": "5.0.3",
     "dependency-cruiser": "18.5.0",
     "knip": "6.41.0",
     "openai": "7.32.0",
-    "typescript": "6.0.3",
+    "typescript": "npm:@typescript/typescript6@6.0.2",
     "vitest": "5.0.3"
   }
 }

@@ -1,15 +1,10 @@
 import { spawnSync } from "node:child_process";
-import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { makeTempDir } from "./helpers/fs.js";
+import { writeProject } from "./helpers/project.js";
 
 const CONFIG = path.resolve(".dependency-cruiser.cjs");
 const CRUISER = path.resolve("node_modules", "dependency-cruiser", "bin", "dependency-cruiser.mjs");
-const TSCONFIG = JSON.stringify({
-  compilerOptions: { module: "NodeNext", moduleResolution: "NodeNext", target: "ES2023" },
-  include: ["src/**/*.ts"],
-});
 
 interface Violation {
   rule: { name: string };
@@ -19,13 +14,9 @@ interface Violation {
 
 /** Writes a small src/ tree into a temporary folder and cruises it with the project's rules. */
 async function cruise(files: Record<string, string>): Promise<Violation[]> {
-  const dir = await makeTempDir();
-  await writeFile(path.join(dir, "tsconfig.json"), TSCONFIG);
-  for (const [name, content] of Object.entries(files)) {
-    const target = path.join(dir, "src", name);
-    await mkdir(path.dirname(target), { recursive: true });
-    await writeFile(target, content);
-  }
+  const dir = await writeProject(
+    Object.fromEntries(Object.entries(files).map(([name, content]) => [`src/${name}`, content])),
+  );
   const result = spawnSync(
     process.execPath,
     [CRUISER, "src", "--config", CONFIG, "--output-type", "json"],

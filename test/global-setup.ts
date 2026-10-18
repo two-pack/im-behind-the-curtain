@@ -6,6 +6,6 @@ import path from "node:path";
  * (test/e2e/process.test.ts) work with any vitest command and need no separate build step.
  */
 export default function setup(): void {
-  const tsc = path.resolve("node_modules", "typescript", "bin", "tsc");
+  const tsc = path.resolve("node_modules", "@typescript/native", "bin", "tsc");
   execFileSync(process.execPath, [tsc, "-p", "tsconfig.build.json"], { stdio: "inherit" });
 }
