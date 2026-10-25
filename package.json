@@ -41,6 +41,7 @@
     "prepublishOnly": "npm run build",
     "audit": "npm audit",
     "round-trip": "node test/tools/round-trip.ts",
+    "timing:load": "node test/tools/repeat-under-load.ts",
     "hooks:install": "git config core.hooksPath .githooks"
   },
   "devDependencies": {

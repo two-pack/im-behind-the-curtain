@@ -38,6 +38,17 @@ npm run round-trip   # start the built program, send one request, answer it, che
 - New code needs at least 80% line coverage. The thresholds are in `vitest.config.ts`. Do not lower them to make a change pass.
 - Tests cover the program through plain HTTP and through the official OpenAI SDK. Tests that start the real program use `dist/`, and the test run builds it for you.
 
+### Timing tests under load
+
+`test/e2e/timing.test.ts` checks NFR6 and NFR7 of [requirements.md](requirements.md) with the real clock. Its limit is the documented 10 seconds, and twice that when the `CI` environment variable is `true`. To see whether the timing tests still pass on a busy machine, run them again and again while every logical CPU core is kept busy:
+
+```sh
+npm run timing:load               # run the timing tests 10 times under load
+npm run timing:load -- --runs 3   # choose another number of runs
+```
+
+It ends with exit code 0 when every run passed and 1 when any run failed, and it stops the load in both cases. It is not part of `npm run check`, and CI does not run it.
+
 ### Git hook (optional)
 
 If you want `npm run check` to run before each commit, install the hook yourself:

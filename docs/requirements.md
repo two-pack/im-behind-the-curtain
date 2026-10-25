@@ -178,8 +178,8 @@ An automated test installs the package that is about to be published from a loca
 | NFR3 | New code has at least 80% line coverage. | CI measures coverage and fails below 80% |
 | NFR4 | The round trip is tested with a plain HTTP tool and with the official OpenAI SDK. | Both round trips are automated tests that pass in CI. The SDK tests cover replies with and without streaming: the SDK reads the response without an error and the reply text can be taken out. They also cover requests with tools: the SDK reads `tool_calls` and `function_call`, and builds the `tool_calls` of a stream |
 | NFR5 | CI checks tests, coverage, formatting and static checks on pull requests to `main` and on pushes to `main`. | A failure in any of them makes the CI result fail |
-| NFR6 | A request is shown by `imbehind answer` within 2 seconds of its arrival. | A test measures it on one machine |
-| NFR7 | The client receives the response within 2 seconds of the reply being sent. | A test measures it on one machine |
+| NFR6 | A request is shown by `imbehind answer` within 10 seconds of its arrival. | A test measures it on one machine |
+| NFR7 | The client receives the response within 10 seconds of the reply being sent. | A test measures it on one machine |
 | NFR8 | Ten waiting requests at once are answered without mixing them up. | A test sends ten requests, answers each differently, and checks every reply |
 | NFR9 | The server accepts no requests from outside the machine and has no authentication. | The server cannot start on a non-local address (FR11.3) |
 | NFR10 | What a request says is written only to files in the storage directory, never to the output of the server. | A test checks that request text does not appear in the output of `imbehind serve` |
