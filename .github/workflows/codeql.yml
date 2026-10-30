@@ -12,6 +12,8 @@ permissions:
 
 jobs:
   analyze:
+    # Run only in the public repository: code scanning in a private one needs GitHub Code Security.
+    if: github.repository == 'two-pack/im-behind-the-curtain'
     runs-on: ubuntu-latest
     permissions:
       contents: read
