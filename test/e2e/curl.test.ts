@@ -308,6 +308,69 @@ describe("requests that are turned away or let through", () => {
   });
 });
 
+describe("an image as a data URL, with curl", () => {
+  /** A 1x1 PNG, as base64. */
+  const PNG_BASE64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const PNG_FILE = "message-1-part-2.png";
+
+  function imageBody(): string {
+    const content = [
+      { type: "text", text: "What is this?" },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_BASE64}` } },
+      { type: "text", text: "Be brief." },
+    ];
+    return JSON.stringify({ model: "m", messages: [{ role: "user", content }] });
+  }
+
+  it("saves the picture, shows two lines to the human, and returns the reply to curl", async () => {
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["A pixel."]));
+    const reply = await curlPost(serve.baseUrl, imageBody());
+    expect(reply.status).toBe(200);
+    expect(reply.body.choices?.[0]?.message.content).toBe("A pixel.");
+    await waitFor(() => answer.stdout().includes("Sent."));
+
+    const id = await waitForRequestId(serve.storageDir);
+    const saved = path.join(serve.storageDir, "requests", id, PNG_FILE);
+    const expected = Buffer.from(PNG_BASE64, "base64");
+    expect(await readFile(saved)).toEqual(expected);
+    expect(answer.stdout()).toContain(
+      `  What is this?\n  [image] image/png, ${expected.length} bytes\n    saved: ${saved}\n  Be brief.\n`,
+    );
+    expect(await requestFiles(serve.storageDir, id)).toEqual([
+      PNG_FILE,
+      "reply.accepted.json",
+      "request.json",
+      "state.json",
+    ]);
+    const stored = JSON.parse(
+      await readFile(path.join(serve.storageDir, "requests", id, "request.json"), "utf8"),
+    ) as { formatVersion: number; conversation: Record<string, unknown>[] };
+    expect(stored.formatVersion).toBe(3);
+    expect(stored.conversation[0]).toMatchObject({
+      content: "What is this?Be brief.",
+      attachments: [{ at: 13, kind: "image", mediaType: "image/png", file: PNG_FILE }],
+    });
+    expect(serve.stdout()).not.toContain(PNG_BASE64);
+    expect(serve.stdout()).not.toContain("What is this?");
+  });
+
+  it("deletes the saved picture with the request after the retention time", async () => {
+    const serve = await startServe({
+      args: ["--timeout", "0", "--retention", "1", "--sweep-interval", "1"],
+    });
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["Done."]));
+    const reply = await curlPost(serve.baseUrl, imageBody());
+    expect(reply.status).toBe(200);
+    await waitFor(() => answer.stdout().includes("Sent."));
+    await waitFor(
+      async () => (await readdir(path.join(serve.storageDir, "requests"))).length === 0,
+      8000,
+    );
+  });
+});
+
 describe("requests that are turned away as unsupported", () => {
   const IMAGES = "Images are not supported. A human reads requests as text.";
   const USER = { role: "user", content: "Hello" };
@@ -326,10 +389,10 @@ describe("requests that are turned away as unsupported", () => {
     expect(answer.stdout()).not.toContain("Request 1 of");
   }
 
-  it("refuses an image part", async () => {
+  it("refuses an image part that is not a readable data URL", async () => {
     const content = [
       { type: "text", text: "What is this?" },
-      { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+      { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
     ];
     await refusedAs({ messages: [{ role: "user", content }] }, IMAGES);
   });
@@ -412,7 +475,7 @@ describe("a round trip with tools, sent with curl", () => {
       await readFile(path.join(serve.storageDir, "requests", id, "request.json"), "utf8"),
     ) as Record<string, unknown>;
     expect(stored).toMatchObject({
-      formatVersion: 2,
+      formatVersion: 3,
       toolDefinitions: "tools",
     });
     expect(stored.originalRequest).toEqual(original);

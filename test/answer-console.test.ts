@@ -1,3 +1,4 @@
+import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
@@ -828,6 +829,75 @@ describe("a request that asks for JSON", () => {
     expect(t.replyKind()).toBe("text");
     t.controller.abort();
     await running;
+  });
+});
+
+describe("a request with a saved image", () => {
+  const FOLDER = `/fake-storage/requests/${ID}`;
+  const FILE = "message-1-part-2.png";
+  const IMAGE_MESSAGE: Message = {
+    role: "user",
+    content: "what is this? thanks",
+    attachments: [
+      {
+        at: 14,
+        kind: "image",
+        mediaType: "image/png",
+        size: 70,
+        file: FILE,
+        readable: true,
+        address: null,
+        fileId: null,
+        typeName: null,
+      },
+    ],
+  };
+
+  it("shows the image as two lines between the pieces of text, with the path of the saved file", async () => {
+    const t = setup([]);
+    t.addWaiting(ID, [IMAGE_MESSAGE]);
+    const running = t.start();
+    await settle();
+    const lines = t.stdout();
+    const start = lines.indexOf("User:");
+    expect(lines.slice(start, start + 5)).toEqual([
+      "User:",
+      "  what is this? ",
+      "  [image] image/png, 70 bytes",
+      `    saved: ${path.join(FOLDER, FILE)}`,
+      "  thanks",
+    ]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("shows a message of only images without (empty)", async () => {
+    const t = setup([]);
+    const onlyImage = {
+      ...IMAGE_MESSAGE,
+      content: "",
+      attachments: [{ ...IMAGE_MESSAGE.attachments?.[0], at: 0 }],
+    };
+    t.addWaiting(ID, [onlyImage as Message]);
+    const running = t.start();
+    await settle();
+    const text = t.stdout().join("\n");
+    expect(text).toContain("[image] image/png, 70 bytes");
+    expect(text).not.toContain("(empty)");
+    t.controller.abort();
+    await running;
+  });
+
+  it("shows no conversation, and so no image line, when the reply comes from standard input", async () => {
+    const t = setup([], undefined, { kind: "running" }, { inputMode: "stdin", stdin: ["Hi"] });
+    t.addWaiting(ID, [IMAGE_MESSAGE]);
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).toEqual([]);
+    t.controller.abort();
+    await running;
+    expect(t.raw()).not.toContain("[image]");
+    expect(t.raw()).not.toContain("saved:");
   });
 });
 

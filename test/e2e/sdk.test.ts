@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import OpenAI from "openai";
 import { describe, expect, it } from "vitest";
 import { waitFor } from "../helpers/io.js";
@@ -130,7 +132,7 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
             content: [
               {
                 type: "image_url",
-                image_url: { url: "data:image/png;base64,AAAA" },
+                image_url: { url: "https://example.com/cat.png" },
               },
             ],
           },
@@ -141,6 +143,37 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
       code: "unsupported_content",
       type: "invalid_request_error",
     });
+  });
+
+  it("accepts an image as a data URL, saves it, and returns the typed reply", async () => {
+    const png =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const serve = await startServe();
+    const answer = startAnswer(serve.storageDir, new ScriptedReader(["It is a pixel."]));
+    const completion = await clientFor(serve.baseUrl).chat.completions.create({
+      model: "whatever",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "What is this?" },
+            {
+              type: "image_url",
+              image_url: { url: `data:image/png;base64,${png}`, detail: "low" },
+            },
+          ],
+        },
+      ],
+    });
+    expect(completion.choices[0]?.message.content).toBe("It is a pixel.");
+    await waitFor(() => answer.stdout().includes("Sent."));
+    const id = await waitForRequestId(serve.storageDir);
+    const saved = path.join(serve.storageDir, "requests", id, "message-1-part-2.png");
+    const bytes = Buffer.from(png, "base64");
+    expect(await readFile(saved)).toEqual(bytes);
+    expect(answer.stdout()).toContain(
+      `  [image] image/png, ${bytes.length} bytes\n    saved: ${saved}\n`,
+    );
   });
 
   it("accepts a message whose content is an array of text parts", async () => {

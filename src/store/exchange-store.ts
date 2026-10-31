@@ -3,9 +3,11 @@ import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { errorCode, IoFailure, type IoReason, StartupError } from "../errors.js";
 import { isRequestId } from "../ids.js";
+import { isSavedFileName } from "../media-parts.js";
 import {
   type Loaded,
   MAX_FILE_BYTES,
+  type PartFileData,
   parseReplyFile,
   parseRequestFile,
   parseStateFile,
@@ -24,6 +26,8 @@ export interface StoreFs {
    * `mode` is the mode of the new file. A file that exists is replaced by rename, never by this.
    */
   writeFile(file: string, data: string, mode?: number): Promise<void>;
+  /** Like `writeFile`, for bytes that are not text. */
+  writeBytes(file: string, bytes: Uint8Array, mode?: number): Promise<void>;
   readFile(file: string): Promise<string>;
   readdir(dir: string): Promise<string[]>;
   rename(from: string, to: string): Promise<void>;
@@ -78,6 +82,7 @@ async function readUpTo(file: string, maxBytes: number): Promise<Uint8Array> {
 export const nodeFs: StoreFs = {
   mkdir: (dir, options) => fsPromises.mkdir(dir, options),
   writeFile: (file, data, mode) => fsPromises.writeFile(file, data, { encoding: "utf8", mode }),
+  writeBytes: (file, bytes, mode) => fsPromises.writeFile(file, bytes, { mode }),
   readFile: (file) => fsPromises.readFile(file, "utf8"),
   readdir: (dir) => fsPromises.readdir(dir),
   rename: (from, to) => fsPromises.rename(from, to),
@@ -163,6 +168,27 @@ function isMissingFile(error: unknown): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
+/**
+ * Fails when a part has a name that is not of the saved form, a name is used twice, or the
+ * request records a file that is not among the parts.
+ */
+function checkPartNames(request: RequestFile, parts: readonly PartFileData[]): void {
+  const seen = new Set<string>();
+  for (const part of parts) {
+    if (!isSavedFileName(part.file) || seen.has(part.file)) {
+      throw new Error("a part has a name that cannot be written");
+    }
+    seen.add(part.file);
+  }
+  for (const message of request.conversation) {
+    for (const attachment of message.attachments ?? []) {
+      if (attachment.file !== null && !seen.has(attachment.file)) {
+        throw new Error("request.json records a part that was not given");
+      }
+    }
+  }
+}
+
 /** Parses JSON text. One byte order mark at the start is allowed. */
 function parseJson(text: string): { ok: true; value: unknown } | { ok: false } {
   try {
@@ -246,12 +272,25 @@ export class ExchangeStore {
     }
   }
 
-  /** Writes request.json and state.json in a hidden directory, then renames the directory. */
-  async createRequest(request: RequestFile, state: StateFile): Promise<void> {
+  /**
+   * Writes the saved parts, then request.json and state.json, in a hidden directory, then renames
+   * the directory. Nothing is written when a part has a name that is not of the form of a saved
+   * name, or when two parts have the same name. When anything fails, the hidden directory goes and
+   * no part stays behind.
+   */
+  async createRequest(
+    request: RequestFile,
+    state: StateFile,
+    parts: readonly PartFileData[] = [],
+  ): Promise<void> {
     const hiddenDir = path.join(this.requestsDir, `.${request.id}`);
     try {
       await this.guard("write failed", async () => {
+        checkPartNames(request, parts);
         await this.fs.mkdir(hiddenDir, { recursive: true, mode: this.dirMode });
+        for (const part of parts) {
+          await this.fs.writeBytes(path.join(hiddenDir, part.file), part.bytes, this.fileMode);
+        }
         await this.writeNew(path.join(hiddenDir, "request.json"), serializeFile(request));
         await this.writeNew(path.join(hiddenDir, "state.json"), serializeFile(state));
       });
@@ -369,18 +408,24 @@ export class ExchangeStore {
   }
 
   /**
-   * Deletes a request folder. Only when the folder holds nothing but the four known
-   * files and hidden files of the temporary form (what a stopped write leaves), and each of
-   * them is a regular file, are they removed, and then the empty folder. Any other entry, such as
-   * a directory or a symbolic link with one of those names, means "kept": nothing is removed.
-   * state.json goes last, and the folder is looked at again before that, so a stop or a new file
-   * in between leaves a request that the next sweep can find again.
+   * Deletes a request folder. Only when the folder holds nothing but the four known files, hidden
+   * files of the temporary form (what a stopped write leaves) and the saved parts that
+   * request.json records, and each of them is a regular file, are they removed, and then the empty
+   * folder. A recorded name counts only if it has the form of a saved name. Any other entry, such
+   * as a file that is not recorded, a directory or a symbolic link, means "kept": nothing is
+   * removed. So a request whose request.json cannot be read is kept when it holds a file with the
+   * form of a saved name, because nothing proves that this server made it.
+   *
+   * The saved parts go first, then the other files, request.json, and state.json last. The folder
+   * is looked at again before state.json, so a stop or a new file in between leaves a request that
+   * the next sweep can find again.
    */
   async removeRequest(id: string): Promise<"removed" | "kept"> {
     const dir = this.requestDir(id);
     try {
       const names = await this.fs.readdir(dir);
-      if (names.some((name) => !REMOVABLE_FILES.has(name) && !isOwnTempName(name))) {
+      const saved = await this.recordedParts(dir, names);
+      if (names.some((name) => !this.isRemovable(name, saved))) {
         return "kept";
       }
       if (!(await this.allRegularFiles(dir, names))) {
@@ -388,7 +433,17 @@ export class ExchangeStore {
       }
       await this.unlinkAll(
         dir,
-        names.filter((name) => name !== "state.json"),
+        names.filter((name) => saved.has(name)),
+      );
+      await this.unlinkAll(
+        dir,
+        names.filter(
+          (name) => !saved.has(name) && name !== "request.json" && name !== "state.json",
+        ),
+      );
+      await this.unlinkAll(
+        dir,
+        names.filter((name) => name === "request.json"),
       );
       if ((await this.fs.readdir(dir)).some((name) => name !== "state.json")) {
         return "kept";
@@ -401,6 +456,49 @@ export class ExchangeStore {
         return "removed";
       }
       throw new IoFailure("delete failed", error);
+    }
+  }
+
+  private isRemovable(name: string, saved: ReadonlySet<string>): boolean {
+    return REMOVABLE_FILES.has(name) || isOwnTempName(name) || saved.has(name);
+  }
+
+  /**
+   * The names of the saved parts that request.json of the folder records, keeping only those with
+   * the form of a saved name. Nothing when request.json is not there, is not a regular file, is
+   * larger than `MAX_FILE_BYTES`, or cannot be read or does not hold a request this version reads. A failure to read is not an
+   * error here: it is the same as a request.json that cannot be read.
+   */
+  private async recordedParts(dir: string, names: readonly string[]): Promise<ReadonlySet<string>> {
+    const file = path.join(dir, "request.json");
+    if (!names.includes("request.json")) {
+      return new Set();
+    }
+    try {
+      if (!(await this.fs.isRegularFile(file))) {
+        return new Set();
+      }
+      const info = await this.fs.statFile(file);
+      if (info.size > MAX_FILE_BYTES) {
+        return new Set();
+      }
+      const bytes = await this.fs.readBytes(file, MAX_FILE_BYTES + 1);
+      if (bytes.length > MAX_FILE_BYTES) {
+        return new Set();
+      }
+      const json = parseJson(Buffer.from(bytes).toString("utf8"));
+      const parsed = json.ok ? parseRequestFile(json.value) : undefined;
+      if (parsed?.kind !== "ok") {
+        return new Set();
+      }
+      const files = parsed.value.conversation
+        .flatMap((message) => message.attachments ?? [])
+        .map((attachment) => attachment.file);
+      return new Set(
+        files.filter((name): name is string => name !== null && isSavedFileName(name)),
+      );
+    } catch {
+      return new Set();
     }
   }
 

@@ -15,7 +15,7 @@ import {
 import { describeFsError, StartupError } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger } from "../log.js";
-import type { ConversationRequest } from "../model.js";
+import type { ConversationRequest, PartFileData } from "../model.js";
 
 /** What the HTTP server needs from a Node.js server. A test replaces it to make listening fail. */
 export interface ListenTarget {
@@ -383,16 +383,20 @@ export class HttpServer {
       respond(response, status, errorBody(code, message));
       return;
     }
-    await this.serve(response, parsed.request);
+    await this.serve(response, parsed.request, parsed.parts);
   }
 
-  private async serve(response: http.ServerResponse, request: ConversationRequest): Promise<void> {
+  private async serve(
+    response: http.ServerResponse,
+    request: ConversationRequest,
+    parts: readonly PartFileData[],
+  ): Promise<void> {
     // The close of the response is watched from here on, before the request is stored.
     const connection = this.watchConnection(response);
     try {
       let submitted: Awaited<ReturnType<ExchangeBroker["submit"]>>;
       try {
-        submitted = await this.options.broker.submit(request);
+        submitted = await this.options.broker.submit(request, parts);
       } catch {
         respond(response, 500, errorBody("storage_error", MESSAGES.storage));
         return;

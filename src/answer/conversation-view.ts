@@ -3,11 +3,16 @@
  * which messages are shown, how control characters are made visible, and how long a message may
  * be. These are pure functions; they write nothing.
  */
-import type { Message, Role } from "../model.js";
+import nodePath from "node:path";
+import { isSavedFileName } from "../media-parts.js";
+import type { Attachment, Message, Role } from "../model.js";
 
 /** Every sentence of the conversation view, in one place. */
 const TEXT = {
   empty: "(empty)",
+  unreadable: "(unreadable)",
+  unknownMediaType: "unknown",
+  saved: "saved",
   toolCall: "tool_call",
   functionCall: "function_call",
   unreadableCall: "(unreadable tool call)",
@@ -141,14 +146,73 @@ function callLines(message: Message): string[] {
   return lines;
 }
 
+/** The text of `content` cut at the given positions, counted in Unicode characters. */
+function textPieces(content: string, positions: readonly number[]): string[] {
+  const pieces: string[] = [];
+  let unit = 0;
+  let characters = 0;
+  let start = 0;
+  for (const position of positions) {
+    while (characters < position && unit < content.length) {
+      unit += (content.codePointAt(unit) ?? 0) > 0xffff ? 2 : 1;
+      characters += 1;
+    }
+    pieces.push(content.slice(start, unit));
+    start = unit;
+  }
+  pieces.push(content.slice(start));
+  return pieces;
+}
+
+/** The size with its unit: `1 byte`, `0 bytes`, `70 bytes`. */
+function sizeText(size: number): string {
+  return `${size} ${size === 1 ? "byte" : "bytes"}`;
+}
+
+/**
+ * The lines of a part that is not text. A saved part has two: the kind, the media type and the
+ * size, then the absolute path of the file. A part that is not saved, or whose file name does not
+ * have the form of a saved name, is shown as unreadable, and no path is made from its name.
+ */
+function partLines(part: Attachment, requestDir: string): string[] {
+  if (part.file === null || part.size === null || !isSavedFileName(part.file)) {
+    return [`[${part.kind}] ${TEXT.unreadable}`];
+  }
+  const mediaType = escapeAllControls(part.mediaType || TEXT.unknownMediaType);
+  return [
+    `[${part.kind}] ${mediaType}, ${sizeText(part.size)}`,
+    `${INDENT}${TEXT.saved}: ${escapeAllControls(nodePath.join(requestDir, part.file))}`,
+  ];
+}
+
+/** The text and the parts of a message, in the order they arrived, as lines. */
+function bodyLines(message: Message, requestDir: string): string[] {
+  const parts = message.attachments ?? [];
+  const pieces = textPieces(
+    message.content,
+    parts.map((part) => part.at),
+  );
+  const lines: string[] = [];
+  pieces.forEach((piece, index) => {
+    if (piece !== "") {
+      lines.push(...escapeControls(piece).split("\n"));
+    }
+    const part = parts[index];
+    if (part !== undefined) {
+      lines.push(...partLines(part, requestDir));
+    }
+  });
+  return lines;
+}
+
 /** The lines of one message after the escape, cut to the first `MAX_LINES`. */
-function messageEntry(message: Message): ViewEntry {
+function messageEntry(message: Message, requestDir: string): ViewEntry {
   const calls = callLines(message);
-  if (message.content === "" && calls.length === 0) {
+  const body = bodyLines(message, requestDir);
+  if (body.length === 0 && calls.length === 0) {
     return { kind: "message", role: message.role, lines: [TEXT.empty], hiddenLines: 0 };
   }
-  const text = message.content === "" ? [] : escapeControls(message.content).split("\n");
-  const all = [...text, ...calls];
+  const all = [...body, ...calls];
   return {
     kind: "message",
     role: message.role,
@@ -174,13 +238,16 @@ function omittedFlags(conversation: readonly Message[]): boolean[] {
  * The entries to show, in the order of the conversation. Left-out messages become one `omission`
  * entry, at the place of the first of them.
  */
-export function buildConversationView(conversation: readonly Message[]): ViewEntry[] {
+export function buildConversationView(
+  conversation: readonly Message[],
+  requestDir: string,
+): ViewEntry[] {
   const flags = omittedFlags(conversation);
   const entries: ViewEntry[] = [];
   let omission: { kind: "omission"; count: number } | undefined;
   conversation.forEach((message, index) => {
     if (!flags[index]) {
-      entries.push(messageEntry(message));
+      entries.push(messageEntry(message, requestDir));
     } else if (omission === undefined) {
       omission = { kind: "omission", count: 1 };
       entries.push(omission);
@@ -230,7 +297,17 @@ export function toolListLines(original: Record<string, unknown>): string[] {
   ];
 }
 
-/** The lines of the conversation as shown, each message followed by an empty line. */
-export function conversationLines(conversation: readonly Message[], path: string): string[] {
-  return buildConversationView(conversation).flatMap((entry) => entryLines(entry, path));
+/**
+ * The lines of the conversation as shown, each message followed by an empty line. `path` is
+ * where request.json is; `requestDir` is the absolute path of the request folder, where the
+ * saved parts are.
+ */
+export function conversationLines(
+  conversation: readonly Message[],
+  path: string,
+  requestDir: string,
+): string[] {
+  return buildConversationView(conversation, requestDir).flatMap((entry) =>
+    entryLines(entry, path),
+  );
 }

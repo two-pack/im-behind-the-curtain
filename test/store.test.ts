@@ -187,6 +187,234 @@ describe("creating a request", () => {
   });
 });
 
+const PART_A = "message-1-part-1.png";
+const PART_B = "message-1-part-2.bin";
+
+function attachment(file: string, at = 0, size = 3) {
+  return {
+    at,
+    kind: "image" as const,
+    mediaType: "image/png",
+    size,
+    file,
+    readable: true,
+    address: null,
+    fileId: null,
+    typeName: null,
+  };
+}
+
+/** A request whose first message has the saved parts `files`, and the matching part data. */
+function requestWithParts(files: string[], id = ID) {
+  const withParts: ConversationRequest = {
+    ...conversation,
+    conversation: [
+      {
+        role: "user",
+        content: "",
+        attachments: files.map((file) => attachment(file)),
+      },
+    ],
+  };
+  const parts = files.map((file, index) => ({
+    file,
+    bytes: new Uint8Array([index, 2, 3]),
+  }));
+  return { request: createRequestFile(id, NOW, withParts), parts };
+}
+
+describe("creating a request with saved parts", () => {
+  it("writes the parts before request.json and state.json, all in the hidden directory", async () => {
+    const calls: string[] = [];
+    const root = await makeTempDir();
+    const requests = path.join(root, "requests");
+    const store = new ExchangeStore({
+      rootDir: root,
+      fs: {
+        ...nodeFs,
+        writeFile: (file, data, mode) => {
+          calls.push(`text ${relative(requests, file)}`);
+          return nodeFs.writeFile(file, data, mode);
+        },
+        writeBytes: (file, bytes, mode) => {
+          calls.push(`bytes ${relative(requests, file)}`);
+          return nodeFs.writeBytes(file, bytes, mode);
+        },
+        rename: (from, to) => {
+          calls.push(`rename ${relative(requests, from)} ${relative(requests, to)}`);
+          return nodeFs.rename(from, to);
+        },
+      },
+    });
+    await store.prepare();
+    calls.length = 0;
+    const { request, parts } = requestWithParts([PART_A, PART_B]);
+    await store.createRequest(request, sampleState(), parts);
+    expect(calls).toEqual([
+      `bytes .${ID}/${PART_A}`,
+      `bytes .${ID}/${PART_B}`,
+      `text .${ID}/request.json`,
+      `text .${ID}/state.json`,
+      `rename .${ID} ${ID}`,
+    ]);
+    const dir = path.join(requests, ID);
+    expect(await names(dir)).toEqual([PART_A, PART_B, "request.json", "state.json"]);
+    expect([...(await readFile(path.join(dir, PART_B)))]).toEqual([1, 2, 3]);
+  });
+
+  it("writes a part of zero bytes as an empty file", async () => {
+    const { store, requests } = await newStore();
+    const { request } = requestWithParts([PART_A]);
+    await store.createRequest(request, sampleState(), [{ file: PART_A, bytes: new Uint8Array(0) }]);
+    expect((await stat(path.join(requests, ID, PART_A))).size).toBe(0);
+  });
+
+  it("keeps the recorded attachments when the request is read back", async () => {
+    const { store } = await newStore();
+    const { request, parts } = requestWithParts([PART_A]);
+    await store.createRequest(request, sampleState(), parts);
+    const read = await store.readRequest(ID);
+    expect(read.kind === "ok" && read.value.conversation[0]?.attachments).toEqual([
+      attachment(PART_A),
+    ]);
+  });
+
+  it("leaves nothing when writing a part fails, whichever part it is", async () => {
+    for (const failing of [PART_A, PART_B]) {
+      const { store, requests } = await newStore({
+        writeBytes: (file, bytes, mode) =>
+          file.endsWith(failing)
+            ? Promise.reject(errno("ENOSPC"))
+            : nodeFs.writeBytes(file, bytes, mode),
+      });
+      const { request, parts } = requestWithParts([PART_A, PART_B]);
+      await expect(store.createRequest(request, sampleState(), parts)).rejects.toMatchObject({
+        name: "IoFailure",
+        reason: "write failed",
+        detail: "no space left on device",
+      });
+      expect(await names(requests)).toEqual([]);
+    }
+  });
+
+  it("leaves nothing when request.json fails after the parts were written", async () => {
+    const { store, requests } = await newStore({
+      writeFile: (file, data, mode) =>
+        file.endsWith("request.json")
+          ? Promise.reject(errno("EIO"))
+          : nodeFs.writeFile(file, data, mode),
+    });
+    const { request, parts } = requestWithParts([PART_A]);
+    await expect(store.createRequest(request, sampleState(), parts)).rejects.toMatchObject({
+      reason: "write failed",
+    });
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("writes nothing when a part has a name that is not of the form it makes", async () => {
+    let written = 0;
+    const { store, requests } = await newStore({
+      writeBytes: (file, bytes, mode) => {
+        written += 1;
+        return nodeFs.writeBytes(file, bytes, mode);
+      },
+    });
+    const bad = ["../message-1-part-1.png", "request.json", "message-1-part-1.PNG", "a/b.png", ""];
+    for (const file of bad) {
+      const { request } = requestWithParts([PART_A]);
+      const parts = [
+        { file: PART_A, bytes: new Uint8Array(1) },
+        { file, bytes: new Uint8Array(1) },
+      ];
+      await expect(store.createRequest(request, sampleState(), parts)).rejects.toMatchObject({
+        name: "IoFailure",
+        reason: "write failed",
+      });
+    }
+    expect(written).toBe(0);
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("fails when two parts have the same name", async () => {
+    const { store, requests } = await newStore();
+    const { request } = requestWithParts([PART_A]);
+    const part = { file: PART_A, bytes: new Uint8Array(1) };
+    await expect(store.createRequest(request, sampleState(), [part, part])).rejects.toMatchObject({
+      reason: "write failed",
+    });
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("fails like a write failure when the path is too long for the system", async () => {
+    const { store, requests } = await newStore({
+      writeBytes: () => Promise.reject(errno("ENAMETOOLONG")),
+    });
+    const { request, parts } = requestWithParts([PART_A]);
+    await expect(store.createRequest(request, sampleState(), parts)).rejects.toMatchObject({
+      reason: "write failed",
+    });
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("writes nothing when request.json records a file that is not among the parts", async () => {
+    let written = 0;
+    const { store, requests } = await newStore({
+      writeBytes: (file, bytes, mode) => {
+        written += 1;
+        return nodeFs.writeBytes(file, bytes, mode);
+      },
+    });
+    const { request, parts } = requestWithParts([PART_A, PART_B]);
+    for (const given of [[], parts.slice(0, 1), parts.slice(1)]) {
+      await expect(store.createRequest(request, sampleState(), given)).rejects.toMatchObject({
+        name: "IoFailure",
+        reason: "write failed",
+      });
+    }
+    expect(written).toBe(0);
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("takes no parts as an empty list", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(sampleRequest(), sampleState(), []);
+    expect(await names(path.join(requests, ID))).toEqual(["request.json", "state.json"]);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("the mode of saved parts", () => {
+  it("writes a saved part so that only the owner can read and write it", async () => {
+    const root = await makeTempDir();
+    const store = new ExchangeStore({ rootDir: root, platform: "linux" });
+    await store.prepare();
+    const { request, parts } = requestWithParts([PART_A]);
+    await store.createRequest(request, sampleState(), parts);
+    expect(await modeOf(path.join(root, "requests", ID, PART_A))).toBe(0o600);
+  });
+
+  it("passes the mode 0600 to writeBytes on Linux and no mode on Windows", async () => {
+    const modes: Record<string, number | undefined> = {};
+    for (const platform of ["linux", "darwin", "win32"] as const) {
+      const root = await makeTempDir();
+      const store = new ExchangeStore({
+        rootDir: root,
+        platform,
+        fs: {
+          ...nodeFs,
+          writeBytes: (file, bytes, mode) => {
+            modes[platform] = mode;
+            return nodeFs.writeBytes(file, bytes);
+          },
+        },
+      });
+      await store.prepare();
+      const { request, parts } = requestWithParts([PART_A]);
+      await store.createRequest(request, sampleState(), parts);
+    }
+    expect(modes).toEqual({ linux: 0o600, darwin: 0o600, win32: undefined });
+  });
+});
+
 describe("listing requests", () => {
   it("lists only directory names that are valid ids, in order", async () => {
     const { store, requests } = await newStore();
@@ -376,7 +604,7 @@ describe("json requests and replies", () => {
     await store.createRequest(jsonRequest, sampleState());
     const onDisk = JSON.parse(await readFile(path.join(requests, ID, "request.json"), "utf8"));
     expect(onDisk).toMatchObject({
-      formatVersion: 2,
+      formatVersion: 3,
       toolDefinitions: "none",
       replyKind: "json",
       requiredShape: shape,
@@ -869,6 +1097,198 @@ describe("removing a request", () => {
   it("treats a folder that is already gone as removed", async () => {
     const { store } = await newStore();
     expect(await store.removeRequest(ID)).toBe("removed");
+  });
+});
+
+describe("removing a request that has saved parts", () => {
+  async function withParts(overrides: Partial<StoreFs> = {}, files = [PART_A, PART_B]) {
+    const t = await newStore(overrides);
+    const { request, parts } = requestWithParts(files);
+    await t.store.createRequest(request, sampleState(), parts);
+    return { ...t, dir: path.join(t.requests, ID) };
+  }
+
+  it("removes the saved parts, then request.json, then state.json, then the folder", async () => {
+    const order: string[] = [];
+    const { store, requests } = await withParts({
+      unlink: (file) => {
+        order.push(path.basename(file));
+        return nodeFs.unlink(file);
+      },
+    });
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(order).toEqual([PART_A, PART_B, "request.json", "state.json"]);
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("removes the saved parts before the reply files and hidden leftovers", async () => {
+    const order: string[] = [];
+    const { store, dir } = await withParts({
+      unlink: (file) => {
+        order.push(path.basename(file));
+        return nodeFs.unlink(file);
+      },
+    });
+    await writeFile(path.join(dir, "reply.json"), "{}");
+    await writeFile(path.join(dir, LEFTOVER), "x");
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(order.slice(0, 2)).toEqual([PART_A, PART_B]);
+    expect(order.slice(-2)).toEqual(["request.json", "state.json"]);
+  });
+
+  it("is not troubled by a recorded part that is already gone", async () => {
+    const { store, dir, requests } = await withParts();
+    await rm(path.join(dir, PART_B));
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("keeps everything when the folder holds a file that is not recorded, even with a name of the same form", async () => {
+    for (const stranger of ["message-9-part-9.png", "message-1-part-1.png.bak", "notes.txt"]) {
+      const { store, dir } = await withParts();
+      await writeFile(path.join(dir, stranger), "mine");
+      expect(await store.removeRequest(ID)).toBe("kept");
+      expect(await names(dir)).toEqual(
+        [PART_A, PART_B, "request.json", stranger, "state.json"].sort(),
+      );
+    }
+  });
+
+  it("never removes a name that is recorded but does not have the form of a saved name", async () => {
+    const { store, dir } = await withParts({}, [PART_A]);
+    const text = await readFile(path.join(dir, "request.json"), "utf8");
+    await writeFile(path.join(dir, "request.json"), text.replaceAll(PART_A, "notes.txt"));
+    await writeFile(path.join(dir, "notes.txt"), "mine");
+    expect(await store.removeRequest(ID)).toBe("kept");
+    expect(await readFile(path.join(dir, "notes.txt"), "utf8")).toBe("mine");
+  });
+
+  describe.skipIf(process.platform === "win32")(
+    "a recorded name that is not a regular file",
+    () => {
+      it("keeps everything when it is a directory", async () => {
+        const { store, dir } = await withParts({}, [PART_A]);
+        await rm(path.join(dir, PART_A));
+        await mkdir(path.join(dir, PART_A));
+        expect(await store.removeRequest(ID)).toBe("kept");
+        expect(await names(dir)).toEqual([PART_A, "request.json", "state.json"]);
+      });
+
+      it("keeps everything and does not follow it when it is a symbolic link", async () => {
+        const { store, dir } = await withParts({}, [PART_A]);
+        const outside = path.join(await makeTempDir(), "outside.txt");
+        await writeFile(outside, "mine");
+        await rm(path.join(dir, PART_A));
+        await symlink(outside, path.join(dir, PART_A));
+        expect(await store.removeRequest(ID)).toBe("kept");
+        expect(await readFile(outside, "utf8")).toBe("mine");
+        expect(await names(dir)).toEqual([PART_A, "request.json", "state.json"]);
+      });
+    },
+  );
+
+  it("keeps the folder when request.json cannot be read and a file has the form of a saved name", async () => {
+    const { store, dir } = await withParts();
+    await writeFile(path.join(dir, "request.json"), "{not json");
+    expect(await store.removeRequest(ID)).toBe("kept");
+    expect(await names(dir)).toEqual([PART_A, PART_B, "request.json", "state.json"]);
+  });
+
+  it("keeps the folder when request.json is missing and a file has the form of a saved name", async () => {
+    const { store, dir } = await withParts();
+    await rm(path.join(dir, "request.json"));
+    expect(await store.removeRequest(ID)).toBe("kept");
+    expect(await names(dir)).toEqual([PART_A, PART_B, "state.json"]);
+  });
+
+  it("keeps the folder when request.json has attachments that break the rules", async () => {
+    const { store, dir } = await withParts({}, [PART_A]);
+    const text = await readFile(path.join(dir, "request.json"), "utf8");
+    await writeFile(path.join(dir, "request.json"), text.replace('"at": 0', '"at": 5'));
+    expect(await store.removeRequest(ID)).toBe("kept");
+    expect(await names(dir)).toEqual([PART_A, "request.json", "state.json"]);
+  });
+
+  it("still removes by name alone a request without saved parts whose request.json cannot be read", async () => {
+    const { store, requests } = await newStore();
+    await store.createRequest(sampleRequest(), sampleState());
+    await writeFile(path.join(requests, ID, "request.json"), "{not json");
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("treats a request.json that cannot be read from the disk as unreadable, not as an error", async () => {
+    const { store, requests } = await newStore({ readFile: () => Promise.reject(errno("EIO")) });
+    await store.createRequest(sampleRequest(), sampleState());
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("removes a request of an older version, which records no parts", async () => {
+    const { store, dir, requests } = await newStore().then(async (t) => {
+      await t.store.createRequest(sampleRequest(), sampleState());
+      return { ...t, dir: path.join(t.requests, ID) };
+    });
+    const old = JSON.parse(await readFile(path.join(dir, "request.json"), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    await writeFile(path.join(dir, "request.json"), JSON.stringify({ ...old, formatVersion: 2 }));
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("leaves the folder, with request.json, when a saved part cannot be removed", async () => {
+    const { store, dir } = await withParts({
+      unlink: (file) =>
+        file.endsWith(PART_B) ? Promise.reject(errno("EBUSY")) : nodeFs.unlink(file),
+    });
+    await expect(store.removeRequest(ID)).rejects.toMatchObject({
+      reason: "delete failed",
+      detail: "resource busy or locked",
+    });
+    expect(await names(dir)).toEqual([PART_B, "request.json", "state.json"]);
+  });
+
+  it("treats a request.json over the size limit as unreadable, without reading it", async () => {
+    let reads = 0;
+    const { store, dir } = await withParts({
+      readFile: (file) => {
+        reads += 1;
+        return nodeFs.readFile(file);
+      },
+      readBytes: (file, limit) => {
+        reads += 1;
+        return nodeFs.readBytes(file, limit);
+      },
+    });
+    const text = await readFile(path.join(dir, "request.json"), "utf8");
+    await writeFile(path.join(dir, "request.json"), text + " ".repeat(MAX_FILE_BYTES));
+    reads = 0;
+    expect(await store.removeRequest(ID)).toBe("kept");
+    expect(reads).toBe(0);
+    expect(await names(dir)).toEqual([PART_A, PART_B, "request.json", "state.json"]);
+  });
+
+  it("still reads a request.json of exactly the size limit", async () => {
+    const { store, dir, requests } = await withParts();
+    const text = await readFile(path.join(dir, "request.json"), "utf8");
+    const padded = text + " ".repeat(MAX_FILE_BYTES - Buffer.byteLength(text));
+    await writeFile(path.join(dir, "request.json"), padded);
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("can remove the request in a later try after a failure", async () => {
+    let broken = true;
+    const { store, requests } = await withParts({
+      unlink: (file) =>
+        broken && file.endsWith(PART_B) ? Promise.reject(errno("EBUSY")) : nodeFs.unlink(file),
+    });
+    await expect(store.removeRequest(ID)).rejects.toBeInstanceOf(IoFailure);
+    broken = false;
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
   });
 });
 

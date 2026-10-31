@@ -319,6 +319,64 @@ describe("rejected bodies", () => {
   });
 });
 
+describe("requests with an image as a data URL", () => {
+  const PNG_BASE64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+  function imageBody(text: string): string {
+    const url = `data:image/png;base64,${PNG_BASE64}`;
+    const content = [
+      { type: "text", text },
+      { type: "image_url", image_url: { url, detail: "low" } },
+    ];
+    return JSON.stringify({ model: "m", messages: [{ role: "user", content }] });
+  }
+
+  it("accepts it, stores the request with the bytes, and answers when a human replies", async () => {
+    const context = await startServer();
+    const pending = send(context.port, { body: imageBody("what is this") });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    const stored = context.store.entries.get(id)?.request;
+    const message = typeof stored === "object" ? stored.conversation[0] : undefined;
+    expect(message?.content).toBe("what is this");
+    expect(message?.attachments).toMatchObject([
+      { at: 12, kind: "image", file: "message-1-part-2.png" },
+    ]);
+    const parts = context.store.savedParts.get(id) ?? [];
+    expect(parts.map((part) => part.file)).toEqual(["message-1-part-2.png"]);
+    expect(Buffer.from(parts[0]?.bytes ?? []).toString("base64")).toBe(PNG_BASE64);
+    await answer(context, id, "a pixel");
+    const reply = await pending;
+    expect(reply.status).toBe(200);
+    expect(reply.json().choices[0]?.message.content).toBe("a pixel");
+  });
+
+  it("writes no text of the request and nothing of the part to the serve output", async () => {
+    const context = await startServer();
+    const pending = send(context.port, { body: imageBody("SECRET-TEXT") });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    await answer(context, id, "ok");
+    await pending;
+    const printed = context.out.join("");
+    expect(printed).not.toContain("SECRET-TEXT");
+    expect(printed).not.toContain(PNG_BASE64);
+    expect(printed).not.toContain("message-1-part");
+    expect(printed).not.toContain("image/png");
+  });
+
+  it("answers 500 storage_error, and keeps nothing, when the parts cannot be stored", async () => {
+    const { port, store } = await startServer();
+    store.fail("createRequest");
+    const reply = await send(port, { body: imageBody("x") });
+    expect(reply.status).toBe(500);
+    expect(reply.json().error.code).toBe("storage_error");
+    expect(store.entries.size).toBe(0);
+    expect(store.savedParts.size).toBe(0);
+  });
+});
+
 describe("requests turned away as unsupported", () => {
   const IMAGES = "Images are not supported. A human reads requests as text.";
 
@@ -1088,7 +1146,7 @@ describe("tool calls", () => {
     const [id] = [...context.store.entries.keys()] as [string];
     const stored = context.store.entries.get(id)?.request;
     expect(stored).toMatchObject({
-      formatVersion: 2,
+      formatVersion: 3,
       toolDefinitions: "tools",
     });
     expect(stored).toMatchObject({

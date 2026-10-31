@@ -335,6 +335,53 @@ describe("a delete that fails", () => {
     expect(await present(t)).toEqual([]);
   });
 
+  it("removes the saved parts with the request, and reports one failed delete of a part only once", async () => {
+    let broken = true;
+    const file = "message-1-part-1.png";
+    const t = await setup({
+      unlink: (target) =>
+        broken && target.endsWith(file) ? Promise.reject(errno("EBUSY")) : nodeFs.unlink(target),
+    });
+    const withPart: ConversationRequest = {
+      ...request,
+      conversation: [
+        {
+          role: "user",
+          content: "",
+          attachments: [
+            {
+              at: 0,
+              kind: "image",
+              mediaType: "image/png",
+              size: 1,
+              file,
+              readable: true,
+              address: null,
+              fileId: null,
+              typeName: null,
+            },
+          ],
+        },
+      ],
+    };
+    const created = "2026-10-09T09:00:00.000Z";
+    await t.store.createRequest(
+      createRequestFile(ID_A, created, withPart),
+      createStateFile(ID_A, "waiting", created, null),
+      [{ file, bytes: new Uint8Array([1]) }],
+    );
+    const ended = new Date(t.clock.now().getTime() - 2 * HOUR).toISOString();
+    const state = createStateFile(ID_A, "replied", created, ended);
+    await writeFile(path.join(t.requests, ID_A, "state.json"), serializeFile(state));
+    await t.sweeper.sweepOnce();
+    await t.sweeper.sweepOnce();
+    expect(await present(t)).toEqual([ID_A]);
+    expect(t.problems).toEqual([[ID_A, "delete failed"]]);
+    broken = false;
+    await t.sweeper.sweepOnce();
+    expect(await present(t)).toEqual([]);
+  });
+
   it("reports a failure again when it comes back after the request was read or deleted well in between", async () => {
     let broken = true;
     const t = await setup({

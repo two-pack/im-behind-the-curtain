@@ -96,6 +96,52 @@ describe("assigning ids and storing requests", () => {
     expect(clock.now().getTime()).toBeLessThan(requestIdTimeMs(future));
   });
 
+  it("passes the parts to the store unchanged, together with a request that records them", async () => {
+    const { store, broker } = setup();
+    const parts = [{ file: "message-1-part-1.png", bytes: new Uint8Array([1, 2, 3]) }];
+    const withPart = {
+      ...request,
+      conversation: [
+        {
+          role: "user" as const,
+          content: "",
+          attachments: [
+            {
+              at: 0,
+              kind: "image" as const,
+              mediaType: "image/png",
+              size: 3,
+              file: "message-1-part-1.png",
+              readable: true,
+              address: null,
+              fileId: null,
+              typeName: null,
+            },
+          ],
+        },
+      ],
+    };
+    const { id } = await broker.submit(withPart, parts);
+    expect(store.savedParts.get(id)).toBe(parts);
+    const stored = store.entries.get(id)?.request;
+    expect(typeof stored === "object" && stored.conversation[0]?.attachments).toHaveLength(1);
+  });
+
+  it("stores no parts when none are given", async () => {
+    const { store, broker } = setup();
+    const { id } = await broker.submit(request);
+    expect(store.savedParts.get(id)).toEqual([]);
+  });
+
+  it("fails without accepting the request or keeping its parts when they cannot be stored", async () => {
+    const { store, broker } = setup();
+    store.fail("createRequest");
+    const parts = [{ file: "message-1-part-1.png", bytes: new Uint8Array(1) }];
+    await expect(broker.submit(request, parts)).rejects.toBeInstanceOf(IoFailure);
+    expect(store.entries.size).toBe(0);
+    expect(store.savedParts.size).toBe(0);
+  });
+
   it("fails without accepting the request when it cannot be stored", async () => {
     const { store, broker, events } = setup();
     store.fail("createRequest");

@@ -1,6 +1,7 @@
 import { AlreadyExistsError, IoFailure, type IoReason } from "../../src/errors.js";
 import {
   type Loaded,
+  type PartFileData,
   parseReplyFile,
   type ReplyFile,
   type RequestFile,
@@ -27,6 +28,8 @@ function ioError(code: string): Error {
 /** An in-memory storage with the same rules as the real one, and failures on demand. */
 export class FakeStore implements ExchangeStorage {
   readonly entries = new Map<string, Entry>();
+  /** The parts that each request was created with, as they were passed. */
+  readonly savedParts = new Map<string, readonly PartFileData[]>();
   readonly calls: Record<string, number> = {};
   private readonly failures = new Map<string, number>();
   private readonly reasons = new Map<string, IoReason>();
@@ -117,9 +120,14 @@ export class FakeStore implements ExchangeStorage {
     return names;
   }
 
-  async createRequest(request: RequestFile, state: StateFile): Promise<void> {
+  async createRequest(
+    request: RequestFile,
+    state: StateFile,
+    parts: readonly PartFileData[] = [],
+  ): Promise<void> {
     await this.enter("createRequest", "write failed");
     this.entries.set(request.id, { request, state, files: new Map() });
+    this.savedParts.set(request.id, parts);
   }
 
   async readRequest(id: string): Promise<Stored<RequestFile>> {

@@ -32,7 +32,7 @@ function validRequestJson(): Record<string, unknown> {
 }
 
 describe("writing files", () => {
-  it("writes formatVersion 2 into a request file and 1 into the other files it creates", () => {
+  it("writes formatVersion 3 into a request file and 1 into the other files it creates", () => {
     const request = createRequestFile(ID, RECEIVED_AT, {
       format: "chat.completions",
       model: "m",
@@ -46,7 +46,7 @@ describe("writing files", () => {
     const waiting = createStateFile(ID, "waiting", RECEIVED_AT, null);
     const reply = createReplyFile("Hi", RECEIVED_AT);
     expect(FORMAT_VERSION).toBe(1);
-    expect(request.formatVersion).toBe(2);
+    expect(request.formatVersion).toBe(3);
     expect(request.toolDefinitions).toBe("none");
     expect(waiting.formatVersion).toBe(1);
     expect(reply.formatVersion).toBe(1);
@@ -93,8 +93,8 @@ describe("reading a request file", () => {
     }
   });
 
-  it("treats a file whose formatVersion is not 1 or 2 as unreadable", () => {
-    expect(parseRequestFile({ ...validRequestJson(), formatVersion: 3 }).kind).toBe("unreadable");
+  it("treats a file whose formatVersion is not 1, 2 or 3 as unreadable", () => {
+    expect(parseRequestFile({ ...validRequestJson(), formatVersion: 4 }).kind).toBe("unreadable");
     expect(parseRequestFile({ ...validRequestJson(), formatVersion: "2" }).kind).toBe("unreadable");
     const withoutVersion = validRequestJson();
     delete withoutVersion.formatVersion;
@@ -361,7 +361,7 @@ describe("the request file version and toolDefinitions", () => {
     ).toBe("unreadable");
   });
 
-  it("keeps the version of a version 1 file as 1 and writes 2 for every new file", () => {
+  it("keeps the version of a version 1 file as 1 and writes 3 for every new file", () => {
     const parsed = parseRequestFile(validRequestJson());
     expect(parsed.kind === "ok" && parsed.value.formatVersion).toBe(1);
   });
@@ -395,5 +395,157 @@ describe("the fixed reasons for tool calls", () => {
     expect(
       isInvalidReplyReason("reply tool calls are not valid (call x needs a non-empty string id)"),
     ).toBe(false);
+  });
+});
+
+describe("attachments in a version 3 request file", () => {
+  const SAVED = {
+    at: 0,
+    kind: "image" as const,
+    mediaType: "image/png",
+    size: 5,
+    file: "message-1-part-1.png",
+    readable: true,
+    address: null,
+    fileId: null,
+    typeName: null,
+  };
+
+  function fileWith(
+    content: string,
+    attachments: unknown,
+    version: number = 3,
+  ): Record<string, unknown> {
+    return {
+      ...validRequestJson(),
+      formatVersion: version,
+      toolDefinitions: "none",
+      conversation: [{ role: "user", content, attachments }],
+    };
+  }
+
+  function attachmentsOf(json: Record<string, unknown>): unknown {
+    const parsed = parseRequestFile(json);
+    return parsed.kind === "ok" ? parsed.value.conversation[0]?.attachments : parsed.kind;
+  }
+
+  it("reads and writes a saved image part", () => {
+    const json = fileWith("ab", [SAVED]);
+    expect(attachmentsOf(json)).toEqual([SAVED]);
+    const parsed = parseRequestFile(JSON.parse(serializeFile(json)));
+    expect(parsed.kind === "ok" && parsed.value.formatVersion).toBe(3);
+  });
+
+  it("writes attachments only for a message that has some", () => {
+    const request = createRequestFile(ID, RECEIVED_AT, {
+      format: "chat.completions",
+      model: "m",
+      replyKind: "text",
+      requiredShape: null,
+      stream: false,
+      includeUsage: false,
+      conversation: [
+        { role: "user", content: "Hi" },
+        { role: "user", content: "", attachments: [{ ...SAVED, at: 0 }] },
+      ],
+      originalRequest: { model: "m" },
+    });
+    const parsed = JSON.parse(serializeFile(request)) as {
+      conversation: Record<string, unknown>[];
+    };
+    expect(parsed.conversation[0]).toEqual({ role: "user", content: "Hi" });
+    expect(parsed.conversation[1]?.attachments).toEqual([SAVED]);
+  });
+
+  it("accepts at as 0, as the length of the content, and as equal to the one before", () => {
+    const later = { ...SAVED, at: 2, file: "message-1-part-2.png" };
+    const same = { ...later, file: "message-1-part-3.png" };
+    expect(attachmentsOf(fileWith("ab", [SAVED, later, same]))).toHaveLength(3);
+  });
+
+  it("rejects an at that is not an integer, is negative, or is past the content", () => {
+    for (const at of [1.5, -1, 3, "1", null, Number.NaN]) {
+      expect(attachmentsOf(fileWith("ab", [{ ...SAVED, at }]))).toBe("unreadable");
+    }
+  });
+
+  it("rejects an at that is smaller than the one before", () => {
+    const first = { ...SAVED, at: 2 };
+    const second = { ...SAVED, at: 1, file: "message-1-part-2.png" };
+    expect(attachmentsOf(fileWith("ab", [first, second]))).toBe("unreadable");
+  });
+
+  it("counts a surrogate pair as one character and a lone surrogate as one", () => {
+    expect(attachmentsOf(fileWith("\u{1F600}", [{ ...SAVED, at: 1 }]))).toHaveLength(1);
+    expect(attachmentsOf(fileWith("\u{1F600}", [{ ...SAVED, at: 2 }]))).toBe("unreadable");
+    expect(attachmentsOf(fileWith("\ud83d", [{ ...SAVED, at: 1 }]))).toHaveLength(1);
+    expect(attachmentsOf(fileWith("\ud83d", [{ ...SAVED, at: 2 }]))).toBe("unreadable");
+  });
+
+  it("rejects the whole file for a state that is not in the table", () => {
+    const bad: Record<string, unknown>[] = [
+      { ...SAVED, readable: false },
+      { ...SAVED, size: null },
+      { ...SAVED, size: -1 },
+      { ...SAVED, size: 1.5 },
+      { ...SAVED, file: null },
+      { ...SAVED, address: "x" },
+      { ...SAVED, kind: "other" },
+      { ...SAVED, kind: "video" },
+      { ...SAVED, mediaType: 5 },
+      { ...SAVED, typeName: "x" },
+      { ...SAVED, fileId: "x" },
+      { at: 0 },
+    ];
+    for (const attachment of bad) {
+      expect(attachmentsOf(fileWith("ab", [attachment]))).toBe("unreadable");
+    }
+    expect(attachmentsOf(fileWith("ab", "no"))).toBe("unreadable");
+    expect(attachmentsOf(fileWith("ab", [null]))).toBe("unreadable");
+    expect(attachmentsOf(fileWith("ab", []))).toBe("unreadable");
+  });
+
+  it("reads the other rows of the table, which this version does not write", () => {
+    const none = {
+      size: null,
+      file: null,
+      mediaType: null,
+      address: null,
+      fileId: null,
+      typeName: null,
+    };
+    const rows = [
+      { ...SAVED, mediaType: null },
+      { ...SAVED, kind: "audio", mediaType: null, size: 0 },
+      { at: 0, kind: "image", readable: true, ...none, address: "https://example.com/a.png" },
+      { at: 0, kind: "file", readable: true, ...none, fileId: "file-abc" },
+      { at: 0, kind: "file", readable: true, ...none },
+      { at: 0, kind: "audio", readable: false, ...none },
+      { at: 0, kind: "other", readable: true, ...none, typeName: "video_url" },
+    ];
+    expect(attachmentsOf(fileWith("", rows))).toEqual(rows);
+  });
+
+  it("ignores keys of an element that it does not know", () => {
+    expect(attachmentsOf(fileWith("ab", [{ ...SAVED, future: true }]))).toEqual([SAVED]);
+  });
+
+  it("reads a version 1 or 2 file without attachments, and ignores the key there", () => {
+    expect(attachmentsOf(fileWith("ab", [SAVED], 2))).toBeUndefined();
+    expect(attachmentsOf(fileWith("ab", [SAVED], 1))).toBeUndefined();
+  });
+
+  it("treats a version 3 file without toolDefinitions as unreadable", () => {
+    const json = fileWith("ab", undefined);
+    delete json.toolDefinitions;
+    expect(parseRequestFile(json).kind).toBe("unreadable");
+  });
+
+  it("reads a version 3 message without attachments as a plain message", () => {
+    const parsed = parseRequestFile(fileWith("ab", undefined));
+    expect(parsed.kind === "ok" && parsed.value.conversation[0]).toEqual({
+      role: "user",
+      content: "ab",
+    });
   });
 });

@@ -1,3 +1,4 @@
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildConversationView,
@@ -6,9 +7,10 @@ import {
   escapeControls,
   toolListLines,
 } from "../src/answer/conversation-view.js";
-import type { Message, Role } from "../src/model.js";
+import type { Attachment, Message, Role } from "../src/model.js";
 
-const PATH = "/data/requests/20261009T140512123Z-a1b2c3/request.json";
+const DIR = path.resolve("data", "requests", "20261009T140512123Z-a1b2c3");
+const PATH = path.join(DIR, "request.json");
 
 function message(role: Role, content: string): Message {
   return { role, content };
@@ -20,7 +22,7 @@ function many(role: Role, count: number): Message[] {
 }
 
 function shownContents(conversation: Message[]): string[] {
-  return buildConversationView(conversation).flatMap((entry) =>
+  return buildConversationView(conversation, DIR).flatMap((entry) =>
     entry.kind === "message" ? entry.lines : [],
   );
 }
@@ -36,7 +38,7 @@ describe("choosing the messages to show", () => {
   });
 
   it("shows everything, with no omission, for exactly three other messages", () => {
-    const entries = buildConversationView([message("system", "rules"), ...many("user", 3)]);
+    const entries = buildConversationView([message("system", "rules"), ...many("user", 3)], DIR);
     expect(entries.map((entry) => entry.kind)).toEqual([
       "message",
       "message",
@@ -46,7 +48,7 @@ describe("choosing the messages to show", () => {
   });
 
   it("omits one message for four other messages", () => {
-    const entries = buildConversationView(many("user", 4));
+    const entries = buildConversationView(many("user", 4), DIR);
     expect(entries.map((entry) => entry.kind)).toEqual([
       "omission",
       "message",
@@ -67,10 +69,187 @@ describe("choosing the messages to show", () => {
   });
 });
 
+describe("saved parts", () => {
+  function part(
+    file: string,
+    at: number,
+    size = 12345,
+    mediaType: string | null = "image/png",
+  ): Attachment {
+    return {
+      at,
+      kind: "image",
+      mediaType,
+      size,
+      file,
+      readable: true,
+      address: null,
+      fileId: null,
+      typeName: null,
+    };
+  }
+
+  function withParts(content: string, ...attachments: Attachment[]): Message {
+    return { role: "user", content, attachments };
+  }
+
+  const FILE_1 = "message-1-part-1.png";
+  const FILE_2 = "message-1-part-2.png";
+
+  function saved(file: string): string {
+    return `    saved: ${path.join(DIR, file)}`;
+  }
+
+  function linesOf(message: Message): string[] {
+    return conversationLines([message], PATH, DIR);
+  }
+
+  it("shows a part as two lines: the kind, the media type and the size, then the saved path", () => {
+    expect(linesOf(withParts("", part(FILE_1, 0)))).toEqual([
+      "User:",
+      "  [image] image/png, 12345 bytes",
+      saved(FILE_1),
+      "",
+    ]);
+  });
+
+  it("says byte for 1, bytes for 0, and unknown for a media type that is null", () => {
+    const lines = linesOf(withParts("", part(FILE_1, 0, 1), part(FILE_2, 0, 0, null)));
+    expect(lines).toEqual([
+      "User:",
+      "  [image] image/png, 1 byte",
+      saved(FILE_1),
+      "  [image] unknown, 0 bytes",
+      saved(FILE_2),
+      "",
+    ]);
+  });
+
+  it("puts the text before and after a part in the order it arrived", () => {
+    expect(linesOf(withParts("before after", part(FILE_1, 7)))).toEqual([
+      "User:",
+      "  before ",
+      "  [image] image/png, 12345 bytes",
+      saved(FILE_1),
+      "  after",
+      "",
+    ]);
+  });
+
+  it("ends a line at the part when the part comes in the middle of a line", () => {
+    const lines = linesOf(withParts("ab\ncd\nef", part(FILE_1, 4)));
+    expect(lines.slice(1, -1)).toEqual([
+      "  ab",
+      "  c",
+      "  [image] image/png, 12345 bytes",
+      saved(FILE_1),
+      "  d",
+      "  ef",
+    ]);
+  });
+
+  it("shows no line for an empty piece of text at the start, at the end or after a newline", () => {
+    const start = linesOf(withParts("ab", part(FILE_1, 0)));
+    expect(start.slice(1, -1)).toEqual(["  [image] image/png, 12345 bytes", saved(FILE_1), "  ab"]);
+    const end = linesOf(withParts("ab", part(FILE_1, 2)));
+    expect(end.slice(1, -1)).toEqual(["  ab", "  [image] image/png, 12345 bytes", saved(FILE_1)]);
+    const afterNewline = linesOf(withParts("ab\ncd", part(FILE_1, 3)));
+    expect(afterNewline.slice(1, -1)).toEqual([
+      "  ab",
+      "",
+      "  [image] image/png, 12345 bytes",
+      saved(FILE_1),
+      "  cd",
+    ]);
+  });
+
+  it("keeps parts with the same position in the order they were recorded", () => {
+    const lines = linesOf(withParts("ab", part(FILE_2, 1), part(FILE_1, 1)));
+    expect(lines.filter((line) => line.startsWith("    saved:"))).toEqual([
+      saved(FILE_2),
+      saved(FILE_1),
+    ]);
+  });
+
+  it("counts a character outside the basic plane as one when it splits the text", () => {
+    const lines = linesOf(withParts("\u{1F600}x", part(FILE_1, 1)));
+    expect(lines.slice(1, -1)).toEqual([
+      "  \u{1F600}",
+      "  [image] image/png, 12345 bytes",
+      saved(FILE_1),
+      "  x",
+    ]);
+  });
+
+  it("makes control characters of the text visible on both sides of a part", () => {
+    const lines = linesOf(withParts("a\x1bb", part(FILE_1, 2)));
+    expect(lines[1]).toBe("  a\\x1b");
+    expect(lines.at(-2)).toBe("  b");
+  });
+
+  it("does not show (empty) for a message of only parts", () => {
+    expect(linesOf(withParts("", part(FILE_1, 0))).join("\n")).not.toContain("(empty)");
+  });
+
+  it("shows the lines of the calls of an assistant message after the text and the parts", () => {
+    const call = { id: "1", type: "function", function: { name: "f", arguments: "{}" } };
+    const lines = linesOf({
+      role: "assistant",
+      content: "x",
+      attachments: [part(FILE_1, 1)],
+      tool_calls: [call],
+    });
+    expect(lines).toEqual([
+      "Assistant:",
+      "  x",
+      "  [image] image/png, 12345 bytes",
+      saved(FILE_1),
+      "  tool_call: f({})",
+      "",
+    ]);
+  });
+
+  const TEXT_199 = Array.from({ length: 199 }, (_, index) => `l${index}`).join("\n");
+
+  it("counts every line of a part in the limit of 200 lines of a message", () => {
+    const message = withParts(TEXT_199, part(FILE_1, 0), part(FILE_2, 0));
+    const entry = buildConversationView([message], DIR)[0];
+    // Four lines of parts and 199 lines of text: 203 lines, 3 are left out.
+    expect(entry?.kind === "message" && entry.lines).toHaveLength(200);
+    expect(entry?.kind === "message" && entry.hiddenLines).toBe(3);
+    expect(linesOf(message).some((line) => line.includes("(3 more lines omitted"))).toBe(true);
+  });
+
+  it("can cut between the two lines of a part: only the first line is shown", () => {
+    const lines = linesOf(withParts(TEXT_199, part(FILE_1, TEXT_199.length)));
+    expect(lines.some((line) => line.startsWith("  [image]"))).toBe(true);
+    expect(lines.some((line) => line.startsWith("    saved:"))).toBe(false);
+    expect(lines.some((line) => line.includes("(1 more line omitted"))).toBe(true);
+  });
+
+  it("shows a part whose file name does not have the form of a saved name as unreadable", () => {
+    for (const file of ["../evil.png", "notes.txt", "message-1-part-1.PNG", ""]) {
+      const lines = linesOf(withParts("", part(file, 0)));
+      expect(lines).toEqual(["User:", "  [image] (unreadable)", ""]);
+    }
+  });
+
+  it("shows a part that has no file or no size as unreadable", () => {
+    const base = part(FILE_1, 0);
+    const lines = linesOf(withParts("", { ...base, file: null }, { ...base, size: null }));
+    expect(lines).toEqual(["User:", "  [image] (unreadable)", "  [image] (unreadable)", ""]);
+  });
+
+  it("makes a control character of the media type visible", () => {
+    const lines = linesOf(withParts("", part(FILE_1, 0, 3, "image/\x1bpng")));
+    expect(lines[1]).toBe("  [image] image/\\x1bpng, 3 bytes");
+  });
+});
+
 describe("the line that says messages were omitted", () => {
   it("is one line at the place of the first omitted message, with blank lines around it", () => {
     const conversation = [message("system", "rules"), ...many("user", 6)];
-    expect(conversationLines(conversation, PATH)).toEqual([
+    expect(conversationLines(conversation, PATH, DIR)).toEqual([
       "System:",
       "  rules",
       "",
@@ -89,7 +268,7 @@ describe("the line that says messages were omitted", () => {
   });
 
   it("says message in the singular for one omitted message", () => {
-    const lines = conversationLines(many("assistant", 4), PATH);
+    const lines = conversationLines(many("assistant", 4), PATH, DIR);
     expect(lines[0]).toBe(`(1 earlier message omitted. Full conversation: ${PATH})`);
   });
 
@@ -102,7 +281,7 @@ describe("the line that says messages were omitted", () => {
       message("user", "u4"),
       message("user", "u5"),
     ];
-    const lines = conversationLines(conversation, PATH);
+    const lines = conversationLines(conversation, PATH, DIR);
     const notices = lines.filter((line) => line.includes("earlier message"));
     expect(notices).toEqual([`(2 earlier messages omitted. Full conversation: ${PATH})`]);
     expect(lines.indexOf(notices[0] as string)).toBeLessThan(lines.indexOf("Developer:"));
@@ -112,19 +291,19 @@ describe("the line that says messages were omitted", () => {
   });
 
   it("does not appear when nothing is omitted", () => {
-    const lines = conversationLines(many("user", 3), PATH);
+    const lines = conversationLines(many("user", 3), PATH, DIR);
     expect(lines.some((line) => line.includes("omitted"))).toBe(false);
   });
 });
 
 describe("an empty message", () => {
   it("shows (empty), and keeps a message of only spaces as it is", () => {
-    expect(conversationLines([message("assistant", "")], PATH)).toEqual([
+    expect(conversationLines([message("assistant", "")], PATH, DIR)).toEqual([
       "Assistant:",
       "  (empty)",
       "",
     ]);
-    expect(conversationLines([message("user", "   ")], PATH)).toEqual(["User:", "     ", ""]);
+    expect(conversationLines([message("user", "   ")], PATH, DIR)).toEqual(["User:", "     ", ""]);
   });
 });
 
@@ -153,7 +332,7 @@ describe("control characters", () => {
   });
 
   it("leaves no control character in the shown lines", () => {
-    const lines = conversationLines([message("user", "x\x1b[31m\x00\x7f\x9by\r")], PATH);
+    const lines = conversationLines([message("user", "x\x1b[31m\x00\x7f\x9by\r")], PATH, DIR);
     for (const line of lines) {
       expect([...line].some((char) => char.charCodeAt(0) < 0x20 || char === "\x7f")).toBe(false);
     }
@@ -172,13 +351,13 @@ describe("the number of lines of one message", () => {
   }
 
   it("shows 200 lines in full", () => {
-    const lines = conversationLines([message("user", lineText(200))], PATH);
+    const lines = conversationLines([message("user", lineText(200))], PATH, DIR);
     expect(lines).toHaveLength(1 + 200 + 1);
     expect(lines.some((line) => line.includes("more line"))).toBe(false);
   });
 
   it("cuts a message of 1000 lines at 200 and says how many were left out", () => {
-    const lines = conversationLines([message("user", lineText(1000))], PATH);
+    const lines = conversationLines([message("user", lineText(1000))], PATH, DIR);
     expect(lines).toHaveLength(1 + 200 + 1 + 1);
     expect(lines[200]).toBe("  line 200");
     expect(lines[201]).toBe(`  (800 more lines omitted. Full conversation: ${PATH})`);
@@ -186,26 +365,26 @@ describe("the number of lines of one message", () => {
   });
 
   it("says line in the singular when one line is left out", () => {
-    const lines = conversationLines([message("user", lineText(201))], PATH);
+    const lines = conversationLines([message("user", lineText(201))], PATH, DIR);
     expect(lines[201]).toBe(`  (1 more line omitted. Full conversation: ${PATH})`);
   });
 
   it("counts the empty line after a final newline", () => {
     const text = `${lineText(200)}\n`;
-    const lines = conversationLines([message("user", text)], PATH);
+    const lines = conversationLines([message("user", text)], PATH, DIR);
     expect(lines[201]).toBe(`  (1 more line omitted. Full conversation: ${PATH})`);
   });
 
   it("counts lines after the control characters are replaced", () => {
     const text = `${"a\r\n".repeat(200)}b`;
-    const lines = conversationLines([message("user", text)], PATH);
+    const lines = conversationLines([message("user", text)], PATH, DIR);
     expect(lines[201]).toBe(`  (1 more line omitted. Full conversation: ${PATH})`);
   });
 });
 
 describe("the layout of a message", () => {
   it("indents each line by two spaces, keeps tabs, and leaves empty lines empty", () => {
-    expect(conversationLines([message("system", "a\n\n\tb")], PATH)).toEqual([
+    expect(conversationLines([message("system", "a\n\n\tb")], PATH, DIR)).toEqual([
       "System:",
       "  a",
       "",
@@ -219,6 +398,7 @@ describe("the layout of a message", () => {
     const lines = conversationLines(
       roles.map((role) => message(role, "x")),
       PATH,
+      DIR,
     );
     expect(lines.filter((line) => line.endsWith(":"))).toEqual([
       "System:",
@@ -229,7 +409,11 @@ describe("the layout of a message", () => {
   });
 
   it("names the tool and function roles too", () => {
-    const lines = conversationLines([message("tool", "sunny"), message("function", "old")], PATH);
+    const lines = conversationLines(
+      [message("tool", "sunny"), message("function", "old")],
+      PATH,
+      DIR,
+    );
     expect(lines).toEqual(["Tool:", "  sunny", "", "Function:", "  old", ""]);
   });
 });
@@ -246,7 +430,7 @@ describe("showing tool calls", () => {
   }
 
   function linesOf(item: Message): string[] {
-    return conversationLines([item], PATH);
+    return conversationLines([item], PATH, DIR);
   }
 
   it("shows the name and the arguments of a call, and not (empty) for an empty content", () => {
@@ -397,7 +581,9 @@ describe("showing tool calls", () => {
     });
     const [, shown] = linesOf(item);
     expect(shown).toBe("  tool_call: a\\x1b[31mb(x\\x0ay\\x07)");
-    expect(conversationLines([message("tool", "ok\u001b")], PATH).join("")).not.toContain("\u001b");
+    expect(conversationLines([message("tool", "ok\u001b")], PATH, DIR).join("")).not.toContain(
+      "\u001b",
+    );
   });
 
   it("shows a tool message together with its own content only", () => {

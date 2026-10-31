@@ -1,11 +1,15 @@
 /**
  * The Chat Completions adapter: checks a request body, turns it into the shared
  * conversation form, and builds the response and error bodies.
- * It has no side effects and calls no other module.
+ * It has no side effects and calls only the leaf modules.
  */
+import { readDataUrl, savedFileName } from "../media-parts.js";
 import {
+  type Attachment,
   type ConversationRequest,
+  characterCount,
   type Message,
+  type PartFileData,
   pickToolFields,
   type ReplyKind,
   ROLES,
@@ -57,7 +61,12 @@ interface RequestRejection extends Failure {
 }
 
 export type AdapterResult =
-  | { ok: true; request: ConversationRequest }
+  | {
+      ok: true;
+      request: ConversationRequest;
+      /** The bytes of the parts that are saved as files, in the order they arrived. */
+      parts: PartFileData[];
+    }
   | { ok: false; rejection: RequestRejection };
 
 export interface ErrorBody {
@@ -176,12 +185,38 @@ function mayLeaveOutContent(message: Record<string, unknown>): boolean {
   );
 }
 
-/** Any part of the content that is an image. */
+/** The url of an `image_url` part, if the part has the shape and the url is a string. */
+function imageUrlOf(part: Record<string, unknown>): string | undefined {
+  const inner = part.image_url;
+  return isRecord(inner) && typeof inner.url === "string" ? inner.url : undefined;
+}
+
+type DecodedImage = ReturnType<typeof readDataUrl>;
+
+/** The decoded data of each image part, so that a data URL is decoded once per request. */
+const decodedImages = new WeakMap<object, DecodedImage>();
+
+/** The decoded data of an `image_url` part; undefined when its url is not a readable data URL. */
+function decodeImage(part: Record<string, unknown>): DecodedImage {
+  if (!decodedImages.has(part)) {
+    const url = imageUrlOf(part);
+    decodedImages.set(part, url === undefined ? undefined : readDataUrl(url));
+  }
+  return decodedImages.get(part);
+}
+
+/** Whether a part is an image that this version reads: the url is a readable data URL. */
+function isReadableImage(part: Record<string, unknown>): boolean {
+  return decodeImage(part) !== undefined;
+}
+
+/** Any part of the content that is an image this version does not read. */
 function checkImageParts(message: Record<string, unknown>): Failure | undefined {
   const content = message.content;
-  const hasImage =
-    Array.isArray(content) && content.some((part) => isRecord(part) && part.type === "image_url");
-  return hasImage ? unsupported(MESSAGES.images) : undefined;
+  const hasUnreadable =
+    Array.isArray(content) &&
+    content.some((part) => isRecord(part) && part.type === "image_url" && !isReadableImage(part));
+  return hasUnreadable ? unsupported(MESSAGES.images) : undefined;
 }
 
 function partTypeMessage(type: string): string {
@@ -195,7 +230,12 @@ function checkOtherParts(message: Record<string, unknown>): Failure | undefined 
     return undefined;
   }
   for (const part of content) {
-    if (isRecord(part) && typeof part.type === "string" && part.type !== "text") {
+    if (
+      isRecord(part) &&
+      typeof part.type === "string" &&
+      part.type !== "text" &&
+      part.type !== "image_url"
+    ) {
       return unsupported(partTypeMessage(part.type));
     }
   }
@@ -231,39 +271,93 @@ function textOfPart(part: unknown): string | undefined {
     : undefined;
 }
 
+/** What is read from the content of one message. */
+interface ReadContent {
+  /** The text parts joined without a separator. */
+  text: string;
+  /** The parts that are not text, in order. Empty when there are none. */
+  attachments: Attachment[];
+  /** The bytes of the saved parts, with their file names. */
+  parts: PartFileData[];
+}
+
+function textOnly(text: string): ReadContent {
+  return { text, attachments: [], parts: [] };
+}
+
+/** The decoded data of an `image_url` part with a readable data URL; undefined for any other. */
+function readableImageOf(part: unknown): DecodedImage {
+  return isRecord(part) && part.type === "image_url" ? decodeImage(part) : undefined;
+}
+
 /**
- * The text of a message content: a string as it is, null as "", an array of text
- * parts joined without a separator. Anything else gives undefined.
+ * The text and the parts of an array content. A text part adds to the text. An image with a
+ * readable data URL becomes an attachment placed after the characters of text before it, and its
+ * bytes are saved under a name made from the message and part numbers. Any other part gives
+ * undefined; the other parts that are accepted were checked before.
  */
-function readContent(content: unknown): string | undefined {
+function readParts(content: unknown[], messageNumber: number): ReadContent | undefined {
+  const read: ReadContent = { text: "", attachments: [], parts: [] };
+  let characters = 0;
+  for (const [index, part] of content.entries()) {
+    const text = textOfPart(part);
+    const image = readableImageOf(part);
+    if (text !== undefined) {
+      read.text += text;
+      characters += characterCount(text);
+    } else if (image !== undefined) {
+      const file = savedFileName(messageNumber, index + 1, image.mediaType);
+      read.attachments.push({
+        at: characters,
+        kind: "image",
+        mediaType: image.mediaType,
+        size: image.bytes.length,
+        file,
+        readable: true,
+        address: null,
+        fileId: null,
+        typeName: null,
+      });
+      read.parts.push({ file, bytes: image.bytes });
+    } else {
+      return undefined;
+    }
+  }
+  return read;
+}
+
+/**
+ * The content of a message: a string as it is, null as "", an array by `readParts`. Anything else
+ * gives undefined.
+ */
+function readContent(content: unknown, messageNumber: number): ReadContent | undefined {
   if (typeof content === "string") {
-    return content;
+    return textOnly(content);
   }
   if (content === null) {
-    return "";
+    return textOnly("");
   }
-  if (!Array.isArray(content)) {
-    return undefined;
-  }
-  const texts = content.map(textOfPart);
-  return texts.every((text) => text !== undefined) ? texts.join("") : undefined;
+  return Array.isArray(content) ? readParts(content, messageNumber) : undefined;
 }
 
-/** The text of a message; a missing content is "" only for an assistant message with tool calls. */
-function messageText(message: Record<string, unknown>): string | undefined {
+/** The content of a message; a missing content is "" only for an assistant message with tool calls. */
+function messageContent(
+  message: Record<string, unknown>,
+  messageNumber: number,
+): ReadContent | undefined {
   if (message.content === undefined && mayLeaveOutContent(message)) {
-    return "";
+    return textOnly("");
   }
-  return readContent(message.content);
+  return readContent(message.content, messageNumber);
 }
 
-type MessageResult = { message: Message } | { error: Failure };
+type MessageResult = { message: Message; parts: PartFileData[] } | { error: Failure };
 
 /**
  * Checks one message in order: object, the checks of MESSAGE_CHECKS, then
  * content. The role, the text content and the tool fields are kept.
  */
-function convertMessage(item: unknown): MessageResult {
+function convertMessage(item: unknown, messageNumber: number): MessageResult {
   if (!isRecord(item)) {
     return { error: invalid(MESSAGES.messageNotObject) };
   }
@@ -271,26 +365,32 @@ function convertMessage(item: unknown): MessageResult {
   if (failure !== undefined) {
     return { error: failure };
   }
-  const content = messageText(item);
-  if (content === undefined) {
+  const read = messageContent(item, messageNumber);
+  if (read === undefined) {
     return { error: invalid(MESSAGES.contentType) };
   }
-  return {
-    message: { role: item.role as Role, content, ...pickToolFields(item) },
-  };
+  const message: Message = { role: item.role as Role, content: read.text, ...pickToolFields(item) };
+  if (read.attachments.length > 0) {
+    message.attachments = read.attachments;
+  }
+  return { message, parts: read.parts };
 }
 
 /** Checks the messages one by one and stops at the first one that fails. */
-function convertMessages(items: unknown[]): { messages: Message[] } | { error: Failure } {
+function convertMessages(
+  items: unknown[],
+): { messages: Message[]; parts: PartFileData[] } | { error: Failure } {
   const messages: Message[] = [];
-  for (const item of items) {
-    const converted = convertMessage(item);
+  const parts: PartFileData[] = [];
+  for (const [index, item] of items.entries()) {
+    const converted = convertMessage(item, index + 1);
     if ("error" in converted) {
       return converted;
     }
     messages.push(converted.message);
+    parts.push(...converted.parts);
   }
-  return { messages };
+  return { messages, parts };
 }
 
 /** The reply kind and the required shape of a request, from `response_format`. */
@@ -360,6 +460,7 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
       originalRequest: body,
       toolDefinitions: readToolDefinitions(body),
     },
+    parts: converted.parts,
   };
 }
 
