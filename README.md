@@ -38,13 +38,13 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 - `POST /v1/chat/completions` in the Chat Completions format: text messages, JSON replies for structured output, and streaming. Any model name and any API key will do.
 - `GET /v1/models`.
 - Tools: requests with `tools` or `functions`, and messages with `tool_calls`, `function_call` or the roles `tool` and `function`, are saved and shown. To play a model that calls a tool, type a JSON array of calls as the reply. The client then receives `tool_calls` (or `function_call` when only `functions` were sent), also in a stream. Other replies are sent as text. See [the specification](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md) for the form.
-- A part that is not text (image, audio, a file) is refused with a `400` error whose `code` is `unsupported_content`. It is not saved.
+- Parts that are not text (image, audio, a file) are received, not refused. The data of a part is saved as a file next to the request, and `imbehind answer` shows a line for each part with its media type, its size and the path of the file. An address in a part is shown as it is and never fetched. A line longer than 1000 characters is cut on the screen.
 
 The server waits for a reply for 30 minutes by default. Set the timeout of your client to at least that, and turn its automatic retries off, or the client may give up and send the request again. [The specification](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md) has examples for the official OpenAI SDKs, all settings, and the files that the server writes.
 
 ## Notes
 
-- Everything you send is saved to files and read by a human. A request that is refused, such as one with an image, is not saved.
+- Everything you send is saved to files and read by a human, the data of images, audio and files included. A request that is not valid, such as one that is not JSON, is not saved.
 - There is no authentication, and the server only listens on local addresses. Use it only on your own machine.
 - Not affiliated with OpenAI, Anthropic, or any other company named here.
 

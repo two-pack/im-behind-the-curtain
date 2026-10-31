@@ -31,6 +31,11 @@ const MAX_ATTACHMENT_RECORD_BYTES = 295;
  * received, and the text and the strings of the attachments are copies of body bytes. Then comes
  * the largest record of an attachment times the most parts a body can hold. It is about 280 MB.
  * There is no limit on the number of parts; this only bounds how much is read back.
+ *
+ * request.json is written with a two-space indent, so a body that is within `MAX_BODY_BYTES` can
+ * still give a file over this limit (a deeply nested body, for example). The cleanup does not read
+ * such a file: it knows no saved file name from it, so it keeps the folder of the request only if
+ * the folder also holds a file with the form of a saved name; otherwise the folder is removed.
  */
 export const MAX_REQUEST_FILE_BYTES =
   2 * MAX_BODY_BYTES +

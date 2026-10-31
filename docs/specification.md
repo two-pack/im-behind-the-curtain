@@ -30,16 +30,41 @@ Any other path gets `404`. Another method on a known path gets `405` with an `Al
 `POST /v1/chat/completions` takes a JSON body with `model` (a string, any value) and `messages` (a non-empty array). An API key is not needed, and one is not checked. Fields that the server does not know are ignored.
 
 - `role` must be `system`, `developer`, `user`, `assistant`, `tool` or `function`.
-- `content` can be a string, `null` (shown as `(empty)`) or an array of text parts `{"type": "text", "text": "..."}`, which are joined without a separator. An `assistant` message that has `tool_calls` or `function_call` may leave `content` out.
+- `content` can be a string, `null` (shown as `(empty)`) or an array of parts. A string is text as it is, also when it looks like a JSON array, an image or a long base64 text; it is never read as parts. In an array, the `text` parts `{"type": "text", "text": "..."}` are joined without a separator. An `assistant` message that has `tool_calls` or `function_call` may leave `content` out.
+- A part of the type `image_url`, `input_audio` or `file` is accepted in a message of every role. The request is stored and shown to the human, and the data of the part is saved as a file when it can be read. A part of any other `type` is accepted too, and is shown by its type name. A part of a known type whose content cannot be read is accepted and shown as unreadable. The server never fetches an address. See "Parts that are not text".
+- A part that is not an object, a part without a string `type`, and a `text` part without a string `text` are refused.
 - `tools`, `functions`, `tool_calls`, `function_call` and the messages of the roles `tool` and `function` are accepted. See "Tool calls".
 - `n` must be missing or 1.
 - `response_format.type` set to `json_schema` or `json_object` asks for a JSON reply. Any other request asks for text.
 - `stream: true` asks for a streamed response. `stream_options.include_usage: true` adds a usage chunk.
-- A body larger than 10 MB (10485760 bytes) is refused. A body of exactly 10485760 bytes is accepted.
+- A body larger than 10 MB (10485760 bytes) is refused. A body of exactly 10485760 bytes is accepted. There is no limit on the number of parts in it.
+
+### Parts that are not text
+
+Each part of an array `content` that is not a `text` part is read once, and the result is stored in `attachments` of the message (see [storage-format.md](storage-format.md)). The saved data goes to a file in the folder of the request.
+
+| Part | What is read | Result |
+|---|---|---|
+| `image_url` | `url` starts with `data:` (in any case), has a comma, and its header ends with `;base64`, and the data is base64 text | Saved |
+| `image_url` | `url` is a non-empty string that does not start with `data:` | Kept as an address, not fetched, not saved |
+| `image_url` | `url` is missing, is empty or is not a string, or a `data:` URL that cannot be read | Unreadable |
+| `input_audio` | `data` is base64 text (it may be empty) | Saved. `format` `wav` gives `audio/wav` and `mp3` gives `audio/mpeg`; any other `format` gives an unknown media type |
+| `input_audio` | `input_audio` is not an object, or `data` is not base64 text | Unreadable |
+| `file` | `file_data` is a `data:` URL that can be read, as for `image_url` | Saved |
+| `file` | `file_data` is missing or `null`, and `file_id` is a string | Kept as a `file_id`, not saved |
+| `file` | `file_data` is missing or `null`, and `file_id` is not a string | Kept as a file with no data |
+| `file` | `file_data` is anything else (empty, not a `data:` URL, not a string), or `file` is not an object | Unreadable. A `file_id` next to it is not shown |
+| any other `type` | a string | Kept by its type name, not saved |
+
+- Base64 text has the standard alphabet (`A`-`Z`, `a`-`z`, `0`-`9`, `+`, `/`) and at most two `=` at the end, and no white space. Text that is not valid base64 is unreadable.
+- The media type of a `data:` URL is the first item of its header, in lower case, when it has the form `type/subtype`. A `;name=...` after it is not part of it. Otherwise the media type is unknown.
+- The `filename` of a `file` part is neither used nor shown.
+- The size of a saved part is the number of bytes after decoding. A `data:` URL with empty data is saved as a file of 0 bytes.
+- The files are written before the request is stored. If they cannot be written, nothing of the request stays and the client gets `storage_error`.
 
 ### Requests that are refused
 
-A refused request is not stored and not shown to a human. The error has the OpenAI shape:
+A refused request is not stored and not shown to a human. A part that is an image, audio or a file is not a reason to refuse a request. The error has the OpenAI shape:
 
 ```json
 { "error": { "message": "...", "type": "invalid_request_error", "code": "invalid_request" } }
@@ -49,7 +74,7 @@ A refused request is not stored and not shown to a human. The error has the Open
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | The body is not JSON; `model` or `messages` is missing or wrong; a message is not an object; a `content` has a wrong type or a part has a wrong form; the role is not one of the six; `n` is 2 or more; the `Origin` or `Host` header is not allowed |
+| 400 | `invalid_request` | The body is not JSON; `model` or `messages` is missing or wrong; a message is not an object; a `content` has a wrong type; a part is not an object, has no string `type`, or is a `text` part without a string `text`; the role is not one of the six; `n` is 2 or more; the `Origin` or `Host` header is not allowed |
 | 404 | `not_found` | The path is not known |
 | 405 | `method_not_allowed` | The method is not allowed on this path |
 | 413 | `request_too_large` | The body is larger than 10 MB. The connection is closed after the answer |
@@ -196,6 +221,27 @@ With a terminal as standard input, it shows one request at a time, oldest first,
 
 It shows every `system` and `developer` message and the last three of the other messages. When it leaves messages out, it prints a line such as `(3 earlier messages omitted. Full conversation: <path>)`. A message longer than 200 lines is cut after 200 lines. Control characters other than newline and tab are shown as `\xNN`. What is shown for tools, tool calls and tool messages is described in "Tool calls".
 
+**Parts that are not text.** Each such part has its own line, in the order the parts arrived, between the lines of the text before and after it. A message with parts and no text shows the part lines, not `(empty)`. The lines are indented like the text of the message.
+
+```
+User:
+  What is this?
+  [image] image/png, 12345 bytes
+    saved: /home/me/.local/share/imbehind/requests/20261031T071240123Z-a1b2c3/message-1-part-2.png
+  [file] file_id: file-abc123
+  [image] https://example.com/cat.png
+  [audio] (unreadable)
+  [video_url]
+```
+
+- A saved part has two lines: the kind (`[image]`, `[audio]` or `[file]`), the media type and the size, then `saved:` and the absolute path of the file, indented by two more spaces. The size is the number of bytes of the data, `1 byte` or `N bytes`. A media type that is not known is shown as `unknown`.
+- A part kept as an address shows the kind and the address, as received. A `file` part with a `file_id` shows `[file] file_id: <id>`, and one with neither shows `[file]`. A part that cannot be read shows `[<kind>] (unreadable)`. A part of an unknown `type` shows `[<type>]`.
+- Control characters in an address, a `file_id`, a media type or a type name are shown as `\xNN`.
+- The path of a saved part is built from the folder of the request and the name in `request.json`, and only when the name has the form of a saved name (see [storage-format.md](storage-format.md)). Otherwise the part is shown as `(unreadable)`.
+- The words of these lines are for people, and they can change. The files in [storage-format.md](storage-format.md) are the contract.
+- Every line of the conversation is cut when it is longer than 1000 Unicode characters: text lines, lines of tool calls, and the first line of a part. The characters are counted after control characters are made visible, without the indent and with a prefix such as `[image] `. The line keeps its first 1000 characters and ends with `... (<n> characters in this line. Full conversation: <path of request.json>)`, where `<n>` is the length of the whole line. The `saved:` line is not cut, so that the path stays usable. A line of exactly 1000 characters is not cut.
+- The lines of parts count towards the limit of 200 lines of a message. A saved part can be split at that limit: the first line is shown and the `saved:` line is left out. The saved file and the whole conversation are in the request folder.
+
 If the request ends while the human types (the client left or the wait limit passed), or another window replied first, the command says so, drops what was typed and goes on to the next request. If a new request arrives, it prints the number of waiting requests.
 
 #### Replying from standard input
@@ -228,7 +274,7 @@ A tool can also write a `reply.json` file itself, without `imbehind answer`. A r
 
 The storage directory is `$XDG_DATA_HOME/imbehind` (or `~/.local/share/imbehind`) on Linux, `~/Library/Application Support/imbehind` on macOS, and `%LOCALAPPDATA%\imbehind` on Windows. Only `imbehind serve` creates it.
 
-Each request is a folder with `request.json`, `state.json`, and, once a reply exists, `reply.json` or `reply.accepted.json`. The format of these files is in [storage-format.md](storage-format.md). The state of a request is one of:
+Each request is a folder with `request.json`, `state.json`, the saved parts if there are any (`message-<m>-part-<p>.<extension>`), and, once a reply exists, `reply.json` or `reply.accepted.json`. The format of these files is in [storage-format.md](storage-format.md). The state of a request is one of:
 
 | State | Meaning |
 |---|---|
@@ -246,6 +292,7 @@ Other rules:
 - `imbehind serve` writes `serve.lock` in the storage directory and renews it every 5 seconds. A second `imbehind serve` for the same directory stops. A lock left by a killed server is taken over when its process is gone or its last renewal is more than 15 seconds old. A `serve.lock` that is not a lock of this program is never read or deleted.
 - At start, requests that are still `waiting` are ended as `abandoned`.
 - A finished request is deleted with its folder when `--retention` seconds have passed since it ended. The check runs at start and then every `--sweep-interval` seconds. A folder with files that this program did not make is kept, and one `error` line is printed for it. A waiting request is never deleted.
+- The saved parts of a request are files that this program made. They are deleted with the folder of the request, after the retention time. A folder that also holds a file that `request.json` does not record, a directory or a symbolic link is kept, as above. So is a folder whose `request.json` cannot be read, or is larger than the limit that the deletion reads (see [storage-format.md](storage-format.md)), when it holds a file that has the form of a saved name.
 - The storage directory must support hard links.
 - Only the first reply to a request is used, whether it comes from `imbehind answer`, from another window, or from a file written by a tool.
 
@@ -257,4 +304,6 @@ Other rules:
 | Reply (written file) | 10485760 bytes |
 | Messages shown by `imbehind answer` | all `system` and `developer`, and the last 3 others |
 | Lines of one message shown | 200 |
+| Characters of one line shown | 1000 Unicode characters. A longer line is cut |
+| Parts that are not text in a request | No limit on the number. The limit of the body applies |
 | Authentication | None. Use the server only on your own machine |
