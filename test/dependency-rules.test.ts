@@ -78,6 +78,30 @@ describe("the dependency rules (logical-components: the leaf modules)", () => {
     expect(violations).toEqual([]);
   });
 
+  it("treats media-parts as a leaf module that the adapter, the store and the view may use", async () => {
+    const violations = await cruise({
+      "model.ts": LEAF,
+      "media-parts.ts": 'import { value } from "./model.js";\nexport const parts = value;\n',
+      "chat-completions/adapter.ts":
+        'import { parts } from "../media-parts.js";\nexport const parse = parts;\n',
+      "store/exchange-store.ts":
+        'import { parts } from "../media-parts.js";\nexport const store = parts;\n',
+      "answer/conversation-view.ts":
+        'import { parts } from "../media-parts.js";\nexport const view = parts;\n',
+    });
+    expect(violations).toEqual([]);
+  });
+
+  it("reports a media-parts module that imports a module that is not a leaf", async () => {
+    const violations = await cruise({
+      "clock.ts": LEAF,
+      "media-parts.ts": 'import { value } from "./clock.js";\nexport const parts = value;\n',
+    });
+    expect(violations.map((violation) => `${violation.from} -> ${violation.to}`)).toEqual([
+      "src/media-parts.ts -> src/clock.ts",
+    ]);
+  });
+
   it("reports a tool-calls module that imports a module that is not a leaf", async () => {
     const violations = await cruise({
       "clock.ts": LEAF,

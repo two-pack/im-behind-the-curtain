@@ -6,8 +6,40 @@
 /** The format version of state.json and reply.json. */
 export const FORMAT_VERSION = 1;
 
-/** The format version that request.json is written with. Version 1 files are still read. */
-const REQUEST_FORMAT_VERSION = 2;
+/** The format version that request.json is written with. Versions 1 and 2 are still read. */
+const REQUEST_FORMAT_VERSION = 3;
+
+/** The most bytes of a request body that the server accepts: 10 MB. */
+export const MAX_BODY_BYTES = 10485760;
+
+/**
+ * The fewest bytes a part can take in a body and still become an attachment: `{"type":""}` is 11
+ * bytes and the comma before it is 1. So a body holds at most `MAX_BODY_BYTES / 12` parts.
+ */
+const SMALLEST_PART_BYTES = 12;
+
+/**
+ * The most bytes one attachment takes in request.json, as written with two-space indent: the keys
+ * and the punctuation, an `at` and a `size` of ten digits and a saved file name with seven-digit
+ * numbers (measured at 295 bytes). The strings of an attachment (an address, a file_id, a type
+ * name) are not counted here; they are copies of body bytes and are counted in the base below.
+ */
+const MAX_ATTACHMENT_RECORD_BYTES = 295;
+
+/**
+ * The most bytes request.json can have. The base is two bodies: `originalRequest` is the body as
+ * received, and the text and the strings of the attachments are copies of body bytes. Then comes
+ * the largest record of an attachment times the most parts a body can hold. It is about 280 MB.
+ * There is no limit on the number of parts; this only bounds how much is read back.
+ *
+ * request.json is written with a two-space indent, so a body that is within `MAX_BODY_BYTES` can
+ * still give a file over this limit (a deeply nested body, for example). The cleanup does not read
+ * such a file: it knows no saved file name from it, so it keeps the folder of the request only if
+ * the folder also holds a file with the form of a saved name; otherwise the folder is removed.
+ */
+export const MAX_REQUEST_FILE_BYTES =
+  2 * MAX_BODY_BYTES +
+  MAX_ATTACHMENT_RECORD_BYTES * Math.floor(MAX_BODY_BYTES / SMALLEST_PART_BYTES);
 
 /** The most bytes a reply file may have, as written. */
 export const MAX_FILE_BYTES = 10485760;
@@ -146,9 +178,38 @@ export interface ToolFields {
 
 const TOOL_FIELD_NAMES = ["tool_call_id", "name", "tool_calls", "function_call"] as const;
 
+/** The kinds of a part that is not text. `other` is a part type this version does not know. */
+type AttachmentKind = "image" | "audio" | "file" | "other";
+
+/**
+ * A part of a message that is not text. `at` is the number of Unicode characters of `content`
+ * that come before the part. The other fields follow the table of states in the storage format:
+ * a saved part has a media type, a size and a file name, and the rest are null.
+ */
+export interface Attachment {
+  at: number;
+  kind: AttachmentKind;
+  mediaType: string | null;
+  size: number | null;
+  file: string | null;
+  readable: boolean;
+  address: string | null;
+  fileId: string | null;
+  typeName: string | null;
+}
+
+/** The bytes of a saved part and the name of the file they are written to. */
+export interface PartFileData {
+  file: string;
+  bytes: Uint8Array;
+}
+
 export interface Message extends ToolFields {
   role: Role;
+  /** The text parts joined without a separator; empty when there is no text part. */
   content: string;
+  /** The parts that are not text, in the order they arrived. Missing when there are none. */
+  attachments?: Attachment[];
 }
 
 /** The tool fields that `source` has, with the values it has. */
@@ -177,8 +238,8 @@ export interface ConversationRequest {
 }
 
 export interface RequestFile extends ConversationRequest {
-  /** The version the file was written with: 1 by an older version, 2 by this one. */
-  formatVersion: 1 | 2;
+  /** The version the file was written with: 1 or 2 by an older version, 3 by this one. */
+  formatVersion: 1 | 2 | 3;
   id: string;
   receivedAt: string;
   toolDefinitions: ToolDefinitions;
@@ -256,7 +317,184 @@ function isToolDefinitions(value: unknown): value is ToolDefinitions {
   return typeof value === "string" && (TOOL_DEFINITIONS as readonly string[]).includes(value);
 }
 
-function parseConversation(value: unknown): Message[] | undefined {
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+/** How many Unicode characters `text` has; a surrogate pair is one, and so is a lone surrogate. */
+export function characterCount(text: string): number {
+  let count = 0;
+  for (const _character of text) {
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * The value of each field of an attachment, by state. `s` is a string, `n` a size, `-` null.
+ * A state is one row of the table in the storage format; `kinds` are the kinds it allows.
+ */
+interface AttachmentState {
+  kinds: readonly AttachmentKind[];
+  readable: boolean;
+  mediaType: "s?" | "-";
+  size: "n" | "-";
+  file: "s" | "-";
+  address: "s" | "-";
+  fileId: "s" | "-";
+  typeName: "s" | "-";
+}
+
+const MEDIA_KINDS: readonly AttachmentKind[] = ["image", "audio", "file"];
+
+const ATTACHMENT_STATES: readonly AttachmentState[] = [
+  // Saved.
+  {
+    kinds: MEDIA_KINDS,
+    readable: true,
+    mediaType: "s?",
+    size: "n",
+    file: "s",
+    address: "-",
+    fileId: "-",
+    typeName: "-",
+  },
+  // An address only.
+  {
+    kinds: ["image"],
+    readable: true,
+    mediaType: "-",
+    size: "-",
+    file: "-",
+    address: "s",
+    fileId: "-",
+    typeName: "-",
+  },
+  // A file_id only.
+  {
+    kinds: ["file"],
+    readable: true,
+    mediaType: "-",
+    size: "-",
+    file: "-",
+    address: "-",
+    fileId: "s",
+    typeName: "-",
+  },
+  // No data and no file_id.
+  {
+    kinds: ["file"],
+    readable: true,
+    mediaType: "-",
+    size: "-",
+    file: "-",
+    address: "-",
+    fileId: "-",
+    typeName: "-",
+  },
+  // Unreadable.
+  {
+    kinds: MEDIA_KINDS,
+    readable: false,
+    mediaType: "-",
+    size: "-",
+    file: "-",
+    address: "-",
+    fileId: "-",
+    typeName: "-",
+  },
+  // A part type that is not known.
+  {
+    kinds: ["other"],
+    readable: true,
+    mediaType: "-",
+    size: "-",
+    file: "-",
+    address: "-",
+    fileId: "-",
+    typeName: "s",
+  },
+];
+
+function fieldFits(value: unknown, shape: "s" | "n" | "s?" | "-"): boolean {
+  switch (shape) {
+    case "s":
+      return isString(value);
+    case "s?":
+      return isString(value) || value === null;
+    case "n":
+      return isNonNegativeInteger(value);
+    default:
+      return value === null;
+  }
+}
+
+function matchesState(item: Record<string, unknown>, state: AttachmentState): boolean {
+  return (
+    (state.kinds as readonly unknown[]).includes(item.kind) &&
+    item.readable === state.readable &&
+    fieldFits(item.mediaType, state.mediaType) &&
+    fieldFits(item.size, state.size) &&
+    fieldFits(item.file, state.file) &&
+    fieldFits(item.address, state.address) &&
+    fieldFits(item.fileId, state.fileId) &&
+    fieldFits(item.typeName, state.typeName)
+  );
+}
+
+/** One attachment, or undefined when it is not in the table of states. Unknown keys are dropped. */
+function parseAttachment(item: unknown): Attachment | undefined {
+  if (
+    !isRecord(item) ||
+    !isNonNegativeInteger(item.at) ||
+    !ATTACHMENT_STATES.some((state) => matchesState(item, state))
+  ) {
+    return undefined;
+  }
+  return {
+    at: item.at,
+    kind: item.kind as AttachmentKind,
+    mediaType: item.mediaType as string | null,
+    size: item.size as number | null,
+    file: item.file as string | null,
+    readable: item.readable as boolean,
+    address: item.address as string | null,
+    fileId: item.fileId as string | null,
+    typeName: item.typeName as string | null,
+  };
+}
+
+/**
+ * The attachments of a message with the text `content`: at least one, each in the table of
+ * states, and each `at` between the one before and the number of characters of the text.
+ */
+function parseAttachments(value: unknown, content: string): Attachment[] | undefined {
+  if (!Array.isArray(value) || value.length === 0) {
+    return undefined;
+  }
+  const limit = characterCount(content);
+  const attachments: Attachment[] = [];
+  let previous = 0;
+  for (const item of value) {
+    const attachment = parseAttachment(item);
+    if (attachment === undefined || attachment.at > limit || attachment.at < previous) {
+      return undefined;
+    }
+    previous = attachment.at;
+    attachments.push(attachment);
+  }
+  return attachments;
+}
+
+/**
+ * The messages of a file. Only a version 3 file has attachments; the key is not looked at in an
+ * older file. A message without the key has none.
+ */
+function parseConversation(value: unknown, withAttachments: boolean): Message[] | undefined {
   if (!Array.isArray(value)) {
     return undefined;
   }
@@ -265,11 +503,15 @@ function parseConversation(value: unknown): Message[] | undefined {
     if (!isRecord(item) || !isRole(item.role) || typeof item.content !== "string") {
       return undefined;
     }
-    messages.push({
-      role: item.role,
-      content: item.content,
-      ...pickToolFields(item),
-    });
+    const message: Message = { role: item.role, content: item.content, ...pickToolFields(item) };
+    if (withAttachments && item.attachments !== undefined) {
+      const attachments = parseAttachments(item.attachments, item.content);
+      if (attachments === undefined) {
+        return undefined;
+      }
+      message.attachments = attachments;
+    }
+    messages.push(message);
   }
   return messages;
 }
@@ -277,15 +519,15 @@ function parseConversation(value: unknown): Message[] | undefined {
 /** The version and the tool definitions of a request file; undefined when it cannot be read. */
 function readVersion(
   data: Record<string, unknown>,
-): { formatVersion: 1 | 2; toolDefinitions: ToolDefinitions } | undefined {
+): { formatVersion: 1 | 2 | 3; toolDefinitions: ToolDefinitions } | undefined {
   if (data.formatVersion === 1) {
     return { formatVersion: 1, toolDefinitions: "none" };
   }
-  if (data.formatVersion === REQUEST_FORMAT_VERSION && isToolDefinitions(data.toolDefinitions)) {
-    return {
-      formatVersion: REQUEST_FORMAT_VERSION,
-      toolDefinitions: data.toolDefinitions,
-    };
+  if (
+    (data.formatVersion === 2 || data.formatVersion === 3) &&
+    isToolDefinitions(data.toolDefinitions)
+  ) {
+    return { formatVersion: data.formatVersion, toolDefinitions: data.toolDefinitions };
   }
   return undefined;
 }
@@ -306,7 +548,7 @@ export function parseRequestFile(data: unknown): Loaded<RequestFile> {
     return UNREADABLE;
   }
   const version = readVersion(data);
-  const conversation = parseConversation(data.conversation);
+  const conversation = parseConversation(data.conversation, version?.formatVersion === 3);
   if (version === undefined || conversation === undefined) {
     return UNREADABLE;
   }

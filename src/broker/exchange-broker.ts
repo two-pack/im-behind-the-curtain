@@ -8,6 +8,7 @@ import {
   createStateFile,
   INVALID_REPLY_REASONS,
   MAX_FILE_BYTES,
+  type PartFileData,
   type ReplyFile,
   type ReplyFileKind,
   type ReplyKind,
@@ -182,8 +183,14 @@ export class ExchangeBroker {
     };
   }
 
-  /** Assigns an id and saves the request. Fails, with nothing stored, if it cannot be saved. */
-  async submit(request: ConversationRequest): Promise<Submitted> {
+  /**
+   * Assigns an id and saves the request, with the files of its saved parts. Fails, with nothing
+   * stored, if it cannot be saved.
+   */
+  async submit(
+    request: ConversationRequest,
+    parts: readonly PartFileData[] = [],
+  ): Promise<Submitted> {
     const now = this.clock.now();
     const id = this.ids.next(now.getTime());
     const receivedAt = now.toISOString();
@@ -195,6 +202,7 @@ export class ExchangeBroker {
       await this.store.createRequest(
         createRequestFile(id, receivedAt, request),
         createStateFile(id, "waiting", receivedAt, null),
+        parts,
       );
     } catch (error) {
       this.waiters.delete(id);

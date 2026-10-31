@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildCompletion,
   buildModelList,
@@ -8,6 +8,12 @@ import {
   parseChatCompletionsRequest,
   replyTimeoutMessage,
 } from "../src/chat-completions/adapter.js";
+import { readDataUrl } from "../src/media-parts.js";
+
+vi.mock("../src/media-parts.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/media-parts.js")>();
+  return { ...actual, readDataUrl: vi.fn(actual.readDataUrl) };
+});
 
 function body(value: unknown): string {
   return JSON.stringify(value);
@@ -88,11 +94,11 @@ describe("checking the request body", () => {
       const message = rejectionOf(
         body({ model: "m", messages: [{ role: "user", content }] }),
       ).message;
-      expect(message).toBe("Message content must be a string, null, or an array of text parts.");
+      expect(message).toBe("Message content must be a string, null, or an array of content parts.");
     }
     const missing = rejectionOf(body({ model: "m", messages: [{ role: "user" }] }));
     expect(missing.message).toBe(
-      "Message content must be a string, null, or an array of text parts.",
+      "Message content must be a string, null, or an array of content parts.",
     );
   });
 
@@ -108,7 +114,7 @@ describe("checking the request body", () => {
 });
 
 describe("the content of a message", () => {
-  const CONTENT_MESSAGE = "Message content must be a string, null, or an array of text parts.";
+  const CONTENT_MESSAGE = "Message content must be a string, null, or an array of content parts.";
 
   function conversationOf(content: unknown) {
     const result = parseChatCompletionsRequest(
@@ -186,7 +192,7 @@ describe("the order of the checks", () => {
     ).toBe('Unsupported message role: "critic".');
     expect(
       rejectionOf(body({ ...BAD_N, model: "m", messages: [{ role: "user", content: 5 }] })).message,
-    ).toBe("Message content must be a string, null, or an array of text parts.");
+    ).toBe("Message content must be a string, null, or an array of content parts.");
     expect(rejectionOf(body({ ...VALID, ...BAD_N })).message).toBe(
       'Only one choice can be returned; "n" must be 1.',
     );
@@ -199,20 +205,15 @@ describe("the order of the checks", () => {
       { role: "critic", content: "x" },
     ];
     expect(rejectionOf(body({ model: "m", messages })).message).toBe(
-      "Message content must be a string, null, or an array of text parts.",
+      "Message content must be a string, null, or an array of content parts.",
     );
   });
 });
 
-describe("requests that are turned away as unsupported", () => {
-  const IMAGES = "Images are not supported. A human reads requests as text.";
+describe("requests that are turned away", () => {
+  const IMAGE_PART = { type: "image_url", image_url: { url: "https://example.com/a.png" } };
   const ROLE_CRITIC = 'Unsupported message role: "critic".';
-  const CONTENT = "Message content must be a string, null, or an array of text parts.";
-  const IMAGE_PART = { type: "image_url", image_url: { url: "x" } };
-
-  function unsupported(message: string) {
-    return { status: 400, code: "unsupported_content", message };
-  }
+  const CONTENT = "Message content must be a string, null, or an array of content parts.";
 
   function invalid(message: string) {
     return { status: 400, code: "invalid_request", message };
@@ -246,10 +247,10 @@ describe("requests that are turned away as unsupported", () => {
     ).toEqual([{ role: "tool", content: "a" }]);
   });
 
-  it("still turns away a tool message that has no content, or an image", () => {
+  it("still turns away a tool message that has no content, but takes an image in one", () => {
     expect(turnedAway([{ role: "tool" }])).toEqual(invalid(CONTENT));
     expect(turnedAway([{ role: "function", name: "f" }])).toEqual(invalid(CONTENT));
-    expect(turnedAway([{ role: "tool", content: [IMAGE_PART] }])).toEqual(unsupported(IMAGES));
+    expect(accepted([{ role: "tool", content: [IMAGE_PART] }])).toBe(true);
   });
 
   it("treats a role that differs only in case as an unknown role", () => {
@@ -304,34 +305,19 @@ describe("requests that are turned away as unsupported", () => {
     expect(accepted([{ role: "user", content: "x", function_call: { name: "f" } }])).toBe(true);
   });
 
-  it("rejects an image part with the images message, wherever it is", () => {
-    expect(turnedAway([{ role: "user", content: [IMAGE_PART] }])).toEqual(unsupported(IMAGES));
-    const mixed = [{ type: "text", text: "a" }, IMAGE_PART];
-    for (const role of ["system", "developer", "user", "assistant"]) {
-      expect(turnedAway([{ role, content: mixed }])).toEqual(unsupported(IMAGES));
+  it("takes a part that is not text in a message of every role", () => {
+    const mixed = [{ type: "text", text: "a" }, IMAGE_PART, { type: "input_audio" }, { type: "x" }];
+    for (const role of ["system", "developer", "user", "assistant", "tool", "function"]) {
+      expect(accepted([{ role, content: mixed }])).toBe(true);
     }
-    expect(turnedAway([{ role: "user", content: [{ type: "input_audio" }, IMAGE_PART] }])).toEqual(
-      unsupported(IMAGES),
-    );
   });
 
-  it("names the type of any other part", () => {
-    for (const type of ["input_audio", "file", "refusal", ""]) {
-      expect(turnedAway([{ role: "user", content: [{ type }] }])).toEqual(
-        unsupported(`Unsupported content part type: "${type}".`),
-      );
+  it("has no way to answer with unsupported_content", () => {
+    const parts = [IMAGE_PART, { type: "input_audio" }, { type: "file" }, { type: "refusal" }];
+    for (const part of parts) {
+      expect(accepted([{ role: "user", content: [part] }])).toBe(true);
     }
-    const first = [{ type: "text", text: "a" }, { type: "file" }, { type: "input_audio" }];
-    expect(turnedAway([{ role: "user", content: first }]).message).toBe(
-      'Unsupported content part type: "file".',
-    );
-  });
-
-  it("cuts a long part type to 64 characters", () => {
-    const type = "t".repeat(100);
-    expect(turnedAway([{ role: "user", content: [{ type }] }]).message).toBe(
-      `Unsupported content part type: "${"t".repeat(64)}".`,
-    );
+    expect(MESSAGES).not.toHaveProperty("images");
   });
 
   it("keeps a malformed part as an invalid request", () => {
@@ -411,13 +397,10 @@ describe("requests that are turned away as unsupported", () => {
       invalid(ROLE_CRITIC),
     );
     expect(turnedAway([{ role: "tool" }, { role: "critic" }])).toEqual(invalid(CONTENT));
-    expect(
-      turnedAway([{ role: "assistant", content: [IMAGE_PART], tool_calls: [{ id: "1" }] }]),
-    ).toEqual(unsupported(IMAGES));
     expect(turnedAway([{ role: "user", content: 5 }, { role: "tool" }])).toEqual(invalid(CONTENT));
     expect(
       turnedAway([{ role: "user", content: [{ type: "file" }, { text: "no type" }] }]),
-    ).toEqual(unsupported('Unsupported content part type: "file".'));
+    ).toEqual(invalid(CONTENT));
   });
 
   it("turns away n of 2 or more even when the request has tools", () => {
@@ -427,10 +410,508 @@ describe("requests that are turned away as unsupported", () => {
     expect(turnedAway(VALID.messages, { n: 2 }).code).toBe("invalid_request");
   });
 
-  it("reports unsupported_content as a client error, not a server error", () => {
-    expect(errorBody("unsupported_content", IMAGES)).toEqual({
-      error: { message: IMAGES, type: "invalid_request_error", code: "unsupported_content" },
+  it("reports invalid_request as a client error, not a server error", () => {
+    expect(errorBody("invalid_request", CONTENT)).toEqual({
+      error: { message: CONTENT, type: "invalid_request_error", code: "invalid_request" },
     });
+  });
+});
+
+describe("image parts that are data URLs", () => {
+  const CONTENT = "Message content must be a string, null, or an array of content parts.";
+  /** "RIFF", as base64. */
+  const WAV = "UklGRg==";
+  /** "%PDF-1.4", as base64. */
+  const PDF = "JVBERi0xLjQ=";
+  const NONE = {
+    mediaType: null,
+    size: null,
+    file: null,
+    address: null,
+    fileId: null,
+    typeName: null,
+  };
+  /** A 1x1 PNG, as base64. */
+  const PNG =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const PNG_BYTES = new Uint8Array(Buffer.from(PNG, "base64"));
+
+  function image(url: unknown = `data:image/png;base64,${PNG}`, extra: object = {}) {
+    return { type: "image_url", image_url: { url, ...extra } };
+  }
+
+  function text(value: string) {
+    return { type: "text", text: value };
+  }
+
+  function audio(data: unknown, format: unknown, extra: object = {}) {
+    return { type: "input_audio", input_audio: { data, format, ...extra } };
+  }
+
+  function file(fileData: unknown, extra: object = {}) {
+    return { type: "file", file: { file_data: fileData, ...extra } };
+  }
+
+  function acceptedOf(messages: unknown[], extra: Record<string, unknown> = {}) {
+    const result = parseChatCompletionsRequest(body({ model: "m", messages, ...extra }));
+    if (!result.ok) {
+      throw new Error(`expected the request to be accepted: ${result.rejection.message}`);
+    }
+    return result;
+  }
+
+  function refusal(messages: unknown[]) {
+    return rejectionOf(body({ model: "m", messages }));
+  }
+
+  const SAVED = {
+    kind: "image",
+    mediaType: "image/png",
+    size: PNG_BYTES.length,
+    readable: true,
+    address: null,
+    fileId: null,
+    typeName: null,
+  };
+
+  it("accepts a readable data URL image in a message of any role", () => {
+    for (const role of ["system", "developer", "user", "assistant", "tool", "function"]) {
+      const result = acceptedOf([{ role, content: [image()] }]);
+      expect(result.parts).toHaveLength(1);
+    }
+  });
+
+  it("records the images in order with the number of characters of text before each", () => {
+    const content = [
+      text("ab"),
+      image(),
+      text("cd"),
+      image(`data:image/jpeg;base64,AAAA`),
+      text("e"),
+    ];
+    const result = acceptedOf([{ role: "user", content }]);
+    expect(result.request.conversation).toEqual([
+      {
+        role: "user",
+        content: "abcde",
+        attachments: [
+          { ...SAVED, at: 2, file: "message-1-part-2.png" },
+          { ...SAVED, at: 4, mediaType: "image/jpeg", size: 3, file: "message-1-part-4.jpg" },
+        ],
+      },
+    ]);
+  });
+
+  it("gives a message with no text an empty content and an at of 0", () => {
+    const result = acceptedOf([{ role: "user", content: [image(), image()] }]);
+    const message = result.request.conversation[0];
+    expect(message?.content).toBe("");
+    expect(message?.attachments?.map((attachment) => attachment.at)).toEqual([0, 0]);
+  });
+
+  it("counts a character outside the basic plane, and a lone surrogate, as one", () => {
+    const result = acceptedOf([
+      { role: "user", content: [text("\u{1F600}"), text("\ud83d"), image()] },
+    ]);
+    expect(result.request.conversation[0]?.attachments?.[0]?.at).toBe(2);
+  });
+
+  it("returns the bytes and the file name of each image, named by message and part number", () => {
+    const result = acceptedOf([
+      { role: "user", content: "plain" },
+      { role: "user", content: [text("a"), image(), image()] },
+    ]);
+    expect(result.parts).toEqual([
+      { file: "message-2-part-2.png", bytes: PNG_BYTES },
+      { file: "message-2-part-3.png", bytes: PNG_BYTES },
+    ]);
+    expect(result.request.conversation[0]).toEqual({ role: "user", content: "plain" });
+  });
+
+  it("uses a name from the server and never one from the client", () => {
+    const hostile = { filename: "../evil.png", name: "../x", format: "../y" };
+    const result = acceptedOf([{ role: "user", content: [image(undefined, hostile)] }]);
+    expect(result.parts.map((part) => part.file)).toEqual(["message-1-part-1.png"]);
+  });
+
+  it("decodes each image data URL once, however many checks look at it", () => {
+    const mock = vi.mocked(readDataUrl);
+    mock.mockClear();
+    acceptedOf([
+      { role: "user", content: [text("a"), image(), image("data:image/jpeg;base64,AAAA")] },
+    ]);
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts an empty data, a media type that is not an image, and an unknown media type", () => {
+    const result = acceptedOf([
+      {
+        role: "user",
+        content: [
+          image("data:image/png;base64,"),
+          image("data:text/plain;base64,AAAA"),
+          image("data:;base64,AAAA"),
+        ],
+      },
+    ]);
+    const attachments = result.request.conversation[0]?.attachments ?? [];
+    expect(attachments.map((a) => [a.kind, a.mediaType, a.size, a.file])).toEqual([
+      ["image", "image/png", 0, "message-1-part-1.png"],
+      ["image", "text/plain", 3, "message-1-part-2.bin"],
+      ["image", null, 3, "message-1-part-3.bin"],
+    ]);
+    expect(result.parts[0]?.bytes).toEqual(new Uint8Array(0));
+  });
+
+  it("ignores detail and other fields of the image", () => {
+    const result = acceptedOf([
+      { role: "user", content: [image(undefined, { detail: "high", x: 1 })] },
+    ]);
+    expect(result.parts).toHaveLength(1);
+  });
+
+  it("keeps the original request as received, base64 included", () => {
+    const messages = [{ role: "user", content: [text("a"), image()] }];
+    const result = acceptedOf(messages);
+    expect(result.request.originalRequest).toEqual({ model: "m", messages });
+  });
+
+  it("gives no parts and no attachments for a request without images", () => {
+    const result = acceptedOf([{ role: "user", content: [text("a"), text("b")] }]);
+    expect(result.parts).toEqual([]);
+    expect(result.request.conversation).toEqual([{ role: "user", content: "ab" }]);
+  });
+
+  it("treats a string content as text, even when it looks like a data URL", () => {
+    const result = acceptedOf([{ role: "user", content: `data:image/png;base64,${PNG}` }]);
+    expect(result.parts).toEqual([]);
+    expect(result.request.conversation[0]?.content).toBe(`data:image/png;base64,${PNG}`);
+  });
+
+  it("keeps the text of an assistant message with tool calls next to its images", () => {
+    const calls = [{ id: "1", type: "function", function: { name: "f", arguments: "{}" } }];
+    const result = acceptedOf([{ role: "assistant", content: [image()], tool_calls: calls }]);
+    expect(result.request.conversation[0]).toMatchObject({ tool_calls: calls });
+    expect(result.request.conversation[0]?.attachments).toHaveLength(1);
+  });
+
+  it("decodes each audio and file data once as well", () => {
+    const mock = vi.mocked(readDataUrl);
+    mock.mockClear();
+    acceptedOf([
+      {
+        role: "user",
+        content: [file(`data:application/pdf;base64,${PDF}`), file("data:x/y;base64,A")],
+      },
+    ]);
+    expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it("takes an image whose url is an address and saves nothing", () => {
+    const result = acceptedOf([
+      { role: "user", content: [text("a"), image("https://example.com/cat.png"), text("b")] },
+    ]);
+    expect(result.parts).toEqual([]);
+    expect(result.request.conversation[0]).toEqual({
+      role: "user",
+      content: "ab",
+      attachments: [
+        { ...NONE, at: 1, kind: "image", readable: true, address: "https://example.com/cat.png" },
+      ],
+    });
+  });
+
+  it("takes any url that does not start with data: as an address, even a strange one", () => {
+    for (const url of [
+      "http://x",
+      "ftp://x/y",
+      "cat.png",
+      "  data:x",
+      "/tmp/a.png",
+      "x".repeat(5000),
+    ]) {
+      const result = acceptedOf([{ role: "user", content: [image(url)] }]);
+      expect(result.request.conversation[0]?.attachments?.[0], url).toMatchObject({
+        kind: "image",
+        readable: true,
+        address: url,
+        file: null,
+        size: null,
+      });
+    }
+  });
+
+  it("takes wav and mp3 audio, saves the bytes and names the media type from the format", () => {
+    const result = acceptedOf([
+      { role: "user", content: [text("a"), audio(WAV, "wav"), audio("QUJD", "mp3")] },
+    ]);
+    expect(result.request.conversation[0]?.attachments).toEqual([
+      {
+        ...NONE,
+        at: 1,
+        kind: "audio",
+        readable: true,
+        mediaType: "audio/wav",
+        size: 4,
+        file: "message-1-part-2.wav",
+      },
+      {
+        ...NONE,
+        at: 1,
+        kind: "audio",
+        readable: true,
+        mediaType: "audio/mpeg",
+        size: 3,
+        file: "message-1-part-3.mp3",
+      },
+    ]);
+    expect(result.parts.map((part) => part.file)).toEqual([
+      "message-1-part-2.wav",
+      "message-1-part-3.mp3",
+    ]);
+    expect([...(result.parts[0]?.bytes ?? [])]).toEqual([82, 73, 70, 70]);
+  });
+
+  it("saves audio of an unknown format with an unknown media type", () => {
+    for (const format of ["ogg", "WAV", "Mp3", 5, null, undefined]) {
+      const result = acceptedOf([{ role: "user", content: [audio("QUJD", format)] }]);
+      expect(result.request.conversation[0]?.attachments?.[0], String(format)).toMatchObject({
+        kind: "audio",
+        readable: true,
+        mediaType: null,
+        size: 3,
+        file: "message-1-part-1.bin",
+      });
+    }
+  });
+
+  it("saves empty audio data as zero bytes", () => {
+    const result = acceptedOf([{ role: "user", content: [audio("", "wav")] }]);
+    expect(result.parts).toEqual([{ file: "message-1-part-1.wav", bytes: new Uint8Array(0) }]);
+    expect(result.request.conversation[0]?.attachments?.[0]).toMatchObject({ size: 0 });
+  });
+
+  it("takes a file with a data URL, saves its bytes and ignores the filename", () => {
+    const result = acceptedOf([
+      {
+        role: "user",
+        content: [
+          text("see"),
+          file(`data:application/pdf;base64,${PDF}`, {
+            filename: "../evil.pdf",
+            file_id: "file-x",
+          }),
+          file("data:;base64,QUJD"),
+        ],
+      },
+    ]);
+    expect(result.request.conversation[0]?.attachments).toEqual([
+      {
+        ...NONE,
+        at: 3,
+        kind: "file",
+        readable: true,
+        mediaType: "application/pdf",
+        size: 8,
+        file: "message-1-part-2.pdf",
+      },
+      {
+        ...NONE,
+        at: 3,
+        kind: "file",
+        readable: true,
+        mediaType: null,
+        size: 3,
+        file: "message-1-part-3.bin",
+      },
+    ]);
+    expect(JSON.stringify(result.request.conversation)).not.toContain("evil");
+    expect(result.parts.map((part) => part.file)).toEqual([
+      "message-1-part-2.pdf",
+      "message-1-part-3.bin",
+    ]);
+  });
+
+  it("takes a file with a file_id only, and shows the id without saving", () => {
+    for (const data of [undefined, null]) {
+      const part = { type: "file", file: { file_data: data, file_id: "file-abc123" } };
+      const result = acceptedOf([{ role: "user", content: [part] }]);
+      expect(result.parts).toEqual([]);
+      expect(result.request.conversation[0]?.attachments).toEqual([
+        { ...NONE, at: 0, kind: "file", readable: true, fileId: "file-abc123" },
+      ]);
+    }
+  });
+
+  it("takes a file with neither data nor a usable file_id, as a kind only", () => {
+    const shapes: unknown[] = [
+      {},
+      { file_id: 5 },
+      { file_id: null },
+      { file_data: null },
+      { filename: "a.pdf" },
+    ];
+    for (const inner of shapes) {
+      const result = acceptedOf([{ role: "user", content: [{ type: "file", file: inner }] }]);
+      expect(result.request.conversation[0]?.attachments, JSON.stringify(inner)).toEqual([
+        { ...NONE, at: 0, kind: "file", readable: true },
+      ]);
+      expect(result.parts).toEqual([]);
+    }
+  });
+
+  it("takes every row of the table of unreadable parts, without saving anything", () => {
+    const rows: [string, unknown][] = [
+      ["image", { type: "image_url" }],
+      ["image", { type: "image_url", image_url: "data:image/png;base64,AAAA" }],
+      ["image", { type: "image_url", image_url: ["x"] }],
+      ["image", { type: "image_url", image_url: null }],
+      ["image", { type: "image_url", image_url: {} }],
+      ["image", image(5)],
+      ["image", image(null)],
+      ["image", image("")],
+      ["image", image("data:image/png,AAAA")],
+      ["image", image("data:image/png;base64,A")],
+      ["image", image("data:image/png;base64,AA AA")],
+      ["audio", { type: "input_audio" }],
+      ["audio", { type: "input_audio", input_audio: "QUJD" }],
+      ["audio", { type: "input_audio", input_audio: null }],
+      ["audio", { type: "input_audio", input_audio: [] }],
+      ["audio", { type: "input_audio", input_audio: { format: "wav" } }],
+      ["audio", audio(5, "wav")],
+      ["audio", audio(null, "wav")],
+      ["audio", audio("A", "wav")],
+      ["audio", audio("QU JD", "wav")],
+      ["audio", audio("QU-D", "wav")],
+      ["audio", audio("data:audio/wav;base64,QUJD", "wav")],
+      ["file", { type: "file" }],
+      ["file", { type: "file", file: "QUJD" }],
+      ["file", { type: "file", file: null }],
+      ["file", { type: "file", file: [] }],
+      ["file", file(5)],
+      ["file", file(true, { file_id: "file-x" })],
+      ["file", file("")],
+      ["file", file("", { file_id: "file-x" })],
+      ["file", file("QUJD")],
+      ["file", file("QUJD", { file_id: "file-x" })],
+      ["file", file("https://example.com/a.pdf")],
+      ["file", file("data:application/pdf,QUJD")],
+      ["file", file("data:application/pdf;base64,A")],
+      ["file", file("data:application/pdf;base64,AA AA")],
+    ];
+    for (const [kind, part] of rows) {
+      const result = acceptedOf([{ role: "user", content: [text("a"), part] }]);
+      expect(result.parts, JSON.stringify(part)).toEqual([]);
+      expect(result.request.conversation[0]?.attachments, JSON.stringify(part)).toEqual([
+        { ...NONE, at: 1, kind, readable: false },
+      ]);
+    }
+  });
+
+  it("takes a part of an unknown type, and records its type name only", () => {
+    for (const type of ["video_url", "refusal", "audio", "image", "", "Text", "t".repeat(500)]) {
+      const result = acceptedOf([{ role: "user", content: [text("a"), { type, extra: 1 }] }]);
+      expect(result.parts).toEqual([]);
+      expect(result.request.conversation[0]?.attachments).toEqual([
+        { ...NONE, at: 1, kind: "other", readable: true, typeName: type },
+      ]);
+    }
+  });
+
+  it("numbers the parts by their place in the content, whether or not they are saved", () => {
+    const result = acceptedOf([
+      { role: "user", content: "plain" },
+      {
+        role: "user",
+        content: [
+          image("https://example.com/a.png"),
+          { type: "video_url" },
+          audio("QUJD", "wav"),
+          text("x"),
+          file(`data:application/pdf;base64,${PDF}`),
+          image(),
+        ],
+      },
+    ]);
+    expect(result.parts.map((part) => part.file)).toEqual([
+      "message-2-part-3.wav",
+      "message-2-part-5.pdf",
+      "message-2-part-6.png",
+    ]);
+    const kinds = result.request.conversation[1]?.attachments?.map((a) => [a.kind, a.at, a.file]);
+    expect(kinds).toEqual([
+      ["image", 0, null],
+      ["other", 0, null],
+      ["audio", 0, "message-2-part-3.wav"],
+      ["file", 1, "message-2-part-5.pdf"],
+      ["image", 1, "message-2-part-6.png"],
+    ]);
+  });
+
+  it("takes the new parts in a message of every role", () => {
+    const parts = [audio("QUJD", "wav"), file("data:x/y;base64,QUJD"), { type: "video_url" }];
+    for (const role of ["system", "developer", "user", "assistant", "tool", "function"]) {
+      const result = acceptedOf([{ role, content: parts }]);
+      expect(result.parts, role).toHaveLength(2);
+      expect(result.request.conversation[0]?.attachments, role).toHaveLength(3);
+    }
+  });
+
+  it("takes 140000 saved parts without an exception", () => {
+    const part = audio("", "wav");
+    const content = Array.from({ length: 140_000 }, () => part);
+    const result = acceptedOf([
+      { role: "user", content },
+      { role: "user", content },
+    ]);
+    expect(result.parts).toHaveLength(280_000);
+    expect(result.parts.at(-1)?.file).toBe("message-2-part-140000.wav");
+    expect(result.request.conversation[1]?.attachments).toHaveLength(140_000);
+  });
+
+  it("keeps the original request as received, with every kind of part", () => {
+    const messages = [{ role: "user", content: [audio(WAV, "wav"), file("QUJD"), { type: "x" }] }];
+    const result = acceptedOf(messages);
+    expect(result.request.originalRequest).toEqual({ model: "m", messages });
+  });
+
+  it("treats a string content as text, whatever it looks like", () => {
+    const strings = [
+      JSON.stringify([{ type: "input_audio", input_audio: { data: WAV, format: "wav" } }]),
+      "A".repeat(2000),
+      `data:application/pdf;base64,${PDF}`,
+      "file-abc123",
+    ];
+    for (const content of strings) {
+      const result = acceptedOf([{ role: "user", content }]);
+      expect(result.parts).toEqual([]);
+      expect(result.request.conversation).toEqual([{ role: "user", content }]);
+    }
+  });
+
+  it("keeps a part with a broken shape as an invalid request, next to any other part", () => {
+    const others = [image(), audio(WAV, "wav"), file("QUJD"), { type: "video_url" }];
+    const bad = [
+      { text: "no type" },
+      { type: 5 },
+      { type: null },
+      { type: "text" },
+      { type: "text", text: 5 },
+      null,
+      "x",
+      5,
+      [],
+    ];
+    for (const other of others) {
+      for (const part of bad) {
+        expect(refusal([{ role: "user", content: [other, part] }]), JSON.stringify(part)).toEqual({
+          status: 400,
+          code: "invalid_request",
+          message: CONTENT,
+        });
+        expect(refusal([{ role: "user", content: [part, other] }]).code).toBe("invalid_request");
+      }
+    }
   });
 });
 

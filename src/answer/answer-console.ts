@@ -2,6 +2,7 @@
  * The screen of `imbehind answer`: shows the oldest waiting request, reads the person's
  * reply (or the wish to skip the request), places it, and tells how the request ended.
  */
+import { dirname } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import type {
@@ -704,7 +705,8 @@ export class AnswerConsole {
     screen.line(`Reply:    ${REPLY_KIND_LABELS[request.replyKind]}`);
     screen.line("");
     const path = this.options.broker.requestFilePath(item.id);
-    for (const line of conversationLines(request.conversation, path)) {
+    const requestDir = dirname(path);
+    for (const line of conversationLines(request.conversation, path, requestDir)) {
       screen.line(line);
     }
     this.showToolList(request.originalRequest);

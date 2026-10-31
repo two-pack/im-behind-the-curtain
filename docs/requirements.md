@@ -76,14 +76,14 @@ Each group says whether it is a Must (the first release cannot go without it) or
 ### FR4 The `imbehind answer` command (Must)
 
 - **FR4.1** When no request is waiting, it prints one line that says so and waits for a request.
-- **FR4.2** It shows waiting requests one at a time, oldest first. The display has the position (such as 1 of 3), the time of arrival, the model name, the reply kind and the conversation. The conversation shows every `system` and `developer` message and the last three of the other messages, in the order they arrived, each with its role name. When messages are left out, the display says how many and gives the path of the file that holds the whole conversation.
+- **FR4.2** It shows waiting requests one at a time, oldest first. The display has the position (such as 1 of 3), the time of arrival, the model name, the reply kind and the conversation. The conversation shows every `system` and `developer` message and the last three of the other messages, in the order they arrived, each with its role name and, for a part that is not text, one line for the part (FR8.4). When messages are left out, the display says how many and gives the path of the file that holds the whole conversation.
 - **FR4.3** The human types the reply directly in the terminal and ends it with Ctrl+D (on Windows: Ctrl+Z, then Enter). Line breaks become `\n` on every operating system, and line breaks at the end are removed.
 - **FR4.4** When the reply reaches the client, it prints `Sent.` and shows the next request.
 - **FR4.5** If the human ends the input without typing anything, the command asks whether to skip. The default is not to skip; only `y` skips. A skipped request gets an error response and the command prints `Skipped.`. If the input ends during the question, the request is not skipped.
 - **FR4.6** If the request ends while the human types, answers the question, or is about to send (the client left or the wait limit passed), the command says that the reply will not be sent, stops the input and moves on to the next request.
 - **FR4.7** If two `imbehind answer` commands reply to the same request, only the first reply is used. The other one says that the request was already answered.
 - **FR4.8** Ctrl+C ends the command and leaves the shown request waiting.
-- **FR4.9** A `content` that is an array of text parts is shown as the parts joined together.
+- **FR4.9** A `content` that is an array of parts is shown as its text parts joined together, with a line for each part that is not text at the place where the part arrived (FR8.4).
 - **FR4.10** Terminal control characters in a request are shown in a visible form and never written to the terminal as they are.
 - **FR4.11** If the server is not running or the storage directory cannot be read, the command says why and shows the storage directory.
 - **FR4.12** When standard input is not a terminal, the command asks no question. It sends the whole input as the reply to the first waiting request (the one that arrived first) and exits. If no request is waiting, it waits for one. If the input is empty, the request stays waiting and the command exits with a failure code. If the request ends while the input is read or before it is sent, the command says so, names the request and exits with a failure code.
@@ -106,11 +106,13 @@ Each group says whether it is a Must (the first release cannot go without it) or
 
 - **FR7.1** `GET /v1/models` returns an object with `object` set to `list` and one or more models. Each model has `id`, `object` set to `model`, `created` and `owned_by`.
 
-### FR8 Refuse parts that are not text (Must)
+### FR8 Parts that are not text (Must)
 
-- **FR8.1** A request with an image part in a message `content` is refused at once, with an error that says images are not supported.
-- **FR8.2** A request with any other part that is not text (audio, a file and so on) is refused at once, with an error that names the unsupported part type.
-- **FR8.3** A refused request is not stored and not shown to the human.
+- **FR8.1** A part of the type `image_url`, `input_audio` or `file` in an array `content` is accepted in a message of every role. The request is stored and shown to the human. The server never answers such a part with `unsupported_content`. A `content` that is a string stays text, also when it looks like a JSON array or holds a long base64 text.
+- **FR8.2** A part of any other `type`, and a part of a known type whose content cannot be read (for example an `image_url` without a `url`), are accepted too. They are not saved, and they are shown as a type name or as unreadable. A part that is not an object, a part without a string `type`, and a `text` part without a string `text` are still refused with a client error, and the request is not stored and not shown to the human.
+- **FR8.3** The data of a part is saved when it can be read: the base64 data of a `data:` URL in an `image_url` or a `file`, and the base64 `data` of an `input_audio`. It is written as a file in the folder of the request, with a name that the server chooses and that uses nothing the client sent. The server never fetches an address in a part and never opens a connection for it. The saved files are written before the request is stored, all or nothing, and they are deleted with the folder of the request by the retention rule (FR10.5).
+- **FR8.4** `imbehind answer` shows one line for each part that is not text, in the order the parts arrived, between the lines of the text. The line of a saved part has the kind (image, audio or file), the media type, the size in bytes and the absolute path of the saved file. A part that is not saved shows the kind and what was received: an address, a `file_id`, a mark that it is unreadable, or the type name. Control characters are shown in a visible form (FR4.10). A message with parts and no text shows these lines, not the word for empty (FR1.8).
+- **FR8.5** A line of the display that is longer than 1000 Unicode characters is cut to its first 1000 characters. The end of the line tells how long the whole line was and where the file with the whole conversation is. Only the display is cut; `request.json` keeps the whole text.
 
 ### FR9 Tools and tool calls (Must)
 
@@ -150,7 +152,7 @@ Each group says whether it is a Must (the first release cannot go without it) or
 ### FR12 Documents and README (Must)
 
 - **FR12.1** The requirements and the specification are kept in `docs/`, in English.
-- **FR12.3** `README.md` and `README.ja.md` describe the first release. They name only the Chat Completions format and the model list. They say that parts that are not text are refused and that `tools`, `tool_calls` and `function_call` are supported.
+- **FR12.3** `README.md` and `README.ja.md` describe the first release. They name only the Chat Completions format and the model list. They say that parts that are not text (images, audio and files) are received, saved and shown, and that `tools`, `tool_calls` and `function_call` are supported.
 - **FR12.4** The documents say that the wait time of the client must be raised, and give an example of how.
 - **FR12.5** The continuous integration has a job that builds, tests, formats and checks, and starts `imbehind serve` and makes one round trip.
 
@@ -163,7 +165,7 @@ An automated test installs the package that is about to be published from a loca
 
 ### FR14 Request and reply files (Should)
 
-- **FR14.1** The formats of the request file and the reply file are documented in `docs/storage-format.md`. Every file carries a field for the format version. The `formatVersion` of `request.json` is 2, and the version of the other files is 1. The server reads request files of both versions 1 and 2, and a reader that knows only version 1 treats a version 2 request file as a file it does not understand.
+- **FR14.1** The formats of the request file and the reply file are documented in `docs/storage-format.md`. Every file carries a field for the format version. The `formatVersion` of `request.json` is 3, and the version of the other files is 1. The server reads request files of versions 1, 2 and 3, and a reader that knows only versions 1 and 2 treats a version 3 request file as a file it does not understand.
 - **FR14.2** If a user puts a reply file in the documented form into the storage directory, the server treats it like a reply from `imbehind answer` and returns it to the client.
 - **FR14.3** The documents tell how to write a reply file safely: write it under another name, then give it its final name when it is complete. The server reads only the final name.
 - **FR14.4** A reply file is not valid if it is not JSON, lacks a required field, has an unknown format version, holds a non-JSON reply for a JSON request, holds tool calls that do not fit (FR9.6), or is larger than 10 MB. The client gets an error that says the reply was not valid and why, and the state becomes `invalid_reply`.
@@ -204,7 +206,7 @@ An automated test installs the package that is about to be published from a loca
 | Behavior that depends on `tool_choice` or `parallel_tool_calls` | Will not be built. They are ignored |
 | Checking the form of the entries of `tools` and `functions`, or that `arguments` is JSON | Will not be built |
 | A response with both text and `tool_calls` | Will not be built |
-| A reply written after the human has seen an image | A candidate for a later release. The first release refuses images |
+| Showing an image, audio or a file in the terminal, or reading an address in a part | Will not be built. The server saves the data and shows its path, and the human opens the file with another program |
 | Merging retried requests that have the same content | A candidate for a later release |
 | Checking a structured reply against the requested shape | Will not be built |
 | More than one reply to one request | Will not be built |

@@ -96,6 +96,114 @@ describe("assigning ids and storing requests", () => {
     expect(clock.now().getTime()).toBeLessThan(requestIdTimeMs(future));
   });
 
+  it("passes the parts to the store unchanged, together with a request that records them", async () => {
+    const { store, broker } = setup();
+    const parts = [{ file: "message-1-part-1.png", bytes: new Uint8Array([1, 2, 3]) }];
+    const withPart = {
+      ...request,
+      conversation: [
+        {
+          role: "user" as const,
+          content: "",
+          attachments: [
+            {
+              at: 0,
+              kind: "image" as const,
+              mediaType: "image/png",
+              size: 3,
+              file: "message-1-part-1.png",
+              readable: true,
+              address: null,
+              fileId: null,
+              typeName: null,
+            },
+          ],
+        },
+      ],
+    };
+    const { id } = await broker.submit(withPart, parts);
+    expect(store.savedParts.get(id)).toBe(parts);
+    const stored = store.entries.get(id)?.request;
+    expect(typeof stored === "object" && stored.conversation[0]?.attachments).toHaveLength(1);
+  });
+
+  it("accepts a request with audio and file parts, and one with parts that are not saved", async () => {
+    const { store, broker } = setup();
+    const none = {
+      mediaType: null,
+      size: null,
+      file: null,
+      address: null,
+      fileId: null,
+      typeName: null,
+    };
+    const unsaved = {
+      ...request,
+      conversation: [
+        {
+          role: "user" as const,
+          content: "",
+          attachments: [
+            {
+              ...none,
+              at: 0,
+              kind: "image" as const,
+              readable: true,
+              address: "https://example.com/a.png",
+            },
+            { ...none, at: 0, kind: "file" as const, readable: true, fileId: "file-1" },
+            { ...none, at: 0, kind: "audio" as const, readable: false },
+            { ...none, at: 0, kind: "other" as const, readable: true, typeName: "video_url" },
+          ],
+        },
+      ],
+    };
+    const { id } = await broker.submit(unsaved, []);
+    expect(store.savedParts.get(id)).toEqual([]);
+    const audio = {
+      ...none,
+      at: 0,
+      kind: "audio" as const,
+      readable: true,
+      mediaType: "audio/wav",
+      size: 1,
+      file: "message-1-part-1.wav",
+    };
+    const pdf = {
+      ...none,
+      at: 0,
+      kind: "file" as const,
+      readable: true,
+      size: 1,
+      file: "message-1-part-2.bin",
+    };
+    const parts = [
+      { file: "message-1-part-1.wav", bytes: new Uint8Array([1]) },
+      { file: "message-1-part-2.bin", bytes: new Uint8Array([2]) },
+    ];
+    const saved = {
+      ...request,
+      conversation: [{ role: "user" as const, content: "", attachments: [audio, pdf] }],
+    };
+    const second = await broker.submit(saved, parts);
+    expect(store.savedParts.get(second.id)).toBe(parts);
+  });
+
+  it("stores no parts when none are given", async () => {
+    const { store, broker } = setup();
+    const { id } = await broker.submit(request);
+    expect(store.savedParts.get(id)).toEqual([]);
+  });
+
+  it("fails without accepting the request or keeping its parts when they cannot be stored", async () => {
+    const { store, broker } = setup();
+    store.fail("createRequest");
+    const parts = [{ file: "message-1-part-1.png", bytes: new Uint8Array(1) }];
+    await expect(broker.submit(request, parts)).rejects.toBeInstanceOf(IoFailure);
+    expect(store.entries.size).toBe(0);
+    expect(store.savedParts.size).toBe(0);
+  });
+
   it("fails without accepting the request when it cannot be stored", async () => {
     const { store, broker, events } = setup();
     store.fail("createRequest");

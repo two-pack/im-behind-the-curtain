@@ -14,15 +14,15 @@
  *   config         -> platform
  *   bin            -> cli, platform
  *
- * errors, ids, model and tool-calls are leaf modules that any module may use. A leaf module may
- * import another leaf module, but never a module that is not a leaf, and leaf modules never form
- * a cycle (tool-calls imports model; model imports nothing). clock imports nothing from the
- * project (no rule allows it). chat-completions, platform, reply-check and conversation-view
- * import only the leaf modules. serve-lock imports only platform and the leaf modules. Type-only
- * imports count as dependencies. Cycles are never allowed.
+ * errors, ids, media-parts, model and tool-calls are leaf modules that any module may use. A leaf
+ * module may import another leaf module, but never a module that is not a leaf, and leaf modules
+ * never form a cycle (tool-calls and media-parts import model; model imports nothing). clock
+ * imports nothing from the project (no rule allows it). chat-completions, platform, reply-check
+ * and conversation-view import only the leaf modules. serve-lock imports only platform and the
+ * leaf modules. Type-only imports count as dependencies. Cycles are never allowed.
  */
 
-const LEAVES = "errors|ids|model|tool-calls";
+const LEAVES = "errors|ids|media-parts|model|tool-calls";
 const LEAF_PATH = "^src/(" + LEAVES + ")\\.ts$";
 
 /** Builds an allowed-dependency rule: `from` may import `targets` and the leaf modules. */

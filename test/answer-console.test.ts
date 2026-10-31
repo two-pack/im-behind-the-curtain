@@ -1,3 +1,4 @@
+import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
@@ -831,6 +832,75 @@ describe("a request that asks for JSON", () => {
   });
 });
 
+describe("a request with a saved image", () => {
+  const FOLDER = `/fake-storage/requests/${ID}`;
+  const FILE = "message-1-part-2.png";
+  const IMAGE_MESSAGE: Message = {
+    role: "user",
+    content: "what is this? thanks",
+    attachments: [
+      {
+        at: 14,
+        kind: "image",
+        mediaType: "image/png",
+        size: 70,
+        file: FILE,
+        readable: true,
+        address: null,
+        fileId: null,
+        typeName: null,
+      },
+    ],
+  };
+
+  it("shows the image as two lines between the pieces of text, with the path of the saved file", async () => {
+    const t = setup([]);
+    t.addWaiting(ID, [IMAGE_MESSAGE]);
+    const running = t.start();
+    await settle();
+    const lines = t.stdout();
+    const start = lines.indexOf("User:");
+    expect(lines.slice(start, start + 5)).toEqual([
+      "User:",
+      "  what is this? ",
+      "  [image] image/png, 70 bytes",
+      `    saved: ${path.join(FOLDER, FILE)}`,
+      "  thanks",
+    ]);
+    t.controller.abort();
+    await running;
+  });
+
+  it("shows a message of only images without (empty)", async () => {
+    const t = setup([]);
+    const onlyImage = {
+      ...IMAGE_MESSAGE,
+      content: "",
+      attachments: [{ ...IMAGE_MESSAGE.attachments?.[0], at: 0 }],
+    };
+    t.addWaiting(ID, [onlyImage as Message]);
+    const running = t.start();
+    await settle();
+    const text = t.stdout().join("\n");
+    expect(text).toContain("[image] image/png, 70 bytes");
+    expect(text).not.toContain("(empty)");
+    t.controller.abort();
+    await running;
+  });
+
+  it("shows no conversation, and so no image line, when the reply comes from standard input", async () => {
+    const t = setup([], undefined, { kind: "running" }, { inputMode: "stdin", stdin: ["Hi"] });
+    t.addWaiting(ID, [IMAGE_MESSAGE]);
+    const running = t.start();
+    await settle();
+    expect(t.stdout()).toEqual([]);
+    t.controller.abort();
+    await running;
+    expect(t.raw()).not.toContain("[image]");
+    expect(t.raw()).not.toContain("saved:");
+  });
+});
+
 describe("a long conversation and unsafe text", () => {
   const FILE = `/fake-storage/requests/${ID}/request.json`;
 
@@ -941,6 +1011,68 @@ describe("a long conversation and unsafe text", () => {
     expect(lines).toContain("  line 200");
     expect(lines).not.toContain("  line 201");
     expect(lines).toContain(`  (800 more lines omitted. Full conversation: ${FILE})`);
+  });
+
+  it("ends a cut line with the place of request.json, the same as the omission lines", async () => {
+    const none = { mediaType: null, size: null, file: null, fileId: null, typeName: null };
+    const lines = await shown([
+      {
+        role: "user",
+        content: "t".repeat(1500),
+        attachments: [
+          {
+            ...none,
+            at: 1500,
+            kind: "image",
+            readable: true,
+            address: `https://x/${"u".repeat(2000)}`,
+          },
+          {
+            ...none,
+            at: 1500,
+            kind: "file",
+            readable: true,
+            address: null,
+            fileId: "f".repeat(1100),
+          },
+        ],
+      },
+    ]);
+    const note = (count: number) =>
+      `... (${count} characters in this line. Full conversation: ${FILE})`;
+    expect(lines).toContain(`  ${"t".repeat(1000)}${note(1500)}`);
+    expect(lines.filter((line) => line.endsWith(FILE.concat(")")))).toHaveLength(3);
+    expect(
+      lines.some((line) => line.startsWith("  [image] https://x/") && line.endsWith(note(2018))),
+    ).toBe(true);
+    expect(
+      lines.some((line) => line.startsWith("  [file] file_id: ") && line.endsWith(note(1116))),
+    ).toBe(true);
+  });
+
+  it("does not cut the saved line of a part", async () => {
+    const lines = await shown([
+      {
+        role: "user",
+        content: "",
+        attachments: [
+          {
+            at: 0,
+            kind: "audio",
+            mediaType: "audio/wav",
+            size: 4,
+            file: "message-1-part-1.wav",
+            readable: true,
+            address: null,
+            fileId: null,
+            typeName: null,
+          },
+        ],
+      },
+    ]);
+    expect(lines).toContain(
+      `    saved: ${path.join(`/fake-storage/requests/${ID}`, "message-1-part-1.wav")}`,
+    );
   });
 
   it("replaces control characters in the required shape and in the model name", async () => {

@@ -1,11 +1,15 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
-import { INVALID_REPLY_REASONS, MAX_FILE_BYTES } from "../src/model.js";
+import { INVALID_REPLY_REASONS, MAX_FILE_BYTES, MAX_REQUEST_FILE_BYTES } from "../src/model.js";
 
-/** The documents are part of the product: these checks keep the promises made to readers true. */
+/**
+ * The documents are part of the product: these checks keep the promises made to readers true.
+ * Line ends are made `\n`, because a checkout on Windows may turn them into `\r\n`.
+ */
 async function document(...parts: string[]): Promise<string> {
-  return readFile(path.resolve(...parts), "utf8");
+  const text = await readFile(path.resolve(...parts), "utf8");
+  return text.replaceAll("\r\n", "\n");
 }
 
 describe("docs/storage-format.md", () => {
@@ -51,16 +55,30 @@ describe("docs/storage-format.md", () => {
     }
   });
 
-  it("says that the format version of request.json is 2 and that of the other two files is 1", () => {
+  it("says that the format version of request.json is 3 and that of the other two files is 1", () => {
     expect(text).toContain("`formatVersion`");
-    expect(text).toMatch(/`formatVersion` of `request\.json` is `2`/);
+    expect(text).toMatch(/`formatVersion` of `request\.json` is `3`/);
     expect(text).toMatch(/`state\.json` and `reply\.json` (stay|are) (at )?(version )?`?1`?/);
   });
 
-  it("says that a reader of version 1 must treat a version 2 request file as one it does not understand", () => {
-    expect(text).toMatch(/version 1[^\n]*\b(older|earlier)\b|\b(older|earlier)\b[^\n]*version 1/i);
+  it("says that a reader of versions 1 and 2 must treat a version 3 request file as one it does not understand (AC5.1.5)", () => {
+    expect(text).toMatch(
+      /versions? 1 and 2[^\n]*\b(older|earlier)\b|\b(older|earlier)\b[^\n]*versions? 1 and 2/i,
+    );
+    expect(text).toMatch(/version 3[^\n]*(cannot read|does not understand|not understand)/i);
     expect(text).toMatch(/every request/i);
-    expect(text).toMatch(/reads? (both )?`?1`? and `?2`?|versions? 1 and 2/i);
+    expect(text).toMatch(/reads? (all of )?`?1`?, `?2`? and `?3`?|versions? 1, 2 and 3/i);
+  });
+
+  it("no longer says that request.json is written as version 2 (AC5.1.6)", () => {
+    expect(text).not.toMatch(/format version 2 of `request\.json`/);
+    expect(text).not.toMatch(/writes version 2/i);
+    expect(text).not.toMatch(/`formatVersion` of `request\.json` is `2`/);
+    const row = text.split("\n").find((line) => line.startsWith("| `formatVersion` | number | `"));
+    expect(row).toContain("`3`");
+    expect(row).not.toMatch(/\| `2`\./);
+    const intro = text.split("\n")[2] ?? "";
+    expect(intro).toMatch(/format version 3 of `request\.json`/);
   });
 
   it("describes toolDefinitions and the tool fields of a message", () => {
@@ -157,6 +175,321 @@ describe("docs/storage-format.md", () => {
   });
 });
 
+/** The text of the section that starts with `heading`, up to the next heading of the same level or higher. */
+function sectionOf(text: string, heading: string): string {
+  const level = heading.match(/^#+/)?.[0].length ?? 2;
+  const start = text.indexOf(`\n${heading}\n`);
+  if (start < 0) {
+    return "";
+  }
+  const rest = text.slice(start + heading.length + 2);
+  const next = rest.search(new RegExp(`^#{1,${level}} `, "m"));
+  return next < 0 ? rest : rest.slice(0, next);
+}
+
+describe("docs/storage-format.md, parts that are not text (version 3)", () => {
+  let text = "";
+
+  beforeAll(async () => {
+    text = await document("docs", "storage-format.md");
+  });
+
+  it("lists the saved files in the layout and says who writes them", () => {
+    const layout = sectionOf(text, "## Layout");
+    expect(layout).toContain("message-<m>-part-<p>.<extension>");
+    expect(layout).toMatch(/written by `imbehind serve`/);
+  });
+
+  it("describes every field of an attachment, and the four kinds", () => {
+    const section = sectionOf(text, "### Attachments");
+    expect(section).not.toBe("");
+    for (const field of [
+      "attachments",
+      "at",
+      "kind",
+      "mediaType",
+      "size",
+      "file",
+      "readable",
+      "address",
+      "fileId",
+      "typeName",
+    ]) {
+      expect(section, field).toContain(`\`${field}\``);
+    }
+    for (const kind of ["image", "audio", "file", "other"]) {
+      expect(section, kind).toContain(`\`${kind}\``);
+    }
+    expect(section).toMatch(/Unicode characters/);
+    expect(section).toMatch(/empty string/);
+  });
+
+  it("has one row for each of the six states of an attachment, and says that others make the file unreadable", () => {
+    const section = sectionOf(text, "### Attachments");
+    const rows = section
+      .split("\n")
+      .filter((line) =>
+        /^\| (saved|address only|file id only|no data|unreadable|unknown type) \|/.test(line),
+      );
+    expect(rows).toHaveLength(6);
+    expect(section).toMatch(
+      /not (in|one of) (this|the) table[^\n]*(cannot|not) (be )?read|does not fit[^\n]*(cannot|not) (be )?read/i,
+    );
+    expect(section).toMatch(/unknown (keys?|fields?) (is|are) ignored/i);
+  });
+
+  it("tells where the saved files are and how they are named", () => {
+    const section = sectionOf(text, "### Saved files");
+    expect(section).not.toBe("");
+    expect(section).toContain("requests/<request id>/");
+    expect(section).toContain("message-<m>-part-<p>.<extension>");
+    expect(section).toMatch(/count(s|ed)? from 1/);
+    expect(section).toContain("`.bin`");
+    for (const extension of ["png", "jpg", "gif", "webp", "bmp", "svg", "wav", "mp3", "pdf"]) {
+      expect(section, extension).toContain(`\`${extension}\``);
+    }
+    expect(section).toMatch(/never (use|used)[^\n]*(client|sent)|nothing the client sent/i);
+  });
+
+  it("says how a saved file is written: all or nothing, before request.json, with the owner-only mode", () => {
+    const section = sectionOf(text, "### Saved files");
+    expect(section).toMatch(/before `request\.json`/);
+    expect(section).toMatch(/all or nothing|none of them stays/i);
+    expect(section).toContain("storage_error");
+    expect(section).toContain("`0600`");
+    expect(section).toMatch(/never write|must never write/i);
+  });
+
+  it("says that the saved files are deleted with the request folder after the retention time", () => {
+    const section = sectionOf(text, "### Saved files");
+    expect(section).toMatch(/retention/i);
+    expect(section).toMatch(/with (the|its) (request )?folder/i);
+    expect(section).toMatch(/recorded in `attachments`/);
+    expect(section).toMatch(/symbolic link|directory/i);
+  });
+
+  it("says that a request.json over the size limit is not cleaned up, with the limit from the code (R-04)", () => {
+    const section = sectionOf(text, "### Saved files");
+    expect(section).toContain(String(MAX_REQUEST_FILE_BYTES));
+    expect(section).toMatch(/larger than[^\n]*MAX_REQUEST_FILE_BYTES|larger than 278746355/i);
+    expect(section).toMatch(/kept|not (cleaned|deleted|removed)/i);
+    expect(section).toMatch(/indent/i);
+  });
+
+  it("names the condition under which the folder of a request.json that is not read is kept", () => {
+    const section = sectionOf(text, "### Saved files");
+    const bullet =
+      section.split("\n").find((line) => line.includes("MAX_REQUEST_FILE_BYTES")) ?? "";
+    // Kept only when it also holds a file that has the form of a saved name; otherwise removed.
+    expect(bullet).toMatch(/only (when|if)[^\n]*(form of a saved name|saved file name)/i);
+    expect(bullet).toMatch(/otherwise[^\n]*(deleted|removed)/i);
+    expect(bullet).not.toMatch(/So the folder of such a request is kept, and/);
+  });
+
+  it("says that attachments, when present, has at least one item", () => {
+    const section = sectionOf(text, "### Attachments");
+    expect(section).toMatch(/at least one item/i);
+    expect(section).toMatch(/empty (array|list)[^\n]*(cannot|not) (be )?read/i);
+  });
+
+  it("is written in English", () => {
+    expect(JAPANESE.test(text)).toBe(false);
+  });
+});
+
+describe("docs/specification.md, parts that are not text", () => {
+  let text = "";
+
+  beforeAll(async () => {
+    text = await document("docs", "specification.md");
+  });
+
+  it("says in the Request section that image_url, input_audio and file parts are accepted for every role (AC3.1.7)", () => {
+    const section = sectionOf(text, "### Request");
+    expect(section).not.toBe("");
+    for (const type of ["image_url", "input_audio", "file"]) {
+      expect(section, type).toContain(`\`${type}\``);
+    }
+    expect(section).toMatch(/accepted|received/i);
+    expect(section).toMatch(/every role|any role|all roles/i);
+  });
+
+  it("says that parts of an unknown type and parts that cannot be read are accepted, and that nothing is fetched", () => {
+    const section = sectionOf(text, "### Request");
+    expect(section).toMatch(/any other `type`|unknown `type`|type this version does not know/i);
+    expect(section).toMatch(/cannot be read|unreadable/i);
+    expect(section).toMatch(/never fetch|does not fetch|not fetch/i);
+  });
+
+  it("says that a content that is a string stays text, even when it looks like a part", () => {
+    const section = sectionOf(text, "### Request");
+    expect(section).toMatch(/string[^\n]*\b(as it is|plain text|text)\b[^\n]*(JSON|base64|image)/i);
+  });
+
+  it("no longer calls an array content an array of text parts only (R-05)", () => {
+    expect(text).not.toMatch(/array of text parts/i);
+    expect(text).not.toMatch(/text parts `\{"type": "text"/);
+    expect(sectionOf(text, "### Request")).toMatch(
+      /`text` parts?[^\n]*joined without a separator/i,
+    );
+  });
+
+  it("tells in its own section which parts are saved, kept as an address or a file_id, or unreadable", () => {
+    const section = sectionOf(text, "### Parts that are not text");
+    expect(section).not.toBe("");
+    expect(section).toContain("data:");
+    expect(section).toContain(";base64");
+    for (const word of [
+      "image_url",
+      "input_audio",
+      "file_data",
+      "file_id",
+      "audio/wav",
+      "audio/mpeg",
+    ]) {
+      expect(section, word).toContain(word);
+    }
+    expect(section).toMatch(/standard alphabet|`A`-`Z`|A-Z/);
+    expect(section).toContain("storage-format.md");
+  });
+
+  it("does not list a row in the refusal table that refuses these three kinds of part (AC3.1.7)", () => {
+    const section = sectionOf(text, "### Requests that are refused");
+    expect(section).not.toBe("");
+    expect(section).not.toContain("unsupported_content");
+    const rows = section.split("\n").filter((line) => line.startsWith("|"));
+    expect(rows.length).toBeGreaterThan(5);
+    for (const row of rows) {
+      expect(row).not.toMatch(/image|audio|input_audio|image_url|a file part/i);
+    }
+    expect(section).toMatch(/not (a reason to )?refus/i);
+  });
+
+  it("describes the part lines of `imbehind answer` and the cut at 1000 characters (AC3.1.7)", () => {
+    const section = sectionOf(text, "### What `imbehind answer` does");
+    expect(section).not.toBe("");
+    for (const word of [
+      "[image]",
+      "[audio]",
+      "[file]",
+      "saved:",
+      "(unreadable)",
+      "file_id",
+      "1000",
+      "characters in this line",
+    ]) {
+      expect(section, word).toContain(word);
+    }
+    expect(section).toMatch(/absolute path/i);
+    expect(section).toMatch(/in the order (they|the parts) arrived/i);
+    expect(section).toMatch(/not (cut|counted)[^\n]*`saved:`|`saved:`[^\n]*(is )?not cut/i);
+    expect(section).toMatch(/may change|can change|are for people/i);
+  });
+
+  it("lists the number of characters of one line, and the parts, in the Limits table (AC3.1.7)", () => {
+    const section = sectionOf(text, "## Limits");
+    const rows = section.split("\n").filter((line) => line.startsWith("| "));
+    const line = rows.find((row) => /1000/.test(row) && /character/i.test(row));
+    expect(line).toBeDefined();
+    expect(rows.some((row) => /parts that are not text/i.test(row) && /no limit/i.test(row))).toBe(
+      true,
+    );
+  });
+
+  it("says in Storage and states that the saved parts are files in the request folder that go with it", () => {
+    const section = sectionOf(text, "## Storage and states");
+    expect(section).toContain("message-<m>-part-<p>");
+    expect(section).toMatch(/with (the|its) (request )?folder/i);
+    expect(section).toMatch(/retention/i);
+  });
+});
+
+describe("docs/requirements.md, parts that are not text", () => {
+  let text = "";
+
+  /** The line of a requirement, found by its number. */
+  const requirement = (id: string): string =>
+    text.split("\n").find((line) => line.startsWith(`- **${id}**`)) ?? "";
+
+  beforeAll(async () => {
+    text = await document("docs", "requirements.md");
+  });
+
+  it("has FR8 as the group that accepts and shows these parts, not the one that refuses them (AC1.1.6)", () => {
+    expect(text).toMatch(/^### FR8 Parts that are not text \(Must\)$/m);
+    expect(text).not.toContain("Refuse parts that are not text");
+    expect(text).not.toMatch(/is refused at once/i);
+    expect(text).not.toMatch(/images are not supported/i);
+    expect(text).not.toMatch(/unsupported part type/i);
+  });
+
+  it("states in FR8 what is accepted, saved, not fetched, shown, and cut", () => {
+    const section = sectionOf(text, "### FR8 Parts that are not text (Must)");
+    for (const id of ["FR8.1", "FR8.2", "FR8.3", "FR8.4", "FR8.5"]) {
+      expect(section, id).toContain(id);
+    }
+    for (const word of ["image_url", "input_audio", "file", "unreadable", "1000"]) {
+      expect(section, word).toContain(word);
+    }
+    expect(requirement("FR8.1")).toMatch(/accepted/i);
+    expect(requirement("FR8.1")).toMatch(/every role|any role|all roles/i);
+    expect(requirement("FR8.3")).toMatch(/saved|written/i);
+    expect(requirement("FR8.3")).toMatch(/never fetch|does not fetch|not fetch/i);
+    expect(requirement("FR8.4")).toMatch(/one line|a line/i);
+    expect(requirement("FR8.4")).toMatch(/absolute path/i);
+    expect(requirement("FR8.5")).toMatch(/cut/i);
+  });
+
+  it("keeps the refusal of parts that are not objects, or have no type, in FR8 or FR1", () => {
+    const section = sectionOf(text, "### FR8 Parts that are not text (Must)");
+    expect(section).toMatch(/not an object|no string `type`|without a string `type`/i);
+    expect(section).toMatch(/refused|client error/i);
+  });
+
+  it("mentions the lines of these parts in FR4.2 and FR4.9, and no longer says that only text parts are shown", () => {
+    expect(requirement("FR4.2")).toMatch(/part/i);
+    expect(requirement("FR4.9")).not.toBe(
+      "A `content` that is an array of text parts is shown as the parts joined together.",
+    );
+    expect(requirement("FR4.9")).not.toMatch(/array of text parts/i);
+    expect(requirement("FR4.9")).toMatch(/not text/i);
+    expect(requirement("FR4.9")).toMatch(/line/i);
+  });
+
+  it("says in FR12.3 that parts that are not text are received and shown, not refused", () => {
+    const line = requirement("FR12.3");
+    expect(line).not.toMatch(/parts that are not text are refused/i);
+    expect(line).not.toMatch(/refus/i);
+    expect(line).toMatch(/not text/i);
+    expect(line).toMatch(/received|accepted/i);
+  });
+
+  it("says in FR14.1 that request.json is version 3 and that it reads versions 1, 2 and 3 (AC5.1.6)", () => {
+    const line = requirement("FR14.1");
+    expect(line).not.toMatch(/`formatVersion` of `request\.json` is 2/);
+    expect(line).not.toMatch(/reads request files of both versions 1 and 2/);
+    expect(line).toMatch(/`formatVersion` of `request\.json` is 3/);
+    expect(line).toMatch(/versions 1, 2 and 3/);
+    expect(line).toMatch(/version 3 request file/);
+  });
+
+  it("no longer says in the out-of-scope table that the first release refuses images", () => {
+    const section = sectionOf(text, "## Out of scope");
+    expect(section).not.toContain("A reply written after the human has seen an image");
+    expect(section).not.toMatch(/refuses images/i);
+    expect(section).toMatch(/\| [^|\n]*(image|audio|file)[^|\n]* \| Will not be built/i);
+  });
+
+  it("keeps the requirement numbers around these changes", () => {
+    for (const id of ["FR1.8", "FR4.2", "FR4.9", "FR8.1", "FR12.3", "FR14.1", "FR14.5"]) {
+      // The line of the requirement itself, not a mention of it inside another requirement.
+      expect(requirement(id), id).toMatch(
+        new RegExp(`^- \\*\\*${id.replace(".", "\\.")}\\*\\* \\S`),
+      );
+    }
+  });
+});
+
 describe("docs/specification.md, replying from standard input", () => {
   it("has a section that tells how it works and links the storage format", async () => {
     const text = await document("docs", "specification.md");
@@ -214,10 +547,7 @@ describe("README.md and README.ja.md", () => {
     }
   });
 
-  it("tell that parts that are not text are refused with unsupported_content", async () => {
-    for (const name of READMES) {
-      expect(await document(name), name).toContain("unsupported_content");
-    }
+  it("mention the parts that are not text", async () => {
     expect(await document("README.md")).toMatch(/image, audio, a file/);
     // The Japanese word for "image", written as code points.
     expect(await document("README.ja.md")).toContain(String.fromCodePoint(0x753b, 0x50cf));
@@ -238,13 +568,49 @@ describe("README.md and README.ja.md", () => {
     );
   });
 
-  it("do not say that images are saved", async () => {
-    expect(await document("README.md")).not.toMatch(
-      /images?\b[^.\n]*\b(is|are|also) (also )?(saved|stored)\b/i,
+  it("do not say that parts that are not text are refused, and no longer name unsupported_content (AC1.1.6)", async () => {
+    for (const name of READMES) {
+      expect(await document(name), name).not.toContain("unsupported_content");
+    }
+    const english = await document("README.md");
+    expect(english).not.toMatch(/\b(image|audio|file)s?\b[^.\n]*\b(is|are) refused\b/i);
+    expect(english).not.toMatch(/A request that is refused, such as one with an image/i);
+    // The Japanese words "refuse" (in three forms), written as code points.
+    const japanese = await document("README.ja.md");
+    for (const word of [
+      String.fromCodePoint(0x65ad, 0x308b),
+      String.fromCodePoint(0x65ad, 0x3063, 0x305f),
+      String.fromCodePoint(0x65ad, 0x3089),
+    ]) {
+      expect(japanese, word).not.toContain(word);
+    }
+  });
+
+  it("say that parts that are not text are received, saved and shown, and that addresses are not fetched (AC1.1.6)", async () => {
+    const english = await document("README.md");
+    expect(english).toMatch(/\(image, audio, a file\)[^.\n]*\breceived\b/i);
+    expect(english).toMatch(/\bsaved\b[^.\n]*\bfile/i);
+    expect(english).toMatch(/\bshows?\b[^.\n]*\bline\b/i);
+    expect(english).toMatch(/never fetch|not fetch|does not fetch/i);
+    // The Japanese words "receive" (uketotte), "save" (hozon) and "not fetch" (torini ikimasen).
+    const japanese = await document("README.ja.md");
+    expect(japanese).toContain(String.fromCodePoint(0x53d7, 0x3051, 0x53d6, 0x3063, 0x3066));
+    expect(japanese).toContain(String.fromCodePoint(0x4fdd, 0x5b58));
+    expect(japanese).toContain(
+      String.fromCodePoint(0x53d6, 0x308a, 0x306b, 0x3044, 0x304d, 0x307e, 0x305b, 0x3093),
     );
-    // The Japanese words for "images are saved too", written as code points.
-    expect(await document("README.ja.md")).not.toContain(
-      String.fromCodePoint(0x753b, 0x50cf, 0x3082, 0x4fdd, 0x5b58),
+  });
+
+  it("say in the notes that the data of images, audio and files is saved too, and that a request that is not valid is not", async () => {
+    const english = await document("README.md");
+    const notes = english.split(/^## Notes$/m)[1]?.split(/^## /m)[0] ?? "";
+    expect(notes).toMatch(/images?, audio and files?/i);
+    expect(notes).toMatch(/not valid|malformed/i);
+    expect(notes).toMatch(/not saved/i);
+    const japanese = await document("README.ja.md");
+    // The Japanese words "a request with a wrong form is not saved", written as code points.
+    expect(japanese).toContain(
+      String.fromCodePoint(0x4f9d, 0x983c, 0x306f, 0x4fdd, 0x5b58, 0x3057, 0x307e, 0x305b, 0x3093),
     );
   });
 
@@ -304,9 +670,9 @@ describe("docs/requirements.md and docs/specification.md, tools", () => {
 
   it("lists in the refusal table only what is still refused", async () => {
     const text = await document("docs", "specification.md");
-    const row = text.split("\n").find((line) => line.includes("| 400 | `unsupported_content` |"));
+    expect(text).not.toContain("unsupported_content");
+    const row = text.split("\n").find((line) => line.includes("| 400 | `invalid_request` |"));
     expect(row).toBeDefined();
-    expect(row).toContain("image");
     expect(row).not.toMatch(/tools|functions|tool_calls|function_call/);
     expect(text).not.toContain("Tool calls are not supported");
     expect(text).not.toContain("Empty `tools` and `functions` arrays are accepted.");
@@ -350,7 +716,6 @@ describe("docs/specification.md (FR12.4)", () => {
     for (const word of [
       "POST /v1/chat/completions",
       "GET /v1/models",
-      "unsupported_content",
       "invalid_request",
       "request_too_large",
       "skipped_by_human",
