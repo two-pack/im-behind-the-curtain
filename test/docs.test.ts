@@ -3,9 +3,13 @@ import path from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import { INVALID_REPLY_REASONS, MAX_FILE_BYTES, MAX_REQUEST_FILE_BYTES } from "../src/model.js";
 
-/** The documents are part of the product: these checks keep the promises made to readers true. */
+/**
+ * The documents are part of the product: these checks keep the promises made to readers true.
+ * Line ends are made `\n`, because a checkout on Windows may turn them into `\r\n`.
+ */
 async function document(...parts: string[]): Promise<string> {
-  return readFile(path.resolve(...parts), "utf8");
+  const text = await readFile(path.resolve(...parts), "utf8");
+  return text.replaceAll("\r\n", "\n");
 }
 
 describe("docs/storage-format.md", () => {
