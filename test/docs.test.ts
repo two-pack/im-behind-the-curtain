@@ -214,10 +214,7 @@ describe("README.md and README.ja.md", () => {
     }
   });
 
-  it("tell that parts that are not text are refused with unsupported_content", async () => {
-    for (const name of READMES) {
-      expect(await document(name), name).toContain("unsupported_content");
-    }
+  it("mention the parts that are not text", async () => {
     expect(await document("README.md")).toMatch(/image, audio, a file/);
     // The Japanese word for "image", written as code points.
     expect(await document("README.ja.md")).toContain(String.fromCodePoint(0x753b, 0x50cf));
@@ -304,9 +301,9 @@ describe("docs/requirements.md and docs/specification.md, tools", () => {
 
   it("lists in the refusal table only what is still refused", async () => {
     const text = await document("docs", "specification.md");
-    const row = text.split("\n").find((line) => line.includes("| 400 | `unsupported_content` |"));
+    expect(text).not.toContain("unsupported_content");
+    const row = text.split("\n").find((line) => line.includes("| 400 | `invalid_request` |"));
     expect(row).toBeDefined();
-    expect(row).toContain("image");
     expect(row).not.toMatch(/tools|functions|tool_calls|function_call/);
     expect(text).not.toContain("Tool calls are not supported");
     expect(text).not.toContain("Empty `tools` and `functions` arrays are accepted.");
@@ -350,7 +347,6 @@ describe("docs/specification.md (FR12.4)", () => {
     for (const word of [
       "POST /v1/chat/completions",
       "GET /v1/models",
-      "unsupported_content",
       "invalid_request",
       "request_too_large",
       "skipped_by_human",

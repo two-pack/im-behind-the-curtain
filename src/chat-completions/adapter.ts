@@ -3,7 +3,14 @@
  * conversation form, and builds the response and error bodies.
  * It has no side effects and calls only the leaf modules.
  */
-import { readDataUrl, savedFileName } from "../media-parts.js";
+import {
+  audioMediaType,
+  type DataUrlContent,
+  isDataUrl,
+  readBase64,
+  readDataUrl,
+  savedFileName,
+} from "../media-parts.js";
 import {
   type Attachment,
   type ConversationRequest,
@@ -20,7 +27,6 @@ import {
 
 export type ErrorCode =
   | "invalid_request"
-  | "unsupported_content"
   | "request_too_large"
   | "not_found"
   | "method_not_allowed"
@@ -35,8 +41,7 @@ export const MESSAGES = {
   messagesRequired: '"messages" must be a non-empty array.',
   modelRequired: '"model" must be a string.',
   messageNotObject: "Each message must be an object.",
-  contentType: "Message content must be a string, null, or an array of text parts.",
-  images: "Images are not supported. A human reads requests as text.",
+  contentType: "Message content must be a string, null, or an array of content parts.",
   tooManyChoices: 'Only one choice can be returned; "n" must be 1.',
   requestTooLarge: "Request body is larger than 10 MB.",
   notFound: "Not found.",
@@ -47,12 +52,12 @@ export const MESSAGES = {
   unexpectedHost: "Unexpected Host header.",
 } as const;
 
-/** Longest piece of a role name or content part type that is put into an error message. */
+/** Longest piece of a role name that is put into an error message. */
 const MAX_ROLE_LENGTH = 64;
 
-/** Why a request is turned away: a malformed one, or one that asks for something not supported. */
+/** Why a request is turned away: it is malformed. */
 interface Failure {
-  code: "invalid_request" | "unsupported_content";
+  code: "invalid_request";
   message: string;
 }
 
@@ -107,10 +112,6 @@ export interface ChatCompletion {
 
 function invalid(message: string): Failure {
   return { code: "invalid_request", message };
-}
-
-function unsupported(message: string): Failure {
-  return { code: "unsupported_content", message };
 }
 
 function reject(failure: Failure): AdapterResult {
@@ -185,69 +186,8 @@ function mayLeaveOutContent(message: Record<string, unknown>): boolean {
   );
 }
 
-/** The url of an `image_url` part, if the part has the shape and the url is a string. */
-function imageUrlOf(part: Record<string, unknown>): string | undefined {
-  const inner = part.image_url;
-  return isRecord(inner) && typeof inner.url === "string" ? inner.url : undefined;
-}
-
-type DecodedImage = ReturnType<typeof readDataUrl>;
-
-/** The decoded data of each image part, so that a data URL is decoded once per request. */
-const decodedImages = new WeakMap<object, DecodedImage>();
-
-/** The decoded data of an `image_url` part; undefined when its url is not a readable data URL. */
-function decodeImage(part: Record<string, unknown>): DecodedImage {
-  if (!decodedImages.has(part)) {
-    const url = imageUrlOf(part);
-    decodedImages.set(part, url === undefined ? undefined : readDataUrl(url));
-  }
-  return decodedImages.get(part);
-}
-
-/** Whether a part is an image that this version reads: the url is a readable data URL. */
-function isReadableImage(part: Record<string, unknown>): boolean {
-  return decodeImage(part) !== undefined;
-}
-
-/** Any part of the content that is an image this version does not read. */
-function checkImageParts(message: Record<string, unknown>): Failure | undefined {
-  const content = message.content;
-  const hasUnreadable =
-    Array.isArray(content) &&
-    content.some((part) => isRecord(part) && part.type === "image_url" && !isReadableImage(part));
-  return hasUnreadable ? unsupported(MESSAGES.images) : undefined;
-}
-
-function partTypeMessage(type: string): string {
-  return `Unsupported content part type: "${type.slice(0, MAX_ROLE_LENGTH)}".`;
-}
-
-/** The first part whose type is a string other than text or image_url. */
-function checkOtherParts(message: Record<string, unknown>): Failure | undefined {
-  const content = message.content;
-  if (!Array.isArray(content)) {
-    return undefined;
-  }
-  for (const part of content) {
-    if (
-      isRecord(part) &&
-      typeof part.type === "string" &&
-      part.type !== "text" &&
-      part.type !== "image_url"
-    ) {
-      return unsupported(partTypeMessage(part.type));
-    }
-  }
-  return undefined;
-}
-
 /** Checks on one message before its content is read, in order. */
-const MESSAGE_CHECKS: readonly Check<Record<string, unknown>>[] = [
-  checkRole,
-  checkImageParts,
-  checkOtherParts,
-];
+const MESSAGE_CHECKS: readonly Check<Record<string, unknown>>[] = [checkRole];
 
 /**
  * Which definitions the body carries. An array with at least one entry counts; what the entries
@@ -265,12 +205,6 @@ function readToolDefinitions(body: Record<string, unknown>): ToolDefinitions {
   return functions ? "functions" : "none";
 }
 
-function textOfPart(part: unknown): string | undefined {
-  return isRecord(part) && part.type === "text" && typeof part.text === "string"
-    ? part.text
-    : undefined;
-}
-
 /** What is read from the content of one message. */
 interface ReadContent {
   /** The text parts joined without a separator. */
@@ -285,42 +219,151 @@ function textOnly(text: string): ReadContent {
   return { text, attachments: [], parts: [] };
 }
 
-/** The decoded data of an `image_url` part with a readable data URL; undefined for any other. */
-function readableImageOf(part: unknown): DecodedImage {
-  return isRecord(part) && part.type === "image_url" ? decodeImage(part) : undefined;
+/** The kinds of a part that is saved or shown by its kind. */
+type MediaKind = "image" | "audio" | "file";
+
+/**
+ * What one part that is not text turns out to be. The shapes are the rows of the table of parts
+ * that can and cannot be read.
+ */
+type PartReading =
+  | { state: "saved"; kind: MediaKind; content: DataUrlContent }
+  | { state: "unreadable"; kind: MediaKind }
+  | { state: "address"; address: string }
+  | { state: "fileId"; fileId: string }
+  | { state: "kindOnly" }
+  | { state: "other"; typeName: string };
+
+const unreadable = (kind: MediaKind): PartReading => ({ state: "unreadable", kind });
+
+/** A data URL part: saved when it can be read, unreadable when it cannot. */
+function savedOrUnreadable(kind: MediaKind, url: string): PartReading {
+  const content = readDataUrl(url);
+  return content === undefined ? unreadable(kind) : { state: "saved", kind, content };
+}
+
+function readImage(part: Record<string, unknown>): PartReading {
+  const inner = part.image_url;
+  const url = isRecord(inner) ? inner.url : undefined;
+  if (typeof url !== "string" || url === "") {
+    return unreadable("image");
+  }
+  return isDataUrl(url) ? savedOrUnreadable("image", url) : { state: "address", address: url };
+}
+
+function readAudio(part: Record<string, unknown>): PartReading {
+  const inner = part.input_audio;
+  if (!isRecord(inner) || typeof inner.data !== "string") {
+    return unreadable("audio");
+  }
+  const bytes = readBase64(inner.data);
+  if (bytes === undefined) {
+    return unreadable("audio");
+  }
+  return {
+    state: "saved",
+    kind: "audio",
+    content: { mediaType: audioMediaType(inner.format), bytes },
+  };
+}
+
+function readFile(part: Record<string, unknown>): PartReading {
+  const inner = part.file;
+  if (!isRecord(inner)) {
+    return unreadable("file");
+  }
+  const data = inner.file_data;
+  if (data === undefined || data === null) {
+    return typeof inner.file_id === "string"
+      ? { state: "fileId", fileId: inner.file_id }
+      : { state: "kindOnly" };
+  }
+  return typeof data === "string" && isDataUrl(data)
+    ? savedOrUnreadable("file", data)
+    : unreadable("file");
 }
 
 /**
- * The text and the parts of an array content. A text part adds to the text. An image with a
- * readable data URL becomes an attachment placed after the characters of text before it, and its
- * bytes are saved under a name made from the message and part numbers. Any other part gives
- * undefined; the other parts that are accepted were checked before.
+ * Reads one part of an array content that is not text. Each part is read once, so a data URL is
+ * decoded once per request.
+ */
+function readNonTextPart(part: Record<string, unknown>, type: string): PartReading {
+  switch (type) {
+    case "image_url":
+      return readImage(part);
+    case "input_audio":
+      return readAudio(part);
+    case "file":
+      return readFile(part);
+    default:
+      return { state: "other", typeName: type };
+  }
+}
+
+/** The attachment fields that a part without data has: all null. */
+const NO_VALUES = {
+  mediaType: null,
+  size: null,
+  file: null,
+  address: null,
+  fileId: null,
+  typeName: null,
+} as const;
+
+/** The attachment for a part that is not text, placed after `at` characters of text. */
+function attachmentOf(reading: PartReading, at: number, file: string | null): Attachment {
+  const base = { at, readable: true, ...NO_VALUES };
+  switch (reading.state) {
+    case "saved":
+      return {
+        ...base,
+        kind: reading.kind,
+        mediaType: reading.content.mediaType,
+        size: reading.content.bytes.length,
+        file,
+      };
+    case "unreadable":
+      return { ...base, kind: reading.kind, readable: false };
+    case "address":
+      return { ...base, kind: "image", address: reading.address };
+    case "fileId":
+      return { ...base, kind: "file", fileId: reading.fileId };
+    case "kindOnly":
+      return { ...base, kind: "file" };
+    default:
+      return { ...base, kind: "other", typeName: reading.typeName };
+  }
+}
+
+/**
+ * The text and the parts of an array content. A text part adds to the text. Every other part
+ * becomes an attachment placed after the characters of text before it. The bytes of a part with a
+ * readable body are saved under a name made from the message and part numbers. Undefined means a
+ * part is not an object, has no string `type`, or is a text part without a string `text`.
  */
 function readParts(content: unknown[], messageNumber: number): ReadContent | undefined {
   const read: ReadContent = { text: "", attachments: [], parts: [] };
   let characters = 0;
   for (const [index, part] of content.entries()) {
-    const text = textOfPart(part);
-    const image = readableImageOf(part);
-    if (text !== undefined) {
-      read.text += text;
-      characters += characterCount(text);
-    } else if (image !== undefined) {
-      const file = savedFileName(messageNumber, index + 1, image.mediaType);
-      read.attachments.push({
-        at: characters,
-        kind: "image",
-        mediaType: image.mediaType,
-        size: image.bytes.length,
-        file,
-        readable: true,
-        address: null,
-        fileId: null,
-        typeName: null,
-      });
-      read.parts.push({ file, bytes: image.bytes });
-    } else {
+    if (!isRecord(part) || typeof part.type !== "string") {
       return undefined;
+    }
+    if (part.type === "text") {
+      if (typeof part.text !== "string") {
+        return undefined;
+      }
+      read.text += part.text;
+      characters += characterCount(part.text);
+      continue;
+    }
+    const reading = readNonTextPart(part, part.type);
+    const file =
+      reading.state === "saved"
+        ? savedFileName(messageNumber, index + 1, reading.content.mediaType)
+        : null;
+    read.attachments.push(attachmentOf(reading, characters, file));
+    if (reading.state === "saved" && file !== null) {
+      read.parts.push({ file, bytes: reading.content.bytes });
     }
   }
   return read;
@@ -388,7 +431,10 @@ function convertMessages(
       return converted;
     }
     messages.push(converted.message);
-    parts.push(...converted.parts);
+    // Not push(...), whose arguments would overflow the stack for a very large number of parts.
+    for (const part of converted.parts) {
+      parts.push(part);
+    }
   }
   return { messages, parts };
 }

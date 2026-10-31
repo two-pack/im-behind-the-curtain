@@ -29,6 +29,15 @@ const EXTENSIONS: Readonly<Record<string, string>> = {
   "image/webp": "webp",
   "image/bmp": "bmp",
   "image/svg+xml": "svg",
+  "audio/wav": "wav",
+  "audio/mpeg": "mp3",
+  "application/pdf": "pdf",
+};
+
+/** The media type of each `input_audio` format that this server knows. Lower case only. */
+const AUDIO_TYPES: Readonly<Record<string, string>> = {
+  wav: "audio/wav",
+  mp3: "audio/mpeg",
 };
 
 const UNKNOWN_EXTENSION = "bin";
@@ -50,13 +59,36 @@ function mediaTypeOf(header: string): string | null {
   return MEDIA_TYPE.test(first) ? first : null;
 }
 
+/** Whether `url` starts with `data:`, in any case. The rest is not looked at. */
+export function isDataUrl(url: string): boolean {
+  return url.slice(0, DATA_PREFIX.length).toLowerCase() === DATA_PREFIX;
+}
+
+/**
+ * The bytes of base64 text with the standard characters and a length that base64 can have; empty
+ * text is zero bytes. Undefined means the text cannot be read.
+ */
+export function readBase64(data: string): Uint8Array | undefined {
+  return isBase64(data) ? new Uint8Array(Buffer.from(data, "base64")) : undefined;
+}
+
+/**
+ * The media type of the `format` of an `input_audio` part: `audio/wav` for `wav` and `audio/mpeg`
+ * for `mp3`, both in lower case. Anything else is null, which is not a failure.
+ */
+export function audioMediaType(format: unknown): string | null {
+  return typeof format === "string" && Object.hasOwn(AUDIO_TYPES, format)
+    ? (AUDIO_TYPES[format] ?? null)
+    : null;
+}
+
 /**
  * Reads a `data:` URL that has a `;base64` mark. Undefined means the URL cannot be read: it does
  * not start with `data:`, has no comma, does not end its header with `;base64`, or its data is not
  * base64. A media type that is not valid is null, which is not a failure.
  */
 export function readDataUrl(url: string): DataUrlContent | undefined {
-  if (url.slice(0, DATA_PREFIX.length).toLowerCase() !== DATA_PREFIX) {
+  if (!isDataUrl(url)) {
     return undefined;
   }
   const rest = url.slice(DATA_PREFIX.length);
@@ -65,11 +97,11 @@ export function readDataUrl(url: string): DataUrlContent | undefined {
     return undefined;
   }
   const header = rest.slice(0, comma);
-  const data = rest.slice(comma + 1);
-  if (!header.toLowerCase().endsWith(BASE64_MARK) || !isBase64(data)) {
+  if (!header.toLowerCase().endsWith(BASE64_MARK)) {
     return undefined;
   }
-  return { mediaType: mediaTypeOf(header), bytes: new Uint8Array(Buffer.from(data, "base64")) };
+  const bytes = readBase64(rest.slice(comma + 1));
+  return bytes === undefined ? undefined : { mediaType: mediaTypeOf(header), bytes };
 }
 
 /**

@@ -1,8 +1,16 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import OpenAI from "openai";
+import type { ChatCompletionContentPart } from "openai/resources/chat/completions";
 import { describe, expect, it } from "vitest";
 import { waitFor } from "../helpers/io.js";
+import {
+  everyKindOfPart,
+  FILE_ID,
+  listenForConnections,
+  PDF_BASE64,
+  WAV_BASE64,
+} from "../helpers/media-parts.js";
 import { ScriptedReader } from "../helpers/scripted-reader.js";
 import {
   answerEverything,
@@ -126,21 +134,12 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
     await expect(
       client.chat.completions.create({
         model: "whatever",
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "image_url",
-                image_url: { url: "https://example.com/cat.png" },
-              },
-            ],
-          },
-        ],
+        messages: [{ role: "user", content: "Hi" }],
+        n: 2,
       }),
     ).rejects.toMatchObject({
       status: 400,
-      code: "unsupported_content",
+      code: "invalid_request",
       type: "invalid_request_error",
     });
   });
@@ -174,6 +173,40 @@ describe("a round trip with the official OpenAI SDK (NFR4.2)", () => {
     expect(answer.stdout()).toContain(
       `  [image] image/png, ${bytes.length} bytes\n    saved: ${saved}\n`,
     );
+  });
+
+  it("accepts audio, a file, an address, a file_id, unreadable parts and an unknown type", async () => {
+    const listener = await listenForConnections();
+    try {
+      const serve = await startServe();
+      const answer = startAnswer(serve.storageDir, new ScriptedReader(["Heard."]));
+      // The SDK types know the first four kinds; the last ones are sent as the raw shapes.
+      const content = everyKindOfPart(listener.address) as unknown as ChatCompletionContentPart[];
+      const completion = await clientFor(serve.baseUrl).chat.completions.create({
+        model: "whatever",
+        messages: [{ role: "user", content }],
+      });
+      expect(completion.choices[0]?.message.content).toBe("Heard.");
+      await waitFor(() => answer.stdout().includes("Sent."));
+      const id = await waitForRequestId(serve.storageDir);
+      const dir = path.join(serve.storageDir, "requests", id);
+      expect(await readFile(path.join(dir, "message-1-part-2.wav"))).toEqual(
+        Buffer.from(WAV_BASE64, "base64"),
+      );
+      expect(await readFile(path.join(dir, "message-1-part-3.pdf"))).toEqual(
+        Buffer.from(PDF_BASE64, "base64"),
+      );
+      const shown = answer.stdout();
+      expect(shown).toContain(
+        `  [audio] audio/wav, 4 bytes\n    saved: ${path.join(dir, "message-1-part-2.wav")}\n`,
+      );
+      expect(shown).toContain(`  [image] ${listener.address}\n  [file] file_id: ${FILE_ID}\n`);
+      expect(shown).toContain("  [file] (unreadable)\n  [audio] (unreadable)\n  [video_url]\n");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(listener.connections()).toBe(0);
+    } finally {
+      await listener.close();
+    }
   });
 
   it("accepts a message whose content is an array of text parts", async () => {

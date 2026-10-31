@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { isSavedFileName, readDataUrl, savedFileName } from "../src/media-parts.js";
+import {
+  audioMediaType,
+  isDataUrl,
+  isSavedFileName,
+  readBase64,
+  readDataUrl,
+  savedFileName,
+} from "../src/media-parts.js";
 
 function readable(url: string): { mediaType: string | null; bytes: number[] } {
   const result = readDataUrl(url);
@@ -85,6 +92,80 @@ describe("reading the base64 data", () => {
   });
 });
 
+describe("telling a data URL by its start", () => {
+  it("is true for data: in any case, even when the rest cannot be read", () => {
+    for (const url of ["data:", "DATA:x", "Data:image/png;base64,QUJD", "data:no comma"]) {
+      expect(isDataUrl(url), url).toBe(true);
+    }
+  });
+
+  it("is false for an address, an empty string and a start that is not exactly data:", () => {
+    for (const url of ["", "https://example.com/a.png", "dat:", " data:x", "xdata:x"]) {
+      expect(isDataUrl(url), url).toBe(false);
+    }
+  });
+});
+
+describe("the media type of audio", () => {
+  it("is audio/wav for wav and audio/mpeg for mp3, in lower case", () => {
+    expect(audioMediaType("wav")).toBe("audio/wav");
+    expect(audioMediaType("mp3")).toBe("audio/mpeg");
+  });
+
+  it("is unknown for a format with a capital letter", () => {
+    for (const format of ["WAV", "Mp3", "wAv", "MP3"]) {
+      expect(audioMediaType(format), format).toBeNull();
+    }
+  });
+
+  it("is unknown for a format that is not a string, or is missing", () => {
+    for (const format of [undefined, null, 5, true, {}, ["wav"], Symbol.for("wav")]) {
+      expect(audioMediaType(format)).toBeNull();
+    }
+  });
+
+  it("is unknown for another format, a padded one and a name of Object", () => {
+    for (const format of ["ogg", "flac", "", " wav", "wav ", "mp3\n", "constructor", "__proto__"]) {
+      expect(audioMediaType(format), JSON.stringify(format)).toBeNull();
+    }
+  });
+});
+
+describe("reading base64 text that has no data: head", () => {
+  it("reads empty text as zero bytes", () => {
+    expect(readBase64("")?.length).toBe(0);
+  });
+
+  it("reads the standard characters with or without padding", () => {
+    expect([...(readBase64("QUJD") ?? [])]).toEqual([65, 66, 67]);
+    expect([...(readBase64("QUI=") ?? [])]).toEqual([65, 66]);
+    expect([...(readBase64("QQ==") ?? [])]).toEqual([65]);
+    expect([...(readBase64("QQ") ?? [])]).toEqual([65]);
+    expect([...(readBase64("+/8=") ?? [])]).toEqual([251, 255]);
+  });
+
+  it("cannot read a wrong length or padding", () => {
+    for (const data of ["Q", "QUJDQ", "QQ=", "QUJ==", "Q===", "QQ===", "QUI=Q"]) {
+      expect(readBase64(data), data).toBeUndefined();
+    }
+  });
+
+  it("cannot read spaces, new lines or the URL-safe alphabet", () => {
+    for (const data of ["QU JD", "QUJD\n", "QU-D", "QU_D", " QUJD", "QUJ*"]) {
+      expect(readBase64(data), JSON.stringify(data)).toBeUndefined();
+    }
+  });
+
+  it("does not take a data: URL for base64 text", () => {
+    expect(readBase64("data:audio/wav;base64,QUJD")).toBeUndefined();
+  });
+
+  it("reads the same bytes as a data URL does", () => {
+    const data = Buffer.alloc(100_000, 9).toString("base64");
+    expect(readBase64(data)).toEqual(readDataUrl(`data:x/y;base64,${data}`)?.bytes);
+  });
+});
+
 describe("the media type of a data URL", () => {
   it("lowercases the media type", () => {
     expect(readable("data:IMAGE/PNG;base64,QUJD").mediaType).toBe("image/png");
@@ -143,6 +224,9 @@ describe("the name of a saved file", () => {
       "image/webp": "webp",
       "image/bmp": "bmp",
       "image/svg+xml": "svg",
+      "audio/wav": "wav",
+      "audio/mpeg": "mp3",
+      "application/pdf": "pdf",
     };
     for (const [mediaType, extension] of Object.entries(table)) {
       expect(savedFileName(1, 1, mediaType), mediaType).toBe(`message-1-part-1.${extension}`);
@@ -151,6 +235,8 @@ describe("the name of a saved file", () => {
 
   it("uses .bin for a media type that is not in the table, and for an unknown one", () => {
     expect(savedFileName(1, 1, "text/plain")).toBe("message-1-part-1.bin");
+    expect(savedFileName(1, 1, "audio/ogg")).toBe("message-1-part-1.bin");
+    expect(savedFileName(1, 1, "application/zip")).toBe("message-1-part-1.bin");
     expect(savedFileName(1, 1, "image/x-unknown")).toBe("message-1-part-1.bin");
     expect(savedFileName(1, 1, null)).toBe("message-1-part-1.bin");
   });

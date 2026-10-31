@@ -22,7 +22,7 @@ function many(role: Role, count: number): Message[] {
 }
 
 function shownContents(conversation: Message[]): string[] {
-  return buildConversationView(conversation, DIR).flatMap((entry) =>
+  return buildConversationView(conversation, DIR, PATH).flatMap((entry) =>
     entry.kind === "message" ? entry.lines : [],
   );
 }
@@ -38,7 +38,11 @@ describe("choosing the messages to show", () => {
   });
 
   it("shows everything, with no omission, for exactly three other messages", () => {
-    const entries = buildConversationView([message("system", "rules"), ...many("user", 3)], DIR);
+    const entries = buildConversationView(
+      [message("system", "rules"), ...many("user", 3)],
+      DIR,
+      PATH,
+    );
     expect(entries.map((entry) => entry.kind)).toEqual([
       "message",
       "message",
@@ -48,7 +52,7 @@ describe("choosing the messages to show", () => {
   });
 
   it("omits one message for four other messages", () => {
-    const entries = buildConversationView(many("user", 4), DIR);
+    const entries = buildConversationView(many("user", 4), DIR, PATH);
     expect(entries.map((entry) => entry.kind)).toEqual([
       "omission",
       "message",
@@ -213,7 +217,7 @@ describe("saved parts", () => {
 
   it("counts every line of a part in the limit of 200 lines of a message", () => {
     const message = withParts(TEXT_199, part(FILE_1, 0), part(FILE_2, 0));
-    const entry = buildConversationView([message], DIR)[0];
+    const entry = buildConversationView([message], DIR, PATH)[0];
     // Four lines of parts and 199 lines of text: 203 lines, 3 are left out.
     expect(entry?.kind === "message" && entry.lines).toHaveLength(200);
     expect(entry?.kind === "message" && entry.hiddenLines).toBe(3);
@@ -243,6 +247,290 @@ describe("saved parts", () => {
   it("makes a control character of the media type visible", () => {
     const lines = linesOf(withParts("", part(FILE_1, 0, 3, "image/\x1bpng")));
     expect(lines[1]).toBe("  [image] image/\\x1bpng, 3 bytes");
+  });
+});
+
+/** An attachment of the given state; the fields that a state does not use are null. */
+function attachmentOf(fields: Partial<Attachment> & Pick<Attachment, "kind">): Attachment {
+  return {
+    at: 0,
+    mediaType: null,
+    size: null,
+    file: null,
+    readable: true,
+    address: null,
+    fileId: null,
+    typeName: null,
+    ...fields,
+  };
+}
+
+function viewLines(...attachments: Attachment[]): string[] {
+  return conversationLines([{ role: "user", content: "", attachments }], PATH, DIR);
+}
+
+describe("audio and file parts that are saved", () => {
+  it("shows them as two lines, like an image, with the kind of the part", () => {
+    const lines = viewLines(
+      attachmentOf({
+        kind: "audio",
+        mediaType: "audio/wav",
+        size: 4,
+        file: "message-1-part-1.wav",
+      }),
+      attachmentOf({
+        kind: "file",
+        mediaType: "application/pdf",
+        size: 8,
+        file: "message-1-part-2.pdf",
+      }),
+      attachmentOf({ kind: "file", mediaType: null, size: 1, file: "message-1-part-3.bin" }),
+    );
+    expect(lines).toEqual([
+      "User:",
+      "  [audio] audio/wav, 4 bytes",
+      `    saved: ${path.join(DIR, "message-1-part-1.wav")}`,
+      "  [file] application/pdf, 8 bytes",
+      `    saved: ${path.join(DIR, "message-1-part-2.pdf")}`,
+      "  [file] unknown, 1 byte",
+      `    saved: ${path.join(DIR, "message-1-part-3.bin")}`,
+      "",
+    ]);
+  });
+});
+
+describe("parts that are not saved", () => {
+  it("shows an address on one line with no saved line", () => {
+    expect(
+      viewLines(attachmentOf({ kind: "image", address: "https://example.com/cat.png" })),
+    ).toEqual(["User:", "  [image] https://example.com/cat.png", ""]);
+  });
+
+  it("shows a file_id, and a file with nothing but its kind", () => {
+    expect(
+      viewLines(
+        attachmentOf({ kind: "file", fileId: "file-abc123" }),
+        attachmentOf({ kind: "file" }),
+      ),
+    ).toEqual(["User:", "  [file] file_id: file-abc123", "  [file]", ""]);
+  });
+
+  it("shows a part that cannot be read, for each of the three kinds, the same way", () => {
+    const lines = viewLines(
+      attachmentOf({ kind: "image", readable: false }),
+      attachmentOf({ kind: "audio", readable: false }),
+      attachmentOf({ kind: "file", readable: false }),
+    );
+    expect(lines).toEqual([
+      "User:",
+      "  [image] (unreadable)",
+      "  [audio] (unreadable)",
+      "  [file] (unreadable)",
+      "",
+    ]);
+  });
+
+  it("shows a part of an unknown type by its type name only", () => {
+    const lines = viewLines(
+      attachmentOf({ kind: "other", typeName: "video_url" }),
+      attachmentOf({ kind: "other", typeName: "audio" }),
+    );
+    expect(lines).toEqual(["User:", "  [video_url]", "  [audio]", ""]);
+  });
+
+  it("puts them in order with text and saved parts", () => {
+    const message: Message = {
+      role: "user",
+      content: "ab",
+      attachments: [
+        attachmentOf({ at: 1, kind: "image", address: "https://x/y.png" }),
+        attachmentOf({ at: 1, kind: "other", typeName: "refusal" }),
+        attachmentOf({ at: 2, kind: "file", fileId: "f1" }),
+      ],
+    };
+    expect(conversationLines([message], PATH, DIR)).toEqual([
+      "User:",
+      "  a",
+      "  [image] https://x/y.png",
+      "  [refusal]",
+      "  b",
+      "  [file] file_id: f1",
+      "",
+    ]);
+  });
+
+  it("makes control characters visible in a type name, an address, a file_id and a media type", () => {
+    const lines = viewLines(
+      attachmentOf({ kind: "other", typeName: "\x1b[31mred" }),
+      attachmentOf({ kind: "image", address: "https://x/\x07\n\ty" }),
+      attachmentOf({ kind: "file", fileId: "id\x1b\r\n" }),
+      attachmentOf({
+        kind: "image",
+        mediaType: "image/\x1bpng",
+        size: 5,
+        file: "message-1-part-4.bin",
+      }),
+    );
+    expect(lines.slice(1, 5)).toEqual([
+      "  [\\x1b[31mred]",
+      "  [image] https://x/\\x07\\x0a\\x09y",
+      "  [file] file_id: id\\x1b\\x0d\\x0a",
+      "  [image] image/\\x1bpng, 5 bytes",
+    ]);
+    const forbidden = [...lines.join("\n")].filter((char) => {
+      const code = char.charCodeAt(0);
+      return (code < 0x20 && char !== "\n") || (code >= 0x7f && code <= 0x9f);
+    });
+    expect(forbidden).toEqual([]);
+  });
+
+  it("shows a name that is empty as an empty pair of brackets", () => {
+    expect(viewLines(attachmentOf({ kind: "other", typeName: "" }))[1]).toBe("  []");
+  });
+});
+
+describe("cutting a long line", () => {
+  const NOTE = (count: number) =>
+    `... (${count} characters in this line. Full conversation: ${PATH})`;
+
+  function userLines(content: string, ...attachments: Attachment[]): string[] {
+    return conversationLines([{ role: "user", content, attachments }], PATH, DIR);
+  }
+
+  it("keeps a line of exactly 1000 characters whole and cuts one of 1001", () => {
+    expect(userLines("a".repeat(1000))[1]).toBe(`  ${"a".repeat(1000)}`);
+    expect(userLines("a".repeat(1001))[1]).toBe(`  ${"a".repeat(1000)}${NOTE(1001)}`);
+  });
+
+  it("cuts a line of text to its first 1000 characters and tells the whole length", () => {
+    expect(userLines("x".repeat(1500))).toEqual([
+      "User:",
+      `  ${"x".repeat(1000)}${NOTE(1500)}`,
+      "",
+    ]);
+  });
+
+  it("does not count the indent, but counts the prefix of a part line", () => {
+    const address = (length: number) =>
+      attachmentOf({ kind: "image", address: "u".repeat(length) });
+    // "[image] " is 8 characters.
+    expect(userLines("", address(992))[1]).toBe(`  [image] ${"u".repeat(992)}`);
+    expect(userLines("", address(993))[1]).toBe(`  [image] ${"u".repeat(992)}${NOTE(1001)}`);
+    expect(userLines("", address(2500))[1]).toBe(`  [image] ${"u".repeat(992)}${NOTE(2508)}`);
+  });
+
+  it("cuts the line of a file_id", () => {
+    const line = userLines("", attachmentOf({ kind: "file", fileId: "i".repeat(1200) }))[1];
+    const prefix = "[file] file_id: ";
+    expect(line).toBe(
+      `  ${prefix}${"i".repeat(1000 - prefix.length)}${NOTE(prefix.length + 1200)}`,
+    );
+  });
+
+  it("cuts the line of a type name, a media type and a tool call", () => {
+    const other = userLines("", attachmentOf({ kind: "other", typeName: "t".repeat(1500) }))[1];
+    expect(other).toBe(`  [${"t".repeat(999)}${NOTE(1502)}`);
+    const assistant: Message = {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "1", type: "function", function: { name: "n".repeat(1200), arguments: "{}" } },
+      ],
+    };
+    const call = conversationLines([assistant], PATH, DIR)[1];
+    const prefix = "tool_call: ";
+    expect(call).toBe(
+      `  ${prefix}${"n".repeat(1000 - prefix.length)}${NOTE(prefix.length + 1200 + 4)}`,
+    );
+  });
+
+  it("counts the line after the control characters are made visible", () => {
+    // 300 ESC characters are 1200 characters on the screen.
+    const line = userLines("\x1b".repeat(300))[1];
+    expect(line).toBe(`  ${"\\x1b".repeat(250)}${NOTE(1200)}`);
+    // 250 are exactly 1000 and are not cut.
+    expect(userLines("\x1b".repeat(250))[1]).toBe(`  ${"\\x1b".repeat(250)}`);
+  });
+
+  it("counts a character outside the basic plane as one and never splits it", () => {
+    const smile = "\u{1F600}";
+    expect(userLines(smile.repeat(1000))[1]).toBe(`  ${smile.repeat(1000)}`);
+    expect(userLines(smile.repeat(1001))[1]).toBe(`  ${smile.repeat(1000)}${NOTE(1001)}`);
+  });
+
+  it("does not cut the saved line, however long the path is", () => {
+    const lines = conversationLines(
+      [
+        {
+          role: "user",
+          content: "",
+          attachments: [
+            attachmentOf({
+              kind: "image",
+              mediaType: "image/png",
+              size: 1,
+              file: "message-1-part-1.png",
+            }),
+          ],
+        },
+      ],
+      PATH,
+      path.join(DIR, "d".repeat(1500)),
+    );
+    expect(lines[2]).toBe(`    saved: ${path.join(DIR, "d".repeat(1500), "message-1-part-1.png")}`);
+    expect(lines[2]?.length).toBeGreaterThan(1500);
+  });
+
+  it("cuts every long line of a message, one by one", () => {
+    const lines = userLines(`${"a".repeat(1100)}\nshort\n${"b".repeat(2000)}`);
+    expect(lines).toEqual([
+      "User:",
+      `  ${"a".repeat(1000)}${NOTE(1100)}`,
+      "  short",
+      `  ${"b".repeat(1000)}${NOTE(2000)}`,
+      "",
+    ]);
+  });
+
+  it("counts a cut line as one line in the limit of 200 lines", () => {
+    const content = Array.from({ length: 250 }, () => "z".repeat(1200)).join("\n");
+    const entry = buildConversationView([{ role: "user", content }], DIR, PATH)[0];
+    expect(entry?.kind === "message" && entry.lines).toHaveLength(200);
+    expect(entry?.kind === "message" && entry.hiddenLines).toBe(50);
+    const lines = userLines(content);
+    expect(lines.filter((line) => line.endsWith(NOTE(1200)))).toHaveLength(200);
+    expect(lines.at(-2)).toBe(`  (50 more lines omitted. Full conversation: ${PATH})`);
+  });
+
+  it("leaves the empty line, (empty), and short lines as they are", () => {
+    expect(userLines("")).toEqual(["User:", "  (empty)", ""]);
+    expect(userLines("a\n\nb")).toEqual(["User:", "  a", "", "  b", ""]);
+  });
+});
+
+describe("a message with a very large number of lines or parts", () => {
+  it("builds the view of 300000 newlines and applies the 200 line cap", () => {
+    const content = "\n".repeat(300_000);
+    const entry = buildConversationView([{ role: "user", content }], DIR, PATH)[0];
+    expect(entry?.kind === "message" && entry.lines).toHaveLength(200);
+    expect(entry?.kind === "message" && entry.hiddenLines).toBe(300_001 - 200);
+    expect(conversationLines([{ role: "user", content }], PATH, DIR).length).toBeLessThan(210);
+  });
+
+  it("builds the view of 140000 parts and 140000 tool calls and applies the cap", () => {
+    const attachments = Array.from({ length: 140_000 }, () =>
+      attachmentOf({ kind: "other", typeName: "x" }),
+    );
+    const call = { id: "1", type: "function", function: { name: "f", arguments: "{}" } };
+    const message: Message = {
+      role: "assistant",
+      content: "",
+      attachments,
+      tool_calls: Array.from({ length: 140_000 }, () => call),
+    };
+    const entry = buildConversationView([message], DIR, PATH)[0];
+    expect(entry?.kind === "message" && entry.lines).toHaveLength(200);
+    expect(entry?.kind === "message" && entry.hiddenLines).toBe(280_000 - 200);
   });
 });
 

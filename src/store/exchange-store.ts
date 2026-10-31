@@ -7,6 +7,7 @@ import { isSavedFileName } from "../media-parts.js";
 import {
   type Loaded,
   MAX_FILE_BYTES,
+  MAX_REQUEST_FILE_BYTES,
   type PartFileData,
   parseReplyFile,
   parseRequestFile,
@@ -466,7 +467,7 @@ export class ExchangeStore {
   /**
    * The names of the saved parts that request.json of the folder records, keeping only those with
    * the form of a saved name. Nothing when request.json is not there, is not a regular file, is
-   * larger than `MAX_FILE_BYTES`, or cannot be read or does not hold a request this version reads. A failure to read is not an
+   * larger than `MAX_REQUEST_FILE_BYTES`, or cannot be read or does not hold a request this version reads. A failure to read is not an
    * error here: it is the same as a request.json that cannot be read.
    */
   private async recordedParts(dir: string, names: readonly string[]): Promise<ReadonlySet<string>> {
@@ -479,11 +480,11 @@ export class ExchangeStore {
         return new Set();
       }
       const info = await this.fs.statFile(file);
-      if (info.size > MAX_FILE_BYTES) {
+      if (info.size > MAX_REQUEST_FILE_BYTES) {
         return new Set();
       }
-      const bytes = await this.fs.readBytes(file, MAX_FILE_BYTES + 1);
-      if (bytes.length > MAX_FILE_BYTES) {
+      const bytes = await this.fs.readBytes(file, MAX_REQUEST_FILE_BYTES + 1);
+      if (bytes.length > MAX_REQUEST_FILE_BYTES) {
         return new Set();
       }
       const json = parseJson(Buffer.from(bytes).toString("utf8"));

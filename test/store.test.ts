@@ -18,7 +18,9 @@ import {
   createReplyFile,
   createRequestFile,
   createStateFile,
+  MAX_BODY_BYTES,
   MAX_FILE_BYTES,
+  MAX_REQUEST_FILE_BYTES,
   serializeFile,
 } from "../src/model.js";
 import { ExchangeStore, isOwnTempName, nodeFs, type StoreFs } from "../src/store/exchange-store.js";
@@ -379,6 +381,188 @@ describe("creating a request with saved parts", () => {
     const { store, requests } = await newStore();
     await store.createRequest(sampleRequest(), sampleState(), []);
     expect(await names(path.join(requests, ID))).toEqual(["request.json", "state.json"]);
+  });
+});
+
+const AUDIO_FILE = "message-1-part-1.wav";
+const PDF_FILE = "message-1-part-3.pdf";
+
+/**
+ * A request whose first message has a saved audio part, parts that are not saved, and a saved
+ * file part, in that order, with the data of the two saved parts.
+ */
+function mixedRequest(id = ID) {
+  const none = {
+    mediaType: null,
+    size: null,
+    file: null,
+    address: null,
+    fileId: null,
+    typeName: null,
+  };
+  const saved = { readable: true, typeName: null, address: null, fileId: null };
+  const withParts: ConversationRequest = {
+    ...conversation,
+    conversation: [
+      {
+        role: "user",
+        content: "",
+        attachments: [
+          { ...saved, at: 0, kind: "audio", mediaType: "audio/wav", size: 4, file: AUDIO_FILE },
+          { ...none, at: 0, kind: "image", readable: true, address: "https://example.com/a.png" },
+          { ...saved, at: 0, kind: "file", mediaType: "application/pdf", size: 3, file: PDF_FILE },
+          { ...none, at: 0, kind: "file", readable: true, fileId: "file-abc" },
+          { ...none, at: 0, kind: "audio", readable: false },
+          { ...none, at: 0, kind: "other", readable: true, typeName: "video_url" },
+        ],
+      },
+    ],
+  };
+  const parts = [
+    { file: AUDIO_FILE, bytes: new Uint8Array([82, 73, 70, 70]) },
+    { file: PDF_FILE, bytes: new Uint8Array([37, 80, 68]) },
+  ];
+  return { request: createRequestFile(id, NOW, withParts), parts };
+}
+
+describe("saved audio and file parts, with parts that are not saved", () => {
+  it("writes the audio and the file in the same order, before request.json, in the hidden directory", async () => {
+    const calls: string[] = [];
+    const { store, requests } = await newStore({
+      writeBytes: (file, bytes, mode) => {
+        calls.push(`bytes ${path.basename(file)}`);
+        return nodeFs.writeBytes(file, bytes, mode);
+      },
+      writeFile: (file, data, mode) => {
+        calls.push(`text ${path.basename(file)}`);
+        return nodeFs.writeFile(file, data, mode);
+      },
+    });
+    calls.length = 0;
+    const { request, parts } = mixedRequest();
+    await store.createRequest(request, sampleState(), parts);
+    expect(calls).toEqual([
+      `bytes ${AUDIO_FILE}`,
+      `bytes ${PDF_FILE}`,
+      "text request.json",
+      "text state.json",
+    ]);
+    const dir = path.join(requests, ID);
+    expect(await names(dir)).toEqual([AUDIO_FILE, PDF_FILE, "request.json", "state.json"]);
+    expect([...(await readFile(path.join(dir, AUDIO_FILE)))]).toEqual([82, 73, 70, 70]);
+    expect([...(await readFile(path.join(dir, PDF_FILE)))]).toEqual([37, 80, 68]);
+  });
+
+  it("reads back every kind of attachment that was written", async () => {
+    const { store } = await newStore();
+    const { request, parts } = mixedRequest();
+    await store.createRequest(request, sampleState(), parts);
+    const read = await store.readRequest(ID);
+    expect(read.kind === "ok" && read.value.conversation[0]?.attachments).toEqual(
+      request.conversation[0]?.attachments,
+    );
+  });
+
+  it("leaves nothing when writing the audio or the file fails", async () => {
+    for (const failing of [AUDIO_FILE, PDF_FILE]) {
+      const { store, requests } = await newStore({
+        writeBytes: (file, bytes, mode) =>
+          file.endsWith(failing)
+            ? Promise.reject(errno("ENOSPC"))
+            : nodeFs.writeBytes(file, bytes, mode),
+      });
+      const { request, parts } = mixedRequest();
+      await expect(store.createRequest(request, sampleState(), parts)).rejects.toMatchObject({
+        reason: "write failed",
+      });
+      expect(await names(requests)).toEqual([]);
+    }
+  });
+
+  it("writes no saved file for a request that has only parts that are not saved", async () => {
+    const { store, requests } = await newStore();
+    const { request } = mixedRequest();
+    const first = request.conversation[0];
+    const unsaved = {
+      ...request,
+      conversation: [{ ...first, attachments: first?.attachments?.filter((a) => a.file === null) }],
+    } as typeof request;
+    await store.createRequest(unsaved, sampleState(), []);
+    expect(await names(path.join(requests, ID))).toEqual(["request.json", "state.json"]);
+  });
+
+  it("removes the audio and the file, then request.json, then state.json, then the folder", async () => {
+    const order: string[] = [];
+    const { store, requests } = await newStore({
+      unlink: (file) => {
+        order.push(path.basename(file));
+        return nodeFs.unlink(file);
+      },
+    });
+    const { request, parts } = mixedRequest();
+    await store.createRequest(request, sampleState(), parts);
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(order).toEqual([AUDIO_FILE, PDF_FILE, "request.json", "state.json"]);
+    expect(await names(requests)).toEqual([]);
+  });
+
+  it("removes a request that has no saved file as before", async () => {
+    const { store, requests } = await newStore();
+    const { request } = mixedRequest();
+    const noFiles = {
+      ...request,
+      conversation: [
+        {
+          role: "user",
+          content: "",
+          attachments: [
+            {
+              at: 0,
+              kind: "other",
+              readable: true,
+              mediaType: null,
+              size: null,
+              file: null,
+              address: null,
+              fileId: null,
+              typeName: "video_url",
+            },
+          ],
+        },
+      ],
+    } as typeof request;
+    await store.createRequest(noFiles, sampleState(), []);
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
+  });
+});
+
+describe("a request with a very large number of saved parts", () => {
+  it("writes 140000 parts one by one, with a fake file system", async () => {
+    const written: string[] = [];
+    const { root } = await newStore();
+    const store = new ExchangeStore({
+      rootDir: root,
+      fs: {
+        ...nodeFs,
+        writeBytes: async (file) => {
+          written.push(path.basename(file));
+        },
+        writeFile: async () => {},
+        rename: async () => {},
+      },
+    });
+    const count = 140_000;
+    const files = Array.from({ length: count }, (_, index) => `message-1-part-${index + 1}.bin`);
+    const request = createRequestFile(ID, NOW, {
+      ...conversation,
+      conversation: [
+        { role: "user", content: "", attachments: files.map((file) => attachment(file)) },
+      ],
+    });
+    const parts = files.map((file) => ({ file, bytes: new Uint8Array(0) }));
+    await store.createRequest(request, sampleState(), parts);
+    expect(written).toEqual(files);
   });
 });
 
@@ -1250,27 +1434,40 @@ describe("removing a request that has saved parts", () => {
     expect(await names(dir)).toEqual([PART_B, "request.json", "state.json"]);
   });
 
-  it("treats a request.json over the size limit as unreadable, without reading it", async () => {
-    let reads = 0;
-    const { store, dir } = await withParts({
-      readFile: (file) => {
-        reads += 1;
-        return nodeFs.readFile(file);
-      },
-      readBytes: (file, limit) => {
-        reads += 1;
-        return nodeFs.readBytes(file, limit);
-      },
-    });
+  it("reads a request.json over 10 MB, as many saved parts make it, and removes the folder", async () => {
+    const { store, dir, requests } = await withParts();
     const text = await readFile(path.join(dir, "request.json"), "utf8");
-    await writeFile(path.join(dir, "request.json"), text + " ".repeat(MAX_FILE_BYTES));
-    reads = 0;
-    expect(await store.removeRequest(ID)).toBe("kept");
-    expect(reads).toBe(0);
-    expect(await names(dir)).toEqual([PART_A, PART_B, "request.json", "state.json"]);
+    const padded = text + " ".repeat(MAX_FILE_BYTES + 1 - Buffer.byteLength(text));
+    await writeFile(path.join(dir, "request.json"), padded);
+    expect(await store.removeRequest(ID)).toBe("removed");
+    expect(await names(requests)).toEqual([]);
   });
 
-  it("still reads a request.json of exactly the size limit", async () => {
+  it("reads a request.json up to the limit derived from the body limit, and no more", async () => {
+    expect(MAX_REQUEST_FILE_BYTES).toBeGreaterThan(MAX_BODY_BYTES * 10);
+    const sizes: Record<string, number> = {};
+    for (const [name, size] of [
+      ["at", MAX_REQUEST_FILE_BYTES],
+      ["over", MAX_REQUEST_FILE_BYTES + 1],
+    ] as const) {
+      const { store, dir } = await withParts({
+        statFile: async (file) =>
+          file.endsWith("request.json") ? { size, isFile: true } : nodeFs.statFile(file),
+        readBytes: async (file, limit) => {
+          sizes[name] = limit;
+          return nodeFs.readBytes(file, limit);
+        },
+      });
+      expect(await store.removeRequest(ID), name).toBe(name === "at" ? "removed" : "kept");
+      if (name === "over") {
+        expect(await names(dir)).toEqual([PART_A, PART_B, "request.json", "state.json"]);
+      }
+    }
+    expect(sizes.at).toBe(MAX_REQUEST_FILE_BYTES + 1);
+    expect(sizes.over).toBeUndefined();
+  });
+
+  it("still reads a request.json of exactly 10 MB", async () => {
     const { store, dir, requests } = await withParts();
     const text = await readFile(path.join(dir, "request.json"), "utf8");
     const padded = text + " ".repeat(MAX_FILE_BYTES - Buffer.byteLength(text));

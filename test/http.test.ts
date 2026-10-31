@@ -377,40 +377,110 @@ describe("requests with an image as a data URL", () => {
   });
 });
 
-describe("requests turned away as unsupported", () => {
-  const IMAGES = "Images are not supported. A human reads requests as text.";
+describe("requests with audio, files, addresses and parts that cannot be read", () => {
+  const WAV = "UklGRg==";
+  const PDF = "JVBERi0xLjQ=";
+  const ADDRESS = "https://secret.example.com/cat.png?token=SECRET-TOKEN";
 
-  const CASES: [string, Record<string, unknown>, string][] = [
-    [
-      "an image part",
-      {
-        model: "m",
-        messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "x" } }] }],
-      },
-      IMAGES,
-    ],
-    [
-      "an unknown part type",
-      {
-        model: "m",
-        messages: [{ role: "user", content: [{ type: "input_audio" }] }],
-      },
-      'Unsupported content part type: "input_audio".',
-    ],
+  const PARTS = [
+    { type: "text", text: "listen" },
+    { type: "input_audio", input_audio: { data: WAV, format: "wav" } },
+    {
+      type: "file",
+      file: { file_data: `data:application/pdf;base64,${PDF}`, filename: "SECRET-NAME.pdf" },
+    },
+    { type: "image_url", image_url: { url: ADDRESS } },
+    { type: "file", file: { file_id: "file-SECRET-ID" } },
+    { type: "file", file: { file_data: "" } },
+    { type: "input_audio" },
+    { type: "video_url" },
   ];
 
-  for (const [name, request, message] of CASES) {
-    it(`answers 400 unsupported_content for ${name} and stores nothing`, async () => {
-      const { port, store, out } = await startServer();
-      const reply = await send(port, { body: JSON.stringify(request) });
-      expect(reply.status).toBe(400);
-      expect(reply.json()).toEqual({
-        error: { message, type: "invalid_request_error", code: "unsupported_content" },
-      });
-      expect(store.entries.size).toBe(0);
-      expect(out).toEqual([]);
-    });
+  function body(): string {
+    return JSON.stringify({ model: "m", messages: [{ role: "user", content: PARTS }] });
   }
+
+  it("accepts the request, stores it with the saved bytes, and answers when a human replies", async () => {
+    const context = await startServer();
+    const pending = send(context.port, { body: body() });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    const stored = context.store.entries.get(id)?.request;
+    const attachments = typeof stored === "object" ? stored.conversation[0]?.attachments : [];
+    expect(attachments?.map((a) => [a.kind, a.readable, a.file])).toEqual([
+      ["audio", true, "message-1-part-2.wav"],
+      ["file", true, "message-1-part-3.pdf"],
+      ["image", true, null],
+      ["file", true, null],
+      ["file", false, null],
+      ["audio", false, null],
+      ["other", true, null],
+    ]);
+    const parts = context.store.savedParts.get(id) ?? [];
+    expect(parts.map((part) => part.file)).toEqual([
+      "message-1-part-2.wav",
+      "message-1-part-3.pdf",
+    ]);
+    expect(Buffer.from(parts[0]?.bytes ?? []).toString("base64")).toBe(WAV);
+    expect(Buffer.from(parts[1]?.bytes ?? []).toString("base64")).toBe(PDF);
+    await answer(context, id, "heard");
+    const reply = await pending;
+    expect(reply.status).toBe(200);
+    expect(reply.json().choices[0]?.message.content).toBe("heard");
+  });
+
+  it("does not turn away any such part, and saves nothing for parts without bytes", async () => {
+    const context = await startServer();
+    const content = [
+      { type: "image_url", image_url: { url: ADDRESS } },
+      { type: "file", file: { file_id: "file-1" } },
+      { type: "input_audio" },
+      { type: "video_url" },
+    ];
+    const pending = send(context.port, {
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content }] }),
+    });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    expect(context.store.savedParts.get(id)).toEqual([]);
+    await answer(context, id, "ok");
+    expect((await pending).status).toBe(200);
+  });
+
+  it("still answers 400 invalid_request for a part that is not an object, and stores nothing", async () => {
+    const { port, store, out } = await startServer();
+    const content = [{ type: "input_audio" }, "not an object"];
+    const reply = await send(port, {
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content }] }),
+    });
+    expect(reply.status).toBe(400);
+    expect(reply.json().error.code).toBe("invalid_request");
+    expect(store.entries.size).toBe(0);
+    expect(out).toEqual([]);
+  });
+
+  it("writes nothing of the parts to the serve output: no bytes, address, file_id or name", async () => {
+    const context = await startServer();
+    const pending = send(context.port, { body: body() });
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    await answer(context, id, "ok");
+    await pending;
+    const printed = context.out.join("") + context.err.join("");
+    for (const secret of [
+      WAV,
+      PDF,
+      "SECRET-TOKEN",
+      "secret.example.com",
+      "SECRET-ID",
+      "SECRET-NAME",
+      "message-1-part",
+      "audio/wav",
+      "video_url",
+    ]) {
+      expect(printed, secret).not.toContain(secret);
+    }
+  });
 });
 
 const BODY_LIMIT = 10485760;

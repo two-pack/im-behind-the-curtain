@@ -15,7 +15,7 @@ import {
 import { describeFsError, StartupError } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger } from "../log.js";
-import type { ConversationRequest, PartFileData } from "../model.js";
+import { type ConversationRequest, MAX_BODY_BYTES, type PartFileData } from "../model.js";
 
 /** What the HTTP server needs from a Node.js server. A test replaces it to make listening fail. */
 export interface ListenTarget {
@@ -161,7 +161,7 @@ function preflight(request: http.IncomingMessage): Refusal | undefined {
 }
 
 /** The most bytes of request body that are accepted. */
-const BODY_LIMIT = 10485760;
+const BODY_LIMIT = MAX_BODY_BYTES;
 
 /**
  * Reads the whole body as text. Gives undefined, and stops reading, as soon as more than

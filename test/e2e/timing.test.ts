@@ -67,6 +67,9 @@ const ROUNDS = 3;
 const ROUND_TRIP_WAITS = 1 + ROUNDS * 4;
 /** The waits of the streaming test: the reader waiting and the response. */
 const STREAM_WAITS = 2;
+/** The parts of the big request, and its waits: the first line, the screen, the reader, the response. */
+const PARTS = 1000;
+const BIG_REQUEST_WAITS = 4;
 
 /**
  * When the request was stored, as the broker wrote it into request.json. It is called after the
@@ -166,6 +169,56 @@ describe("timing with the real clock (NFR6, NFR7)", () => {
     },
     timingTestTimeoutMs({
       sequentialWaits: STREAM_WAITS,
+      limitMs: LIMIT_MS,
+      startupMarginMs: STARTUP_MARGIN_MS,
+    }),
+  );
+
+  it(
+    "shows and answers a request of nearly 10 MB with 1000 parts within the limit (NFR6, AC3.1.6)",
+    async () => {
+      const serve = await startServe();
+      const reader = new GatedReader();
+      const answer = startAnswer(serve.storageDir, reader, { pollIntervalMs: FAST_POLL_MS });
+      await waitFor(() => answer.stdout().includes("Waiting for requests..."), LIMIT_MS);
+
+      // 1000 audio parts of 9900 base64 characters each, in all about 9.9 MB.
+      const data = "A".repeat(9900);
+      const content: Record<string, unknown>[] = [{ type: "text", text: "big-request" }];
+      for (let index = 1; index < PARTS; index += 1) {
+        content.push({ type: "input_audio", input_audio: { data, format: "wav" } });
+      }
+      const body = JSON.stringify({ model: "m", messages: [{ role: "user", content }] });
+      expect(body.length).toBeGreaterThan(9_800_000);
+      expect(body.length).toBeLessThan(10_485_760);
+
+      const sentAt = performance.now();
+      const response = fetch(`${serve.baseUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
+      await waitFor(() => answer.stdout().includes("more lines omitted"), LIMIT_MS);
+      const shownMs = performance.now() - sentAt;
+      expect(answer.stdout()).toContain("User:\n  big-request\n  [audio] audio/wav, 7425 bytes\n");
+
+      await waitFor(() => reader.waiting, LIMIT_MS);
+      const typedAt = performance.now();
+      reader.type("seen");
+      const reply = await response;
+      const returnedMs = performance.now() - typedAt;
+      expect(reply.status).toBe(200);
+      expect(shownMs + POLL_INTERVAL_MS).toBeLessThanOrEqual(LIMIT_MS);
+      expect(
+        checkedSpanMs({
+          elapsedMs: returnedMs,
+          pollingExcluded: false,
+          pollIntervalMs: POLL_INTERVAL_MS,
+        }),
+      ).toBeLessThanOrEqual(LIMIT_MS);
+    },
+    timingTestTimeoutMs({
+      sequentialWaits: BIG_REQUEST_WAITS,
       limitMs: LIMIT_MS,
       startupMarginMs: STARTUP_MARGIN_MS,
     }),

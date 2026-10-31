@@ -9,6 +9,33 @@ export const FORMAT_VERSION = 1;
 /** The format version that request.json is written with. Versions 1 and 2 are still read. */
 const REQUEST_FORMAT_VERSION = 3;
 
+/** The most bytes of a request body that the server accepts: 10 MB. */
+export const MAX_BODY_BYTES = 10485760;
+
+/**
+ * The fewest bytes a part can take in a body and still become an attachment: `{"type":""}` is 11
+ * bytes and the comma before it is 1. So a body holds at most `MAX_BODY_BYTES / 12` parts.
+ */
+const SMALLEST_PART_BYTES = 12;
+
+/**
+ * The most bytes one attachment takes in request.json, as written with two-space indent: the keys
+ * and the punctuation, an `at` and a `size` of ten digits and a saved file name with seven-digit
+ * numbers (measured at 295 bytes). The strings of an attachment (an address, a file_id, a type
+ * name) are not counted here; they are copies of body bytes and are counted in the base below.
+ */
+const MAX_ATTACHMENT_RECORD_BYTES = 295;
+
+/**
+ * The most bytes request.json can have. The base is two bodies: `originalRequest` is the body as
+ * received, and the text and the strings of the attachments are copies of body bytes. Then comes
+ * the largest record of an attachment times the most parts a body can hold. It is about 280 MB.
+ * There is no limit on the number of parts; this only bounds how much is read back.
+ */
+export const MAX_REQUEST_FILE_BYTES =
+  2 * MAX_BODY_BYTES +
+  MAX_ATTACHMENT_RECORD_BYTES * Math.floor(MAX_BODY_BYTES / SMALLEST_PART_BYTES);
+
 /** The most bytes a reply file may have, as written. */
 export const MAX_FILE_BYTES = 10485760;
 

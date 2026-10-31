@@ -42,7 +42,7 @@ Any other path gets `404`. Another method on a known path gets `405` with an `Al
 A refused request is not stored and not shown to a human. The error has the OpenAI shape:
 
 ```json
-{ "error": { "message": "...", "type": "invalid_request_error", "code": "unsupported_content" } }
+{ "error": { "message": "...", "type": "invalid_request_error", "code": "invalid_request" } }
 ```
 
 `type` is `invalid_request_error` for a mistake of the client and `server_error` for the codes `storage_error`, `skipped_by_human`, `reply_timeout` and `invalid_reply`.
@@ -50,7 +50,6 @@ A refused request is not stored and not shown to a human. The error has the Open
 | Status | `code` | When |
 |---|---|---|
 | 400 | `invalid_request` | The body is not JSON; `model` or `messages` is missing or wrong; a message is not an object; a `content` has a wrong type or a part has a wrong form; the role is not one of the six; `n` is 2 or more; the `Origin` or `Host` header is not allowed |
-| 400 | `unsupported_content` | A part that is not text (an image, audio, a file) |
 | 404 | `not_found` | The path is not known |
 | 405 | `method_not_allowed` | The method is not allowed on this path |
 | 413 | `request_too_large` | The body is larger than 10 MB. The connection is closed after the answer |

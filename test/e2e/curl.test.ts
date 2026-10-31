@@ -8,6 +8,13 @@ import { BarrierReader } from "../helpers/barrier-reader.js";
 import { FakeClock } from "../helpers/fake-clock.js";
 import { makeTempDir } from "../helpers/fs.js";
 import { makeIo, waitFor } from "../helpers/io.js";
+import {
+  everyKindOfPart,
+  FILE_ID,
+  listenForConnections,
+  PDF_BASE64,
+  WAV_BASE64,
+} from "../helpers/media-parts.js";
 import { ScriptedReader } from "../helpers/scripted-reader.js";
 import {
   answerEverything,
@@ -371,38 +378,82 @@ describe("an image as a data URL, with curl", () => {
   });
 });
 
-describe("requests that are turned away as unsupported", () => {
-  const IMAGES = "Images are not supported. A human reads requests as text.";
+describe("audio, files, addresses and parts that cannot be read, with curl", () => {
+  it("saves the audio and the file, shows every part, never opens the address, and returns the reply", async () => {
+    const listener = await listenForConnections();
+    try {
+      const serve = await startServe();
+      const answer = startAnswer(serve.storageDir, new ScriptedReader(["Heard."]));
+      const body = JSON.stringify({
+        model: "m",
+        messages: [{ role: "user", content: everyKindOfPart(listener.address) }],
+      });
+      const reply = await curlPost(serve.baseUrl, body);
+      expect(reply.status).toBe(200);
+      expect(reply.body.choices?.[0]?.message.content).toBe("Heard.");
+      await waitFor(() => answer.stdout().includes("Sent."));
+
+      const id = await waitForRequestId(serve.storageDir);
+      const dir = path.join(serve.storageDir, "requests", id);
+      expect(await readFile(path.join(dir, "message-1-part-2.wav"))).toEqual(
+        Buffer.from(WAV_BASE64, "base64"),
+      );
+      expect(await readFile(path.join(dir, "message-1-part-3.pdf"))).toEqual(
+        Buffer.from(PDF_BASE64, "base64"),
+      );
+      expect(await requestFiles(serve.storageDir, id)).toEqual([
+        "message-1-part-2.wav",
+        "message-1-part-3.pdf",
+        "reply.accepted.json",
+        "request.json",
+        "state.json",
+      ]);
+      expect(answer.stdout()).toContain(
+        [
+          "User:",
+          "  listen",
+          "  [audio] audio/wav, 4 bytes",
+          `    saved: ${path.join(dir, "message-1-part-2.wav")}`,
+          "  [file] application/pdf, 8 bytes",
+          `    saved: ${path.join(dir, "message-1-part-3.pdf")}`,
+          `  [image] ${listener.address}`,
+          `  [file] file_id: ${FILE_ID}`,
+          "  [file] (unreadable)",
+          "  [audio] (unreadable)",
+          "  [video_url]",
+          "",
+        ].join("\n"),
+      );
+      expect(answer.stdout()).not.toContain("report.pdf");
+      expect(serve.stdout()).not.toContain(listener.address);
+      expect(serve.stdout()).not.toContain(FILE_ID);
+      expect(serve.stdout()).not.toContain(WAV_BASE64);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(listener.connections()).toBe(0);
+    } finally {
+      await listener.close();
+    }
+  });
+});
+
+describe("requests that are turned away as invalid", () => {
   const USER = { role: "user", content: "Hello" };
 
-  async function refusedAs(request: Record<string, unknown>, message: string) {
+  it("still refuses a part that is not an object, whatever is next to it", async () => {
     const serve = await startServe();
     const answer = startAnswer(serve.storageDir, new ScriptedReader([]));
-    const reply = await curlPost(serve.baseUrl, JSON.stringify({ model: "m", ...request }));
+    const content = [{ type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }, "x"];
+    const reply = await curlPost(
+      serve.baseUrl,
+      JSON.stringify({ model: "m", messages: [{ role: "user", content }] }),
+    );
     expect(reply.status).toBe(400);
-    expect(reply.body.error).toEqual({
-      message,
+    expect(reply.body.error).toMatchObject({
       type: "invalid_request_error",
-      code: "unsupported_content",
+      code: "invalid_request",
     });
     expect(await storedRequests(serve.storageDir)).toEqual([]);
     expect(answer.stdout()).not.toContain("Request 1 of");
-  }
-
-  it("refuses an image part that is not a readable data URL", async () => {
-    const content = [
-      { type: "text", text: "What is this?" },
-      { type: "image_url", image_url: { url: "https://example.com/cat.png" } },
-    ];
-    await refusedAs({ messages: [{ role: "user", content }] }, IMAGES);
-  });
-
-  it("refuses an audio part and names its type", async () => {
-    const content = [{ type: "input_audio", input_audio: { data: "AAAA", format: "wav" } }];
-    await refusedAs(
-      { messages: [{ role: "user", content }] },
-      'Unsupported content part type: "input_audio".',
-    );
   });
 
   it("refuses n of 2 or more even when the request has tools", async () => {

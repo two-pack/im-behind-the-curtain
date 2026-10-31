@@ -526,6 +526,79 @@ describe("attachments in a version 3 request file", () => {
     expect(attachmentsOf(fileWith("", rows))).toEqual(rows);
   });
 
+  it("reads and writes a saved audio part and a saved file part, with or without a media type", () => {
+    const rows = [
+      { ...SAVED, kind: "audio", mediaType: "audio/wav", file: "message-1-part-1.wav" },
+      { ...SAVED, kind: "audio", mediaType: null, size: 0, file: "message-1-part-2.bin" },
+      { ...SAVED, kind: "file", mediaType: "application/pdf", file: "message-1-part-3.pdf" },
+      { ...SAVED, kind: "file", mediaType: null, file: "message-1-part-4.bin" },
+    ];
+    expect(attachmentsOf(fileWith("", rows))).toEqual(rows);
+    const parsed = parseRequestFile(JSON.parse(serializeFile(fileWith("", rows))));
+    expect(parsed.kind === "ok" && parsed.value.conversation[0]?.attachments).toEqual(rows);
+  });
+
+  it("reads an unreadable part of each of the three media kinds", () => {
+    const none = { mediaType: null, size: null, file: null, address: null, fileId: null };
+    const rows = ["image", "audio", "file"].map((kind) => ({
+      at: 0,
+      kind,
+      readable: false,
+      typeName: null,
+      ...none,
+    }));
+    expect(attachmentsOf(fileWith("", rows))).toEqual(rows);
+  });
+
+  it("reads an unknown part type with its type name, and keeps a name that looks like a kind", () => {
+    const row = {
+      at: 0,
+      kind: "other",
+      readable: true,
+      mediaType: null,
+      size: null,
+      file: null,
+      address: null,
+      fileId: null,
+      typeName: "audio",
+    };
+    expect(attachmentsOf(fileWith("", [row]))).toEqual([row]);
+  });
+
+  it("rejects the combinations that the table of states does not have", () => {
+    const none = {
+      at: 0,
+      readable: true,
+      mediaType: null,
+      size: null,
+      file: null,
+      address: null,
+      fileId: null,
+      typeName: null,
+    };
+    const bad: Record<string, unknown>[] = [
+      { ...none, kind: "other", typeName: "x", file: "message-1-part-1.bin" },
+      { ...none, kind: "other", typeName: "x", size: 1 },
+      { ...none, kind: "other", typeName: "x", address: "x" },
+      { ...none, kind: "other", typeName: "x", fileId: "x" },
+      { ...none, kind: "other", typeName: null },
+      { ...none, kind: "other", typeName: "x", readable: false },
+      { ...none, kind: "audio", address: "https://example.com/a.wav" },
+      { ...none, kind: "audio", fileId: "x" },
+      { ...none, kind: "audio", typeName: "x" },
+      { ...none, kind: "file", address: "x" },
+      { ...none, kind: "file", fileId: "x", typeName: "x" },
+      { ...none, kind: "file", fileId: "x", file: "message-1-part-1.bin", size: 1 },
+      { ...none, kind: "file", readable: false, fileId: "x" },
+      { ...none, kind: "audio", readable: false, mediaType: "audio/wav" },
+      { ...none, kind: "image", readable: false, address: "x" },
+      { ...none, kind: "image", fileId: "x" },
+    ];
+    for (const attachment of bad) {
+      expect(attachmentsOf(fileWith("", [attachment]))).toBe("unreadable");
+    }
+  });
+
   it("ignores keys of an element that it does not know", () => {
     expect(attachmentsOf(fileWith("ab", [{ ...SAVED, future: true }]))).toEqual([SAVED]);
   });

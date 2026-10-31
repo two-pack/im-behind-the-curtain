@@ -5,7 +5,7 @@
  */
 import nodePath from "node:path";
 import { isSavedFileName } from "../media-parts.js";
-import type { Attachment, Message, Role } from "../model.js";
+import { type Attachment, characterCount, type Message, type Role } from "../model.js";
 
 /** Every sentence of the conversation view, in one place. */
 const TEXT = {
@@ -21,6 +21,9 @@ const TEXT = {
     `(${count} earlier ${count === 1 ? "message" : "messages"} omitted. Full conversation: ${path})`,
   moreLines: (count: number, path: string) =>
     `(${count} more ${count === 1 ? "line" : "lines"} omitted. Full conversation: ${path})`,
+  cut: (count: number, path: string) =>
+    `... (${count} characters in this line. Full conversation: ${path})`,
+  fileId: "file_id",
 } as const;
 
 const ROLE_LABELS: Readonly<Record<Role, string>> = {
@@ -40,6 +43,9 @@ const SHOWN_OTHER_MESSAGES = 3;
 
 /** The most lines of one message that are shown. */
 const MAX_LINES = 200;
+
+/** The most characters of Unicode of one line that are shown, not counting the indent. */
+const MAX_LINE_CHARACTERS = 1000;
 
 /** The most characters of Unicode of the arguments of a call that are shown. */
 const MAX_ARGUMENT_CHARACTERS = 80;
@@ -136,7 +142,9 @@ function callLines(message: Message): string[] {
   const { tool_calls: calls, function_call: legacy } = message;
   const lines: string[] = [];
   if (Array.isArray(calls)) {
-    lines.push(...calls.map((call) => callLine(TEXT.toolCall, functionOf(call))));
+    for (const call of calls) {
+      lines.push(callLine(TEXT.toolCall, functionOf(call)));
+    }
   } else if (calls !== undefined && calls !== null) {
     lines.push(`${TEXT.toolCall}: ${TEXT.unreadableCall}`);
   }
@@ -170,23 +178,75 @@ function sizeText(size: number): string {
 }
 
 /**
- * The lines of a part that is not text. A saved part has two: the kind, the media type and the
- * size, then the absolute path of the file. A part that is not saved, or whose file name does not
- * have the form of a saved name, is shown as unreadable, and no path is made from its name.
+ * Cuts a line that has more than `MAX_LINE_CHARACTERS` characters of Unicode to its first
+ * `MAX_LINE_CHARACTERS`, and adds how long the line was and where the whole conversation is. The
+ * line is counted as it is shown: control characters are already visible, and the indent is not
+ * part of it. A line that is not longer is returned as it is.
  */
-function partLines(part: Attachment, requestDir: string): string[] {
-  if (part.file === null || part.size === null || !isSavedFileName(part.file)) {
-    return [`[${part.kind}] ${TEXT.unreadable}`];
+function cutLine(line: string, path: string): string {
+  // The number of UTF-16 units is at least the number of characters, so a short one is whole.
+  if (line.length <= MAX_LINE_CHARACTERS) {
+    return line;
   }
-  const mediaType = escapeAllControls(part.mediaType || TEXT.unknownMediaType);
-  return [
-    `[${part.kind}] ${mediaType}, ${sizeText(part.size)}`,
-    `${INDENT}${TEXT.saved}: ${escapeAllControls(nodePath.join(requestDir, part.file))}`,
-  ];
+  const total = characterCount(line);
+  if (total <= MAX_LINE_CHARACTERS) {
+    return line;
+  }
+  let end = 0;
+  for (let count = 0; count < MAX_LINE_CHARACTERS; count += 1) {
+    end += (line.codePointAt(end) ?? 0) > 0xffff ? 2 : 1;
+  }
+  return `${line.slice(0, end)}${TEXT.cut(total, path)}`;
 }
 
-/** The text and the parts of a message, in the order they arrived, as lines. */
-function bodyLines(message: Message, requestDir: string): string[] {
+/** What a part that is not text shows: its first line, and the line of the saved path if it has one. */
+interface PartView {
+  head: string;
+  saved: string | null;
+}
+
+/**
+ * The lines of a part that is not text. A saved part has two: the kind, the media type and the
+ * size, then the absolute path of the file. A part with an address or a file_id has one line. A
+ * part that is unreadable, or is saved under a name that does not have the form of a saved name,
+ * shows its kind and says it is unreadable, and no path is made from its name. A part of an
+ * unknown type shows its type name.
+ */
+function partView(part: Attachment, requestDir: string): PartView {
+  const unreadable = { head: `[${part.kind}] ${TEXT.unreadable}`, saved: null };
+  if (part.kind === "other") {
+    return { head: `[${escapeAllControls(part.typeName ?? "")}]`, saved: null };
+  }
+  if (!part.readable) {
+    return unreadable;
+  }
+  if (part.file !== null || part.size !== null) {
+    if (part.file === null || part.size === null || !isSavedFileName(part.file)) {
+      return unreadable;
+    }
+    const mediaType = escapeAllControls(part.mediaType || TEXT.unknownMediaType);
+    return {
+      head: `[${part.kind}] ${mediaType}, ${sizeText(part.size)}`,
+      saved: `${INDENT}${TEXT.saved}: ${escapeAllControls(nodePath.join(requestDir, part.file))}`,
+    };
+  }
+  if (part.address !== null) {
+    return { head: `[${part.kind}] ${escapeAllControls(part.address)}`, saved: null };
+  }
+  if (part.fileId !== null) {
+    return {
+      head: `[${part.kind}] ${TEXT.fileId}: ${escapeAllControls(part.fileId)}`,
+      saved: null,
+    };
+  }
+  return { head: `[${part.kind}]`, saved: null };
+}
+
+/**
+ * The text and the parts of a message, in the order they arrived, as lines. Every line but the
+ * saved path is cut to `MAX_LINE_CHARACTERS`.
+ */
+function bodyLines(message: Message, requestDir: string, path: string): string[] {
   const parts = message.attachments ?? [];
   const pieces = textPieces(
     message.content,
@@ -195,20 +255,27 @@ function bodyLines(message: Message, requestDir: string): string[] {
   const lines: string[] = [];
   pieces.forEach((piece, index) => {
     if (piece !== "") {
-      lines.push(...escapeControls(piece).split("\n"));
+      // Not push(...): the arguments would overflow the stack for a text of many newlines.
+      for (const line of escapeControls(piece).split("\n")) {
+        lines.push(cutLine(line, path));
+      }
     }
     const part = parts[index];
     if (part !== undefined) {
-      lines.push(...partLines(part, requestDir));
+      const view = partView(part, requestDir);
+      lines.push(cutLine(view.head, path));
+      if (view.saved !== null) {
+        lines.push(view.saved);
+      }
     }
   });
   return lines;
 }
 
-/** The lines of one message after the escape, cut to the first `MAX_LINES`. */
-function messageEntry(message: Message, requestDir: string): ViewEntry {
-  const calls = callLines(message);
-  const body = bodyLines(message, requestDir);
+/** The lines of one message after the escape and the cut, limited to the first `MAX_LINES`. */
+function messageEntry(message: Message, requestDir: string, path: string): ViewEntry {
+  const calls = callLines(message).map((line) => cutLine(line, path));
+  const body = bodyLines(message, requestDir, path);
   if (body.length === 0 && calls.length === 0) {
     return { kind: "message", role: message.role, lines: [TEXT.empty], hiddenLines: 0 };
   }
@@ -236,18 +303,20 @@ function omittedFlags(conversation: readonly Message[]): boolean[] {
 
 /**
  * The entries to show, in the order of the conversation. Left-out messages become one `omission`
- * entry, at the place of the first of them.
+ * entry, at the place of the first of them. `path` is where request.json is; a cut line points
+ * to it.
  */
 export function buildConversationView(
   conversation: readonly Message[],
   requestDir: string,
+  path: string,
 ): ViewEntry[] {
   const flags = omittedFlags(conversation);
   const entries: ViewEntry[] = [];
   let omission: { kind: "omission"; count: number } | undefined;
   conversation.forEach((message, index) => {
     if (!flags[index]) {
-      entries.push(messageEntry(message, requestDir));
+      entries.push(messageEntry(message, requestDir, path));
     } else if (omission === undefined) {
       omission = { kind: "omission", count: 1 };
       entries.push(omission);
@@ -307,7 +376,7 @@ export function conversationLines(
   path: string,
   requestDir: string,
 ): string[] {
-  return buildConversationView(conversation, requestDir).flatMap((entry) =>
+  return buildConversationView(conversation, requestDir, path).flatMap((entry) =>
     entryLines(entry, path),
   );
 }
