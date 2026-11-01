@@ -1,6 +1,6 @@
 # Storage format
 
-`imbehind serve` keeps every request as a small folder of JSON files. The files are the only state: nothing is hidden in memory that a restart would lose. Any tool can read them, and a tool can also write a reply, instead of using `imbehind answer`. This document is the contract for that. It describes format version 3 of `request.json` and format version 1 of the other files.
+`imbehind serve` keeps every request as a small folder of JSON files. The files are the only state: nothing is hidden in memory that a restart would lose. Any tool can read them, and a tool can also write a reply, instead of using `imbehind answer`. This document is the contract for that. It describes format version 3 of `request.json` and format version 1 of the other files, except that a `reply.json` that carries audio is version 2.
 
 `imbehind path` prints the storage directory (see the specification for the default and for how to choose it).
 
@@ -27,11 +27,12 @@
 
 ## Format version
 
-Every file has the field `formatVersion`, a whole number. The `formatVersion` of `request.json` is `3`. The `formatVersion` of `state.json` and `reply.json` stay at `1`. A reader must treat a file with a `formatVersion` it does not know as a file it does not understand. `imbehind serve` does so for `reply.json` (reason `reply file has an unknown format version`).
+Every file has the field `formatVersion`, a whole number. The `formatVersion` of `request.json` is `3`. The `formatVersion` of `state.json` and `reply.json` stay at `1`, except that a `reply.json` of `kind` `audio` has `formatVersion` `2`. A reader must treat a file with a `formatVersion` it does not know as a file it does not understand. `imbehind serve` does so for `reply.json` (reason `reply file has an unknown format version`).
 
 - This version reads versions 1, 2 and 3 for `request.json`. A request file of version 1, written by an older version, has no `toolDefinitions` field, and it is read as if `toolDefinitions` were `none`. A file of version 1 or 2 has no `attachments`; the key is not looked at in such a file, and every message is read as one without parts that are not text.
 - This version writes version 3 for every request, not only for requests that have parts that are not text. A file of version 1 or 2 that is already in the storage directory is not rewritten.
 - An older version of `imbehind` that knows only versions 1 and 2 treats a version 3 `request.json` as a file it cannot read: its `imbehind answer` does not list these requests, and its `imbehind serve` reports them as unreadable. An older version that knows only version 1 does the same for version 2 and 3. Any tool of yours that reads `request.json` must accept `3` as well as `1` and `2`.
+- `request.json` stays at version 3 although a message can now have `audio` (see "Tool fields of a message"): the field is kept as received like the tool fields, and a reader that knows version 3 reads such a file as before. Only a `reply.json` with audio is version 2, so that an older `imbehind serve` refuses it with `reply file has an unknown format version` and does not return a reply that lacks the audio. A `reply.json` of `kind` `text`, `json` or `skip` stays version 1 and is read as before.
 - A version 2 or 3 file whose `toolDefinitions` is missing or is not one of the four values below is not readable. A version 3 file whose `attachments` break the rules in "Attachments" is not readable either.
 
 ## request.json
@@ -54,6 +55,8 @@ Every file has the field `formatVersion`, a whole number. The `formatVersion` of
 ### Tool fields of a message
 
 A message in `conversation` can also have `tool_call_id`, `name`, `tool_calls` and `function_call`. A field is there only when the client sent it, and its value is stored exactly as received, with whatever type the client used. Nothing is checked or changed, so a form that is wrong (a `tool_calls` that is not an array, a `function_call` that is a string) is stored too, and `imbehind answer` shows it as `(unreadable tool call)`. A `content` that was `null` or missing is stored as an empty string. A message that the client sent without these fields has only `role` and `content`.
+
+The `audio` of an `assistant` message, which is the id of an earlier audio reply (`{"id": "audio_..."}`), is kept in the same way: as received, with whatever type the client used, and only when the client sent it. `imbehind answer` shows `audio: <id>` for it, or `audio: (unreadable)` when it has no string `id`.
 
 ### Attachments
 
@@ -141,9 +144,10 @@ A request leaves `waiting` once and then never changes. The first thing that hap
 
 | Field | Type | Meaning |
 |---|---|---|
-| `formatVersion` | number | Must be `1`. |
-| `kind` | string | `text`, `json` or `skip`. |
-| `body` | string | The reply. At least one character for `text` and `json`. An empty string for `skip`. |
+| `formatVersion` | number | `1`, or `2` when `kind` is `audio`. |
+| `kind` | string | `text`, `json`, `skip` or `audio`. |
+| `body` | string | The reply. At least one character for `text` and `json`. An empty string for `skip`. For `audio` it is the transcript, which may be an empty string. |
+| `audio` | object | Only for `kind` `audio`, where it is required. See "Replies with audio". |
 | `source` | string, optional | Who wrote the file. `imbehind answer` writes `imbehind-answer`. It is not checked. |
 | `writtenAt` | string, optional | When the file was written. It is not checked. |
 
@@ -154,6 +158,33 @@ A request leaves `waiting` once and then never changes. The first thing that hap
 - Unknown fields are ignored.
 - The size limit is 10485760 bytes for the whole file. A file over the limit is refused without being read.
 - The file must be UTF-8. One byte order mark at the start is allowed.
+
+## Replies with audio
+
+A reply can carry one audio file. Such a reply has `kind` `audio` and `formatVersion` `2`, and an `audio` object next to the `body`:
+
+```json
+{
+  "formatVersion": 2,
+  "kind": "audio",
+  "body": "Here is the greeting you asked for.",
+  "audio": { "format": "wav", "data": "UklGRiQAAABXQVZF..." },
+  "source": "my-tool",
+  "writtenAt": "2026-10-09T14:05:12.000Z"
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `audio.format` | string | `wav`, `mp3`, `flac`, `opus` or `pcm16`. |
+| `audio.data` | string | The content of the audio file as base64 text (the standard alphabet, no white space, `=` padding). It must decode to at least one byte. |
+
+- The `body` is the text of the reply and becomes `transcript`. Unlike `text` and `json`, it may be an empty string.
+- The first bytes of the decoded data must fit `audio.format`: `wav` starts with `RIFF` and has `WAVE` from byte 8, `mp3` starts with `ID3` or with a frame sync (`0xFF` and a byte whose top 3 bits are set), `flac` starts with `fLaC`, `opus` starts with `OggS`, and `pcm16` has an even length. A file that is shorter than its mark does not fit.
+- The request must ask for audio (`modalities` holds `audio`). When its `audio.format` is a string, it must equal `audio.format` of the file. A request for structured output (`replyKind` `json`) takes no audio, and the `body` must not be tool calls.
+- The file path and the extension are not part of a reply file, so only the data is judged.
+- The base64 text counts towards the size limit of 10485760 bytes for the whole file. The audio can therefore be about 7.5 MB at most.
+- The file is written as safely as any other (see "Writing a reply file"). A `reply.json` of another `kind` has no `audio`, and an `audio` field in such a file is ignored.
 
 ## Replies that call tools
 
@@ -205,17 +236,29 @@ When a waiting request has a `reply.json` and no `reply.accepted.json`, `imbehin
 | 1 | It is larger than 10485760 bytes. | `reply file is larger than 10 MB` |
 | 2 | It is not JSON, or not valid UTF-8. | `reply file is not valid JSON` |
 | 3 | The top level is not an object, or `formatVersion`, `kind` or `body` is missing, or `kind` or `body` is not a string. | `reply file is missing a required field` |
-| 4 | `formatVersion` is not `1`. | `reply file has an unknown format version` |
-| 5 | `kind` is not `text`, `json` or `skip`. | `reply file has an unknown kind` |
-| 6 | `body` is empty for `text` or `json`, or not empty for `skip`. | `reply file has a body that does not fit its kind` |
-| 7 | The request asks for JSON, `kind` is not `skip`, and `body` is not JSON text. | `reply body is not valid JSON (<detail>)` |
-| 8 | `kind` is not `skip`, and `body` calls tools (see "Replies that call tools") but the calls do not fit. | `reply tool calls are not valid (<detail>)` |
+| 4 | `formatVersion` is not `1`, or it is `2` and `kind` is not `audio`. | `reply file has an unknown format version` |
+| 5 | `kind` is not `text`, `json` or `skip` (version 1), or not `audio` (version 2). | `reply file has an unknown kind` |
+| 6 | `body` is empty for `text` or `json`, or not empty for `skip`. (An `audio` reply may have an empty `body`.) | `reply file has a body that does not fit its kind` |
+| 7 | The request asks for JSON, `kind` is not `skip` or `audio`, and `body` is not JSON text. | `reply body is not valid JSON (<detail>)` |
+| 8 | `kind` is not `skip` or `audio`, and `body` calls tools (see "Replies that call tools") but the calls do not fit. | `reply tool calls are not valid (<detail>)` |
+
+For `kind` `audio`, checks 9 to 15 follow. A missing `audio`, or an `audio` that is not an object, is refused as in check 3.
+
+| # | The file is refused when | Reason |
+|---|---|---|
+| 9 | `audio.format` is not one of the five formats. | `reply file has an audio format that is not known` |
+| 10 | `audio.data` is not base64 text, or decodes to no byte. | `reply file has audio data that is not base64 or is empty` |
+| 11 | The first bytes of the decoded data do not fit `audio.format`. | `reply file has audio data that does not match its format` |
+| 12 | The request does not ask for audio. | `reply file has audio but the request did not ask for audio` |
+| 13 | `audio.format` of the request is a string and is not the format of the file. | `reply file has an audio format other than the one the request asked for` |
+| 14 | The request asks for structured output. | `reply file has audio but the request asks for structured output` |
+| 15 | `body` is tool calls for this request (the same test as in "Replies that call tools", whether or not the calls fit). | `reply file has audio and a text that calls tools` |
 
 The `<detail>` of check 7 is one of `unexpected end of input at line <n>`, `unexpected character at line <n>, column <m>` or `extra data after the JSON value at line <n>, column <m>`. It tells where reading stopped and never repeats the text.
 
 The `<detail>` of check 8 is one of `call <n> needs a non-empty string id`, `call <n> has the same id as an earlier call`, `call <n> needs the type "function"`, `call <n> needs function.name as a non-empty string`, `call <n> needs function.arguments as a string`, or `this request defines functions only, so exactly one call is allowed`. `<n>` counts the calls from 1, and the first call that does not fit decides. It never repeats the text either.
 
-A file that passes all eight checks is accepted. The exact bytes that were checked are kept as `reply.accepted.json`. If a tool changes `reply.json` after the check, the change is not used.
+A file that passes the checks is accepted. The exact bytes that were checked are kept as `reply.accepted.json`. If a tool changes `reply.json` after the check, the change is not used.
 
 ## When the reply file is not valid
 

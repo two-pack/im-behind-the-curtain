@@ -934,3 +934,69 @@ describe("listing the tools of a request", () => {
     expect(toolListLines(original)).toEqual(["Tools: a\\x0ab\\x1b"]);
   });
 });
+
+describe("showing the audio of an earlier reply (FR17.3)", () => {
+  const assistant = (audio: unknown, content = ""): Message => ({
+    role: "assistant",
+    content,
+    audio,
+  });
+  const linesOf = (item: Message): string[] => conversationLines([item], PATH, DIR);
+
+  it("shows an audio: line with the id, and not (empty) for an empty content", () => {
+    expect(linesOf(assistant({ id: "audio_abc123" }))).toEqual([
+      "Assistant:",
+      "  audio: audio_abc123",
+      "",
+    ]);
+  });
+
+  it("shows the text first and the audio line after it", () => {
+    expect(linesOf(assistant({ id: "audio_abc123" }, "Hi there"))).toEqual([
+      "Assistant:",
+      "  Hi there",
+      "  audio: audio_abc123",
+      "",
+    ]);
+  });
+
+  it("shows the audio line after the tool calls of the same message", () => {
+    const item: Message = {
+      ...assistant({ id: "audio_1" }),
+      tool_calls: [{ id: "c", type: "function", function: { name: "f", arguments: "{}" } }],
+    };
+    expect(linesOf(item)).toEqual(["Assistant:", "  tool_call: f({})", "  audio: audio_1", ""]);
+  });
+
+  it("says (unreadable) when the audio has no id that is a string", () => {
+    for (const audio of [{}, { id: 5 }, "audio_abc", 5, [], { id: null }]) {
+      expect(linesOf(assistant(audio))).toEqual(["Assistant:", "  audio: (unreadable)", ""]);
+    }
+  });
+
+  it("shows nothing for a message without audio, or with a null audio", () => {
+    expect(linesOf({ role: "assistant", content: "Hi" })).toEqual(["Assistant:", "  Hi", ""]);
+    expect(linesOf(assistant(null, "Hi"))).toEqual(["Assistant:", "  Hi", ""]);
+    expect(linesOf(assistant(undefined))).toEqual(["Assistant:", "  (empty)", ""]);
+  });
+
+  it("shows the audio of an assistant message only", () => {
+    expect(linesOf({ role: "user", content: "Hi", audio: { id: "audio_1" } })).toEqual([
+      "User:",
+      "  Hi",
+      "",
+    ]);
+  });
+
+  it("makes the control characters of an id visible", () => {
+    expect(linesOf(assistant({ id: "a\nb\u001b\tc" }))[1]).toBe("  audio: a\\x0ab\\x1b\\x09c");
+  });
+
+  it("cuts an id of more than 1000 characters and says where the whole conversation is", () => {
+    const line = linesOf(assistant({ id: "i".repeat(1200) }))[1];
+    const prefix = "audio: ";
+    expect(line).toBe(
+      `  ${prefix}${"i".repeat(1000 - prefix.length)}... (${prefix.length + 1200} characters in this line. Full conversation: ${PATH})`,
+    );
+  });
+});

@@ -468,6 +468,7 @@ function respondTo(
       content: outcome.body,
       nowSeconds,
       reply: outcome.reply,
+      ...(outcome.audio === undefined ? {} : { audio: outcome.audio }),
     };
     if (request.stream) {
       respondStream(response, buildStreamEvents({ ...input, includeUsage: request.includeUsage }));

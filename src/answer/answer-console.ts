@@ -2,9 +2,19 @@
  * The screen of `imbehind answer`: shows the oldest waiting request, reads the person's
  * reply (or the wish to skip the request), places it, and tells how the request ended.
  */
+import { open, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { clearLine, createInterface, cursorTo, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
+import {
+  type AudioRules,
+  audioRequestOf,
+  checkAudioRules,
+  formatOfPath,
+  matchesFormat,
+  type RuleProblem,
+  readFileMarker,
+} from "../audio-reply.js";
 import type {
   BrokerEvent,
   Confirmation,
@@ -16,7 +26,14 @@ import type { Clock } from "../clock.js";
 import { EXIT, IoFailure } from "../errors.js";
 import { shortId } from "../ids.js";
 import type { Logger, Screen } from "../log.js";
-import { MAX_FILE_BYTES, type ReplyFileKind, type ReplyKind, type RequestFile } from "../model.js";
+import {
+  type AudioFormat,
+  MAX_FILE_BYTES,
+  type ReplyAudio,
+  type ReplyFileKind,
+  type ReplyKind,
+  type RequestFile,
+} from "../model.js";
 import { type AnswerInputMode, endOfInputHint } from "../platform.js";
 import {
   conversationLines,
@@ -59,7 +76,143 @@ const TEXT = {
   serveNotRunning: (dir: string) => `Error: imbehind serve is not running for ${dir}.`,
   startServe: "Start it with: imbehind serve",
   cannotRead: (dir: string, detail: string) => `Error: cannot read ${dir}: ${detail}.`,
+  audioRequested: (format: string | undefined) =>
+    format === undefined
+      ? "Audio:    requested"
+      : `Audio:    requested (format: ${escapeAllControls(format.slice(0, MAX_SHOWN_FORMAT))})`,
+  audioHint: "To reply with an audio file, type a line: @file <path>",
+  audioRefused: (detail: string) => `Not sent: ${detail}.`,
 } as const;
+
+/** The most characters of the `audio.format` of a request that are shown. */
+const MAX_SHOWN_FORMAT = 64;
+
+/**
+ * Why an audio reply is not sent, as the part of a sentence that both ways of replying share: the
+ * screen puts "Not sent:" before it and the reply from standard input puts "Error:" before it.
+ * None of these carries a character of a file; the path in `unreadable` is what the person typed.
+ */
+const AUDIO_DETAIL = {
+  notAsked: "this request does not ask for audio",
+  emptyPath: "the @file line has no path",
+  manyMarkers: "only one @file line is allowed in a reply",
+  image: "Chat Completions has no way to return an image, so only audio files can be sent",
+  unknownExtension: "the file name must end in .wav, .mp3, .flac, .opus or .pcm",
+  structured: "audio cannot be returned for a request that asks for JSON",
+  toolCalls: "audio cannot be sent together with tool calls",
+  formatDiffers: (requested: string, actual: AudioFormat) =>
+    `the request asks for ${escapeAllControls(requested.slice(0, MAX_SHOWN_FORMAT))} audio, but this file is ${actual}`,
+  mismatch: (format: AudioFormat) => `the beginning of the file does not look like ${format}`,
+  unreadable: (path: string, why: string) => `cannot read ${escapeAllControls(path)}: ${why}`,
+} as const;
+
+/** Why a file could not be read, to follow "cannot read <path>:". */
+const UNREADABLE_WHY: Readonly<Record<AudioUnreadable, string>> = {
+  missing: "the file does not exist",
+  denied: "permission denied",
+  directory: "it is a folder",
+  "not-file": "it is not a regular file",
+  empty: "the file is empty",
+  failed: "the file could not be read",
+};
+
+/** Why a file could not be used as the audio of a reply. */
+type AudioUnreadable = "missing" | "denied" | "directory" | "not-file" | "empty" | "failed";
+
+/**
+ * What reading the file of an `@file` line gave: its bytes, why it cannot be read, or that it is
+ * larger than a reply file may be (so no reply could hold it, and it is not read).
+ */
+export type AudioFileRead =
+  | { kind: "bytes"; bytes: Uint8Array }
+  | { kind: "unreadable"; reason: AudioUnreadable }
+  | { kind: "too-large" };
+
+/** Reads the file at a path as the person typed it. Tests replace it with a fake. */
+export type AudioFileReader = (path: string) => Promise<AudioFileRead>;
+
+const UNREADABLE_BY_CODE: Readonly<Record<string, AudioUnreadable>> = {
+  ENOENT: "missing",
+  ENOTDIR: "missing",
+  EACCES: "denied",
+  EPERM: "denied",
+  EISDIR: "directory",
+};
+
+function unreadable(error: unknown): AudioFileRead {
+  const code = (error as { code?: unknown } | null)?.code;
+  const reason = typeof code === "string" ? UNREADABLE_BY_CODE[code] : undefined;
+  return { kind: "unreadable", reason: reason ?? "failed" };
+}
+
+/**
+ * Reads the file of an `@file` line, once. A relative path counts from where the command was
+ * started. A folder, a file that is not a regular file and an empty file are not read as audio, and
+ * neither is a file over 10 MB, because its base64 could not fit in a reply file. The size is
+ * looked at again after the read, so a file that changed in between is judged on what was read.
+ */
+export function createAudioFileReader(ops: AudioFileOps): AudioFileReader {
+  return async (path) => {
+    try {
+      const info = await ops.stat(path);
+      if (info.isDirectory()) {
+        return { kind: "unreadable", reason: "directory" };
+      }
+      if (!info.isFile()) {
+        return { kind: "unreadable", reason: "not-file" };
+      }
+      if (info.size > MAX_FILE_BYTES) {
+        return { kind: "too-large" };
+      }
+      // The read itself is bounded, so a file that grew after the size was looked at, or a regular
+      // file that reports a size of zero, still cannot be read past the limit.
+      const bytes = await ops.readUpTo(path, MAX_FILE_BYTES + 1);
+      if (bytes.length > MAX_FILE_BYTES) {
+        return { kind: "too-large" };
+      }
+      return bytes.length === 0
+        ? { kind: "unreadable", reason: "empty" }
+        : { kind: "bytes", bytes };
+    } catch (error) {
+      return unreadable(error);
+    }
+  };
+}
+
+/** What `createAudioFileReader` needs from the disk. Tests replace it. */
+export interface AudioFileOps {
+  stat(path: string): Promise<{ isDirectory(): boolean; isFile(): boolean; size: number }>;
+  /** Reads the file from its start, and stops after `limit` bytes or at the end of the file. */
+  readUpTo(path: string, limit: number): Promise<Uint8Array>;
+}
+
+const CHUNK_BYTES = 65536;
+
+/** Reads at most `limit` bytes of a file, in chunks, so no buffer is bigger than what was read. */
+async function readFileUpTo(path: string, limit: number): Promise<Uint8Array> {
+  const handle = await open(path, "r");
+  try {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total < limit) {
+      const chunk = Buffer.alloc(Math.min(CHUNK_BYTES, limit - total));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    return new Uint8Array(Buffer.concat(chunks, total));
+  } finally {
+    await handle.close();
+  }
+}
+
+export const readAudioFile: AudioFileReader = createAudioFileReader({
+  stat,
+  readUpTo: readFileUpTo,
+});
 
 /** The sentences of the reply from standard input. */
 const STDIN_TEXT = {
@@ -81,6 +234,8 @@ const STDIN_TEXT = {
   elsewhere: (id: string) =>
     `Error: request ${shortId(id)} was already answered in another window. Nothing was sent.`,
   ended: (id: string) => `Error: request ${shortId(id)} has already ended. Nothing was sent.`,
+  audioRefused: (detail: string) =>
+    `Error: ${detail}. Nothing was sent; the request is still waiting.`,
 } as const;
 
 /** The word shown after "Reply:" for each kind of reply. */
@@ -405,6 +560,8 @@ export interface AnswerConsoleOptions {
   checkServe: () => Promise<ServeStatus>;
   /** How the input is used. Left out, it is `interactive`. */
   inputMode?: AnswerInputMode;
+  /** Reads the file of an `@file` line. Left out, it reads from the disk. */
+  readFile?: AudioFileReader;
 }
 
 /**
@@ -413,8 +570,74 @@ export interface AnswerConsoleOptions {
  */
 type Closed = Confirmation;
 
+/**
+ * A reply that passed every check, ready to be placed: its body (the text, or the transcript of
+ * audio), the kind of reply file, and the audio for an audio reply.
+ */
+interface ReadyReply {
+  text: string;
+  fileKind: ReplyFileKind;
+  audio?: ReplyAudio;
+}
+
+/** Why a reply is not sent. Each has a sentence on the screen and one for standard input. */
+type Problem =
+  | { kind: "not-json"; reason: string }
+  | { kind: "tool-calls"; reason: string }
+  | { kind: "too-large" }
+  | { kind: "audio"; detail: string };
+
+type Prepared = { ok: true; reply: ReadyReply } | { ok: false; problem: Problem };
+
+const audioProblem = (detail: string): Prepared => ({
+  ok: false,
+  problem: { kind: "audio", detail },
+});
+
+/** The sentence on the screen for a reply that is not sent. */
+function screenSentence(problem: Problem): string {
+  switch (problem.kind) {
+    case "not-json":
+      return TEXT.notJson(problem.reason);
+    case "tool-calls":
+      return TEXT.badToolCalls(problem.reason);
+    case "too-large":
+      return TEXT.tooLarge;
+    default:
+      return TEXT.audioRefused(problem.detail);
+  }
+}
+
+/** The sentence on standard error for a reply from standard input that is not sent. */
+function stdinSentence(problem: Problem): string {
+  switch (problem.kind) {
+    case "not-json":
+      return STDIN_TEXT.notJson(problem.reason);
+    case "tool-calls":
+      return STDIN_TEXT.badToolCalls(problem.reason);
+    case "too-large":
+      return STDIN_TEXT.tooLarge;
+    default:
+      return STDIN_TEXT.audioRefused(problem.detail);
+  }
+}
+
+/** The part of a sentence for each way a request can refuse an audio reply. */
+function ruleDetail(problem: RuleProblem, rules: AudioRules, format: AudioFormat): string {
+  switch (problem) {
+    case "notAsked":
+      return AUDIO_DETAIL.notAsked;
+    case "formatDiffers":
+      return AUDIO_DETAIL.formatDiffers(rules.audio.format ?? "", format);
+    case "structured":
+      return AUDIO_DETAIL.structured;
+    default:
+      return AUDIO_DETAIL.toolCalls;
+  }
+}
+
 type Typed =
-  | { kind: "text"; text: string }
+  | ({ kind: "text" } & ReadyReply)
   | { kind: "skip" }
   | { kind: "closed"; closed: Closed }
   | { kind: "exit"; code: number };
@@ -614,35 +837,29 @@ export class AnswerConsole {
     return EXIT.failure;
   }
 
-  /** The checks of a reply from standard input, in order: empty, json, the size of the file. */
-  private stdinProblem(request: RequestFile, text: string): string | undefined {
-    const { broker } = this.options;
-    if (text === "") {
-      return STDIN_TEXT.empty;
-    }
-    const check = broker.checkReply(request.replyKind, text, request.toolDefinitions);
-    if (!check.ok) {
-      return check.problem === "tool_calls"
-        ? STDIN_TEXT.badToolCalls(check.reason)
-        : STDIN_TEXT.notJson(check.reason);
-    }
-    return broker.replyFitsLimit(text, request.replyKind) ? undefined : STDIN_TEXT.tooLarge;
-  }
-
   private async sendFromStdin(
     target: WaitingExchange,
     raw: string,
     signal: AbortSignal,
   ): Promise<number> {
-    const kind = target.request.replyKind;
     const text = normalizeReply(raw);
-    const problem = this.stdinProblem(target.request, text);
-    if (problem !== undefined) {
-      return this.stdinFailure(problem);
+    // The checks of a reply from standard input, in order: empty, then the checks of any reply.
+    if (text === "") {
+      return this.stdinFailure(STDIN_TEXT.empty);
     }
+    const prepared = await this.prepare(target.request, text);
+    if (!prepared.ok) {
+      return this.stdinFailure(stdinSentence(prepared.problem));
+    }
+    const { reply } = prepared;
     let placed: Awaited<ReturnType<ExchangeBroker["placeReply"]>>;
     try {
-      placed = await this.options.broker.placeReply(target.id, text, kind);
+      placed = await this.options.broker.placeReply(
+        target.id,
+        reply.text,
+        reply.fileKind,
+        reply.audio,
+      );
     } catch (error) {
       if (!(error instanceof IoFailure)) {
         throw error;
@@ -689,9 +906,9 @@ export class AnswerConsole {
         this.options.screen.line(endingLine(typed.closed) ?? TEXT.ended);
         return undefined;
       case "skip":
-        return this.send(item.id, "", "skip", signal);
+        return this.send(item.id, { text: "", fileKind: "skip" }, signal);
       default:
-        return this.send(item.id, typed.text, item.request.replyKind, signal);
+        return this.send(item.id, typed, signal);
     }
   }
 
@@ -703,6 +920,10 @@ export class AnswerConsole {
     screen.line(`Received: ${formatReceived(request.receivedAt)}`);
     screen.line(`Model:    ${escapeAllControls(request.model)}`);
     screen.line(`Reply:    ${REPLY_KIND_LABELS[request.replyKind]}`);
+    const wantsAudio = audioRequestOf(request.originalRequest);
+    if (wantsAudio.asked) {
+      screen.line(TEXT.audioRequested(wantsAudio.format));
+    }
     screen.line("");
     const path = this.options.broker.requestFilePath(item.id);
     const requestDir = dirname(path);
@@ -715,6 +936,9 @@ export class AnswerConsole {
     }
     if (request.toolDefinitions !== "none") {
       screen.line(TEXT.toolHint);
+    }
+    if (wantsAudio.asked) {
+      screen.line(TEXT.audioHint);
     }
     screen.line(request.replyKind === "json" ? TEXT.jsonPrompt() : TEXT.prompt());
   }
@@ -773,7 +997,7 @@ export class AnswerConsole {
       screen.line(TEXT.emptyReply);
       return undefined;
     }
-    return this.accepts(item.request, text) ? { kind: "text", text } : undefined;
+    return this.accepts(item.request, text);
   }
 
   /** Nothing was typed: asks whether to skip. Only y or Y skips. */
@@ -894,38 +1118,101 @@ export class AnswerConsole {
    * The check of the reply before it is placed. A reply that fails is not sent: the
    * reason is shown, and the same request asks again.
    */
-  private accepts(request: RequestFile, text: string): boolean {
-    const { broker, screen } = this.options;
+  private async accepts(request: RequestFile, text: string): Promise<Typed | undefined> {
+    const { screen } = this.options;
+    const prepared = await this.prepare(request, text);
+    if (prepared.ok) {
+      return { kind: "text", ...prepared.reply };
+    }
+    screen.line(screenSentence(prepared.problem));
+    screen.line(request.replyKind === "json" ? TEXT.jsonAgain() : TEXT.again());
+    return undefined;
+  }
+
+  /**
+   * The one check of a typed reply, for the screen and for standard input. A reply with an
+   * `@file` line is an audio reply; any other is text or JSON, as the request asks. The size of the
+   * written file comes last, after the other checks.
+   */
+  private async prepare(request: RequestFile, text: string): Promise<Prepared> {
+    const marker = readFileMarker(text);
+    if (marker.kind === "text") {
+      return this.prepareText(request, text);
+    }
+    if (marker.kind === "refused") {
+      return audioProblem(AUDIO_DETAIL[marker.reason]);
+    }
+    return this.prepareAudio(request, marker.path, normalizeReply(marker.transcript));
+  }
+
+  private prepareText(request: RequestFile, text: string): Prepared {
+    const { broker } = this.options;
     const kind = request.replyKind;
     const check = broker.checkReply(kind, text, request.toolDefinitions);
     if (!check.ok) {
-      screen.line(
+      const problem: Problem =
         check.problem === "tool_calls"
-          ? TEXT.badToolCalls(check.reason)
-          : TEXT.notJson(check.reason),
-      );
-      screen.line(kind === "json" ? TEXT.jsonAgain() : TEXT.again());
-      return false;
+          ? { kind: "tool-calls", reason: check.reason }
+          : { kind: "not-json", reason: check.reason };
+      return { ok: false, problem };
     }
-    // The size of the written file comes after the check of the json.
-    if (!broker.replyFitsLimit(text, kind)) {
-      screen.line(TEXT.tooLarge);
-      screen.line(kind === "json" ? TEXT.jsonAgain() : TEXT.again());
-      return false;
+    return broker.replyFitsLimit(text, kind)
+      ? { ok: true, reply: { text, fileKind: kind } }
+      : { ok: false, problem: { kind: "too-large" } };
+  }
+
+  /**
+   * The checks of an audio reply, cheapest first, so a file is read only when the request could
+   * take it: the request asks for audio, the extension, what the request allows, the file, its
+   * leading bytes, and the size of the reply file with the audio in it.
+   */
+  private async prepareAudio(
+    request: RequestFile,
+    path: string,
+    transcript: string,
+  ): Promise<Prepared> {
+    const rules: AudioRules = {
+      replyKind: request.replyKind,
+      toolDefinitions: request.toolDefinitions,
+      audio: audioRequestOf(request.originalRequest),
+    };
+    if (!rules.audio.asked) {
+      return audioProblem(AUDIO_DETAIL.notAsked);
     }
-    return true;
+    const choice = formatOfPath(path);
+    if (choice.kind === "refused") {
+      return audioProblem(AUDIO_DETAIL[choice.reason]);
+    }
+    const { format } = choice;
+    const problem = checkAudioRules(rules, format, transcript);
+    if (problem !== undefined) {
+      return audioProblem(ruleDetail(problem, rules, format));
+    }
+    const read = await (this.options.readFile ?? readAudioFile)(path);
+    if (read.kind === "too-large") {
+      return { ok: false, problem: { kind: "too-large" } };
+    }
+    if (read.kind === "unreadable") {
+      return audioProblem(AUDIO_DETAIL.unreadable(path, UNREADABLE_WHY[read.reason]));
+    }
+    if (!matchesFormat(format, read.bytes)) {
+      return audioProblem(AUDIO_DETAIL.mismatch(format));
+    }
+    const audio: ReplyAudio = { format, data: Buffer.from(read.bytes).toString("base64") };
+    return this.options.broker.replyFitsLimit(transcript, "audio", audio)
+      ? { ok: true, reply: { text: transcript, fileKind: "audio", audio } }
+      : { ok: false, problem: { kind: "too-large" } };
   }
 
   private async send(
     id: string,
-    text: string,
-    kind: ReplyFileKind,
+    reply: ReadyReply,
     signal: AbortSignal,
   ): Promise<number | undefined> {
     const { broker, errorScreen, clock, pollIntervalMs } = this.options;
     let placed: Awaited<ReturnType<ExchangeBroker["placeReply"]>>;
     try {
-      placed = await broker.placeReply(id, text, kind);
+      placed = await broker.placeReply(id, reply.text, reply.fileKind, reply.audio);
     } catch (error) {
       if (!(error instanceof IoFailure)) {
         throw error;

@@ -68,7 +68,7 @@ Each group says whether it is a Must (the first release cannot go without it) or
 
 - **FR3.1** For a request with `stream: true`, the server answers with `Content-Type: text/event-stream` only after the human reply is complete. Each chunk is a line `data: <JSON>` followed by an empty line, and the last line is `data: [DONE]`.
 - **FR3.2** Every chunk has `id` (the same in all chunks of a request), `object` `chat.completion.chunk`, `created` (the same in all chunks), `model` (the model name of the request), and one item in `choices` with `index` 0.
-- **FR3.3** The first chunk has the delta `{"role": "assistant", "content": ""}`. Then come one or more chunks with the delta `{"content": <reply>}`. The last chunk has the delta `{}` and `finish_reason` `stop`. Earlier chunks have `finish_reason` `null`.
+- **FR3.3** The first chunk has the delta `{"role": "assistant", "content": ""}`. Then come one or more chunks with the delta `{"content": <reply>}`. The last chunk has the delta `{}` and `finish_reason` `stop`. Earlier chunks have `finish_reason` `null`. A reply with audio is the one exception to this order (FR15.12).
 - **FR3.4** A structured output request is streamed in the same form. A reply that calls tools is streamed in the form of FR9.7 and FR9.8.
 - **FR3.5** When `stream_options.include_usage` is true, a chunk with an empty `choices` array and a `usage` of zeros is sent just before `[DONE]`.
 - **FR3.6** If the request fails before the reply (skipped, timed out and so on), the server does not start a stream. It returns a normal HTTP error in the error shape.
@@ -152,7 +152,7 @@ Each group says whether it is a Must (the first release cannot go without it) or
 ### FR12 Documents and README (Must)
 
 - **FR12.1** The requirements and the specification are kept in `docs/`, in English.
-- **FR12.3** `README.md` and `README.ja.md` describe the first release. They name only the Chat Completions format and the model list. They say that parts that are not text (images, audio and files) are received, saved and shown, and that `tools`, `tool_calls` and `function_call` are supported.
+- **FR12.3** `README.md` and `README.ja.md` describe the first release. They name only the Chat Completions format and the model list. They say that parts that are not text (images, audio and files) are received, saved and shown, that `tools`, `tool_calls` and `function_call` are supported, and that a human can reply with an audio file.
 - **FR12.4** The documents say that the wait time of the client must be raised, and give an example of how.
 - **FR12.5** The continuous integration has a job that builds, tests, formats and checks, and starts `imbehind serve` and makes one round trip.
 
@@ -165,11 +165,44 @@ An automated test installs the package that is about to be published from a loca
 
 ### FR14 Request and reply files (Should)
 
-- **FR14.1** The formats of the request file and the reply file are documented in `docs/storage-format.md`. Every file carries a field for the format version. The `formatVersion` of `request.json` is 3, and the version of the other files is 1. The server reads request files of versions 1, 2 and 3, and a reader that knows only versions 1 and 2 treats a version 3 request file as a file it does not understand.
+- **FR14.1** The formats of the request file and the reply file are documented in `docs/storage-format.md`. Every file carries a field for the format version. The `formatVersion` of `request.json` is 3, the `formatVersion` of a reply file that carries audio is 2, and the version of the other files is 1. The server reads request files of versions 1, 2 and 3, and a reader that knows only versions 1 and 2 treats a version 3 request file as a file it does not understand.
 - **FR14.2** If a user puts a reply file in the documented form into the storage directory, the server treats it like a reply from `imbehind answer` and returns it to the client.
 - **FR14.3** The documents tell how to write a reply file safely: write it under another name, then give it its final name when it is complete. The server reads only the final name.
-- **FR14.4** A reply file is not valid if it is not JSON, lacks a required field, has an unknown format version, holds a non-JSON reply for a JSON request, holds tool calls that do not fit (FR9.6), or is larger than 10 MB. The client gets an error that says the reply was not valid and why, and the state becomes `invalid_reply`.
+- **FR14.4** A reply file is not valid if it is not JSON, lacks a required field, has an unknown format version, holds a non-JSON reply for a JSON request, holds tool calls that do not fit (FR9.6), holds audio that does not fit the file or the request (FR16.2), or is larger than 10 MB. The client gets an error that says the reply was not valid and why, and the state becomes `invalid_reply`.
 - **FR14.5** If both `imbehind answer` and a written file reply to the same request, only the one that arrived first is used.
+
+### FR15 Replying with an audio file (Must)
+
+A human can reply to a request that asks for audio (`modalities` holds `audio`) with an audio file. Only what the Chat Completions endpoint documents is built. Where the documentation has no example, the choice made here is marked as a guess.
+
+- **FR15.1** In the input of a reply, the human can write one line that starts with `@file ` (`@file` and one space) to give the path of an audio file. Everything after `@file ` on that line, with the white space around it removed, is the path. The path is used as it was written, and quotes are not read. Every other line is text and becomes `audio.transcript`. The marker line is not part of the text. If the path is empty (only white space follows `@file `), nothing is sent, the reason is shown, and the human types again. A line such as `@filename` has no space after `@file`, so it is not a marker line and stays text.
+- **FR15.2** A reply can have at most one marker line. With two or more, nothing is sent, the reason is shown, and the human types again.
+- **FR15.3** Audio is sent only when `modalities` of the request is an array that holds the string `audio`. Otherwise nothing is sent, the reason is shown, and the human types again. This is decided from `originalRequest` in the request file.
+- **FR15.4** The format of the file comes from its extension: `.wav` is `wav`, `.mp3` is `mp3`, `.flac` is `flac`, `.opus` is `opus`, `.pcm` is `pcm16`. The extension is read in lower case, and a slash and a backslash both end a folder name, on every operating system. Any other extension is refused as in FR15.3. `aac` is not accepted.
+- **FR15.5** An extension of an image (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.svg`) is refused with the reason that a Chat Completions response has no place for an image.
+- **FR15.6** The format is also checked on the first bytes of the file. `wav` starts with `RIFF` and has `WAVE` from byte 8. `mp3` starts with `ID3`, or its first byte is `0xFF` and the top 3 bits of its second byte are set (a frame sync). `flac` starts with `fLaC`. `opus` starts with `OggS`; what is inside the container is not checked. `pcm16` has no mark, so only an even length is checked. A file shorter than the bytes a mark needs (12 for `wav`, 3 for `mp3`, 4 for `flac` and `opus`) does not match. An extension and first bytes that disagree are refused as in FR15.3.
+- **FR15.7** When `audio.format` of the request is a string and differs from the format of the file, nothing is sent and the difference is shown. When `audio.format` is missing or not a string, this check is not made.
+- **FR15.8** A file that cannot be read (it does not exist, there is no permission, it is a folder, it is not a regular file, or it is empty) is not sent. The screen says which path cannot be read and why, and the human types again. The request stays `waiting`. The file is read once, and a change to it after the read is not used.
+- **FR15.9** A request for structured output (`response_format` `json_object` or `json_schema`) gets no audio reply. The reason is shown, and the human types again.
+- **FR15.10** Audio and tool calls are not sent together. When the text is tool calls as defined in FR9.5, nothing is sent, the reason is shown, and the human types again.
+- **FR15.11** For a request that is not streamed, the response has `message.role` `assistant`, `message.content` `null`, `message.audio` `{id, data, expires_at, transcript}` and `finish_reason` `stop`. `data` is the content of the file as base64, and `transcript` is the text (an empty string when there is no text). `id` differs for every request. `expires_at` is the `created` of the response plus 3600 seconds, as Unix time in seconds. Two points are guesses, because the documentation has no example response: that `message.content` is `null` for an audio response, and the value of `expires_at` (imbehind keeps no audio to fetch, so the value has no meaning).
+- **FR15.12** For a request with `stream: true`, the chunks come in this order. The whole reply is written before it is sent in one go, as for a text reply. (1) the delta `{"role": "assistant", "content": null}`; (2) the delta `{"audio": {"id": ..., "data": <all of it>, "transcript": ...}}`; (3) the delta `{}` with `finish_reason` `stop`; (4) the delta `{"audio": {"expires_at": ...}}` with `finish_reason` `null`; (5) when the request asks for it, the usage chunk of FR3.5; (6) `[DONE]`. `id` and `expires_at` are sent once each. No limit on the format is made for a stream. The chunk of step (4) after the one with `finish_reason` `stop` is an exception to FR3.3, for audio only. The official SDK types and tests show this order. The place of the usage chunk, after step (4), is a guess because the documentation does not say.
+- **FR15.13** When a request asks for audio (the condition of FR15.3), `imbehind answer` says so in one line of the display, with `audio.format` of the request when it has one, and shows how to give a file (`@file <path>`) in one line.
+- **FR15.14** A reply from standard input (FR4.12) is judged by the same rules. When it cannot be sent, nothing is sent and the command exits with a failure code. A relative path is counted from where the command was started.
+- **FR15.15** The rule that only the reply that arrived first is used (FR4.7, FR14.5) holds for an audio reply too.
+- **FR15.16** The limit of 10 MB (10485760 bytes) for a reply file is unchanged. The audio is written as base64, so the audio file itself can be about 7.5 MB at most. The size is checked after the file is read, turned into base64 and put in the form of a reply file. When it is over the limit, nothing is sent and `Not sent: your reply is larger than 10 MB.` is shown. The human types again for a typed reply (as in FR15.2), and a reply from standard input fails as in FR15.14.
+
+### FR16 Audio in a reply file (Should)
+
+- **FR16.1** A reply file can carry audio in a field `audio`, written as `{"format": <format>, "data": <base64>}`. `format` is `wav`, `mp3`, `flac`, `opus` or `pcm16`, and `data` is a base64 string. The text that becomes `transcript` is the `body`, which may be an empty string for an audio reply. Such a file has `kind` `audio` and `formatVersion` 2. A reply file of any other kind stays at `formatVersion` 1 and is read as before. The format is in `docs/storage-format.md`.
+- **FR16.2** A reply file with audio is checked in this order. A file that fails is ended as `invalid_reply` as before, with a fixed reason that holds no character of the file. (1) `format` is one of the five. (2) `data` is valid base64 and decodes to at least one byte. (3) The first bytes of the decoded data fit `format` (FR15.6; for `pcm16` the length is even). (4) The request asks for audio (FR15.3). (5) When `audio.format` of the request is a string, it equals `format` (FR15.7). (6) The request does not ask for structured output (FR15.9). (7) `body` is not tool calls (FR15.10). (8) The whole file is at most 10 MB (FR16.3). The extension and the path are not in a reply file, so FR15.4, FR15.5 and FR15.8 do not apply to it.
+- **FR16.3** The audio is stored as base64 in the reply file. The limit for the whole file is 10 MB (10485760 bytes) as before, and a file over it is refused without being read (`reply file is larger than 10 MB`). The limit for `imbehind answer` and standard input is FR15.16.
+
+### FR17 The audio of an earlier reply (Should)
+
+- **FR17.1** A request is accepted when an `assistant` message in it has `audio: {id}`, as before. A `content` that is `null` or a string is accepted; the official SDK sends the `null` it received. A message without `content` is still refused unless it has `tool_calls` or `function_call`. The rule for leaving `content` out is not widened.
+- **FR17.2** That `audio` is stored in the conversation as received.
+- **FR17.3** `imbehind answer` shows a line `audio: <id>` for that message. The characters of the id follow the rule that makes control characters visible (FR4.10) and the cut of long lines (FR8.5). An `audio` that has no string `id` is shown as `audio: (unreadable)`.
 
 ## Non-functional requirements
 
@@ -190,6 +223,11 @@ An automated test installs the package that is about to be published from a loca
 | NFR13 | If the server stops while writing, the next start works without manual cleanup. | A test starts the server in a directory that holds a half-written file |
 | NFR14 | The display does not rely on color, names states with words, and can be used with the keyboard only. | Tests check the words, and the input-feeding tests reach the reply and the skip using typed characters only |
 | NFR15 | Command output, code comments and repository text are English. Only `README.ja.md` is Japanese. | An automated test finds no Japanese characters in the files that go to `main`, other than `README.ja.md` |
+| NFR16 | A round trip with an audio reply is tested with a plain HTTP tool and with the official OpenAI SDK. With the SDK, `message.audio` of a response that is not streamed, and the `delta.audio` of a stream put together, are the same as the audio that was sent. | Automated tests make both round trips, with and without streaming |
+| NFR17 | The data of the audio, the path and the text are never written to the output of `imbehind serve` (as in NFR10). | An automated test checks that none of them appears in the output |
+| NFR18 | The limit of 10 MB for a reply file stays. An audio reply over the limit is not sent. | Tests with a reply file a little over and a little under the limit |
+| NFR19 | A path is handled the same way on Linux, macOS and Windows, including the separator, the case of the extension and `\r\n`. | The same tests pass in CI on the three operating systems |
+| NFR20 | The code added has at least 80% line coverage and at least 80% branch coverage. | CI measures both |
 
 ## Constraints
 
@@ -207,6 +245,11 @@ An automated test installs the package that is about to be published from a loca
 | Checking the form of the entries of `tools` and `functions`, or that `arguments` is JSON | Will not be built |
 | A response with both text and `tool_calls` | Will not be built |
 | Showing an image, audio or a file in the terminal, or reading an address in a part | Will not be built. The server saves the data and shows its path, and the human opens the file with another program |
+| An image in a reply | Will not be built. A Chat Completions response has no place for an image (it comes from the Images API or the Responses API) |
+| More than one audio file in one reply | Will not be built. `message.audio` holds one audio |
+| An audio reply to a request for structured output, or together with tool calls | Will not be built. The documentation has no such combination |
+| Changing, shrinking or playing audio, and the format `aac` | Will not be built. `aac` is in the SDK types but not in the description of the field |
+| A limit on the format of a streamed audio reply (only `pcm16`) | Will not be built. The documentation does not say so |
 | Merging retried requests that have the same content | A candidate for a later release |
 | Checking a structured reply against the requested shape | Will not be built |
 | More than one reply to one request | Will not be built |

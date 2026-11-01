@@ -24,6 +24,7 @@ import {
   serializeFile,
 } from "../src/model.js";
 import { ExchangeStore, isOwnTempName, nodeFs, type StoreFs } from "../src/store/exchange-store.js";
+import { replyAudio } from "./helpers/audio.js";
 import { FakeClock } from "./helpers/fake-clock.js";
 import { errno, makeTempDir } from "./helpers/fs.js";
 
@@ -687,6 +688,38 @@ describe("reading files", () => {
       parsed: { kind: "unreadable" },
     });
     expect(await store.readReply(ID, "reply.json")).toBeUndefined();
+  });
+
+  it("reads a reply.accepted.json with audio, and its audio comes back as written", async () => {
+    const { store, requests } = await newStore();
+    await mkdir(path.join(requests, ID));
+    const audio = replyAudio("mp3");
+    const text = serializeFile(
+      createReplyFile("Hello", "2026-10-09T14:05:12.123Z", "audio", audio),
+    );
+    await writeFile(path.join(requests, ID, "reply.accepted.json"), text);
+    const read = await store.readReply(ID, "reply.accepted.json");
+    expect(read?.bytes).toBe(text);
+    expect(read?.parsed).toMatchObject({
+      kind: "ok",
+      value: { formatVersion: 2, kind: "audio", body: "Hello", audio },
+    });
+  });
+
+  it("reads an audio reply of version 1 as unreadable, and keeps its bytes", async () => {
+    const { store, requests } = await newStore();
+    await mkdir(path.join(requests, ID));
+    const text = JSON.stringify({
+      formatVersion: 1,
+      kind: "audio",
+      body: "",
+      audio: replyAudio("wav"),
+    });
+    await writeFile(path.join(requests, ID, "reply.accepted.json"), text);
+    expect(await store.readReply(ID, "reply.accepted.json")).toEqual({
+      bytes: text,
+      parsed: { kind: "unreadable" },
+    });
   });
 
   it("reports a failed read as an IoFailure, not as missing", async () => {

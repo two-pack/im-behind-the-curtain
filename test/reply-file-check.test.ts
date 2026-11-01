@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vitest";
+import { type AudioRequest, NO_AUDIO_REQUEST } from "../src/audio-reply.js";
 import { checkReply } from "../src/broker/reply-check.js";
 import { checkReplyFile } from "../src/broker/reply-file-check.js";
 import {
+  AUDIO_FORMATS,
+  createReplyFile,
   INVALID_REPLY_REASONS,
   isInvalidReplyReason,
   MAX_FILE_BYTES,
   type ReplyKind,
+  serializeFile,
   type ToolDefinitions,
 } from "../src/model.js";
+import { audioSizesAtLimit, replyAudio, replyAudioOfSize } from "./helpers/audio.js";
 
 const BOM = [0xef, 0xbb, 0xbf];
 
@@ -343,5 +348,160 @@ describe("a reply file that calls tools", () => {
       "reply body is not valid JSON (unexpected character at line 1, column 2)",
     );
     expect(checkReplyFile(file("Hello"), "text", "tools").kind).toBe("valid");
+  });
+});
+
+describe("an audio reply file (FR16.2)", () => {
+  const ASKING: AudioRequest = { asked: true, format: "wav" };
+  const audioFile = (extra: Record<string, unknown> = {}) =>
+    bytesOf({
+      formatVersion: 2,
+      kind: "audio",
+      body: "Hello",
+      audio: replyAudio("wav"),
+      ...extra,
+    });
+  const reasonOf = (
+    bytes: Uint8Array,
+    audio: AudioRequest = ASKING,
+    replyKind: ReplyKind = "text",
+    toolDefinitions: ToolDefinitions = "none",
+  ): string | undefined => {
+    const verdict = checkReplyFile(bytes, replyKind, toolDefinitions, audio);
+    return verdict.kind === "invalid" ? verdict.reason : undefined;
+  };
+
+  it("accepts audio with a transcript, and without one", () => {
+    const verdict = checkReplyFile(audioFile(), "text", "none", ASKING);
+    expect(verdict).toMatchObject({
+      kind: "valid",
+      reply: { formatVersion: 2, kind: "audio", body: "Hello", audio: replyAudio("wav") },
+    });
+    expect(reasonOf(audioFile({ body: "" }))).toBeUndefined();
+  });
+
+  it("accepts every format, with its leading bytes", () => {
+    for (const format of AUDIO_FORMATS) {
+      const bytes = audioFile({ audio: replyAudio(format) });
+      expect(reasonOf(bytes, { asked: true, format })).toBeUndefined();
+    }
+  });
+
+  it("accepts any format when the request names none", () => {
+    expect(
+      reasonOf(audioFile({ audio: replyAudio("flac") }), { asked: true, format: undefined }),
+    ).toBe(undefined);
+  });
+
+  it("says an audio reply of version 1, or a text reply of version 2, is not known", () => {
+    expect(reasonOf(audioFile({ formatVersion: 1 }))).toBe(INVALID_REPLY_REASONS.unknownKind);
+    expect(
+      reasonOf(bytesOf({ formatVersion: 2, kind: "text", body: "Hi", audio: replyAudio("wav") })),
+    ).toBe(INVALID_REPLY_REASONS.unknownVersion);
+  });
+
+  it("says a missing or non-object audio field is a missing field", () => {
+    for (const audio of [undefined, null, "wav", []]) {
+      expect(reasonOf(audioFile({ audio }))).toBe(INVALID_REPLY_REASONS.missingField);
+    }
+  });
+
+  it("checks the format name first", () => {
+    for (const format of ["aac", "WAV", 5, undefined]) {
+      const audio = { format, data: "not base64!" };
+      expect(reasonOf(audioFile({ audio }))).toBe(INVALID_REPLY_REASONS.audioFormat);
+    }
+  });
+
+  it("then checks that the data is base64 and holds at least one byte", () => {
+    for (const data of ["", "***", "AAA=A", "=AAA", 5, null, undefined]) {
+      const audio = { format: "wav", data };
+      expect(reasonOf(audioFile({ audio }))).toBe(INVALID_REPLY_REASONS.audioData);
+    }
+  });
+
+  it("then checks the leading bytes against the format", () => {
+    const mismatches = [
+      { format: "wav", data: replyAudio("flac").data },
+      { format: "wav", data: Buffer.from("RIFF").toString("base64") },
+      { format: "pcm16", data: Buffer.from([1, 2, 3]).toString("base64") },
+    ];
+    for (const audio of mismatches) {
+      expect(reasonOf(audioFile({ audio }), { asked: true, format: undefined })).toBe(
+        INVALID_REPLY_REASONS.audioContent,
+      );
+    }
+  });
+
+  it("then checks that the request asked for audio", () => {
+    expect(reasonOf(audioFile(), NO_AUDIO_REQUEST)).toBe(INVALID_REPLY_REASONS.audioNotAsked);
+    expect(checkReplyFile(audioFile(), "text").kind).toBe("invalid");
+  });
+
+  it("then checks the format against audio.format of the request", () => {
+    expect(reasonOf(audioFile(), { asked: true, format: "mp3" })).toBe(
+      INVALID_REPLY_REASONS.audioFormatDiffers,
+    );
+  });
+
+  it("then refuses a request for structured output", () => {
+    expect(reasonOf(audioFile({ body: '{"a":1}' }), ASKING, "json")).toBe(
+      INVALID_REPLY_REASONS.audioStructured,
+    );
+    expect(reasonOf(audioFile({ body: "" }), ASKING, "json")).toBe(
+      INVALID_REPLY_REASONS.audioStructured,
+    );
+  });
+
+  it("then refuses a transcript that calls tools", () => {
+    const calls = JSON.stringify([
+      { id: "call_1", type: "function", function: { name: "f", arguments: "{}" } },
+    ]);
+    expect(reasonOf(audioFile({ body: calls }), ASKING, "text", "tools")).toBe(
+      INVALID_REPLY_REASONS.audioToolCalls,
+    );
+    expect(reasonOf(audioFile({ body: calls }), ASKING, "text", "none")).toBeUndefined();
+  });
+
+  it("refuses a file over 10 MB as too large, before it is read", () => {
+    const big = Buffer.alloc(MAX_FILE_BYTES + 1, 0x20);
+    expect(reasonOf(big)).toBe(INVALID_REPLY_REASONS.tooLarge);
+  });
+
+  it("accepts the largest audio reply file within the limit and refuses one byte of audio more (NFR18)", () => {
+    const { fits, over } = audioSizesAtLimit(MAX_FILE_BYTES);
+    const within = Buffer.from(
+      serializeFile(
+        createReplyFile("", "2026-10-09T14:05:12.123Z", "audio", replyAudioOfSize("wav", fits)),
+      ),
+    );
+    const beyond = Buffer.from(
+      serializeFile(
+        createReplyFile("", "2026-10-09T14:05:12.123Z", "audio", replyAudioOfSize("wav", over)),
+      ),
+    );
+    expect(within.length).toBeLessThanOrEqual(MAX_FILE_BYTES);
+    expect(beyond.length).toBeGreaterThan(MAX_FILE_BYTES);
+    expect(reasonOf(within)).toBeUndefined();
+    expect(reasonOf(beyond)).toBe(INVALID_REPLY_REASONS.tooLarge);
+  });
+
+  it("never puts a character of the file in a reason", () => {
+    const secret = "secret-format";
+    const reasons = [
+      reasonOf(audioFile({ audio: { format: secret, data: secret } })),
+      reasonOf(audioFile({ audio: { format: "wav", data: secret } })),
+      reasonOf(audioFile({ body: secret }), NO_AUDIO_REQUEST),
+    ];
+    for (const reason of reasons) {
+      expect(reason).toBeDefined();
+      expect(reason).not.toContain(secret);
+      expect(isInvalidReplyReason(reason ?? "")).toBe(true);
+    }
+  });
+
+  it("does not look at an audio field of a text reply", () => {
+    const text = bytesOf({ formatVersion: 1, kind: "text", body: "Hi", audio: "anything" });
+    expect(checkReplyFile(text, "text").kind).toBe("valid");
   });
 });
