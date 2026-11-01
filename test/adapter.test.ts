@@ -9,6 +9,7 @@ import {
   replyTimeoutMessage,
 } from "../src/chat-completions/adapter.js";
 import { readDataUrl } from "../src/media-parts.js";
+import { replyAudio } from "./helpers/audio.js";
 
 vi.mock("../src/media-parts.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/media-parts.js")>();
@@ -1437,6 +1438,180 @@ describe("building the stream", () => {
     expect(buildStreamEvents({ ...INPUT, reply: { kind: "text" } })).toEqual(
       buildStreamEvents(INPUT),
     );
+  });
+});
+
+describe("building a response with audio (FR15.11, FR15.12)", () => {
+  const ID = "20261009T140640321Z-d4e5f6";
+  const AUDIO = replyAudio("wav");
+  const INPUT = {
+    requestId: ID,
+    model: "whatever",
+    content: "Hello",
+    nowSeconds: 1791814000,
+    audio: AUDIO,
+  };
+  const AUDIO_ID = `audio_${ID}`;
+  const EXPIRES = 1791814000 + 3600;
+  const common = {
+    id: `chatcmpl-${ID}`,
+    object: "chat.completion.chunk",
+    created: 1791814000,
+    model: "whatever",
+  };
+
+  function parsed(events: string[]) {
+    return events.map((event) => {
+      expect(event.startsWith("data: ")).toBe(true);
+      expect(event.endsWith("\n\n")).toBe(true);
+      const text = event.slice("data: ".length, -2);
+      return text === "[DONE]" ? text : (JSON.parse(text) as Record<string, unknown>);
+    });
+  }
+
+  it("builds message.audio with null content, the transcript and stop", () => {
+    const completion = buildCompletion(INPUT);
+    expect(completion.choices[0]).toEqual({
+      index: 0,
+      message: {
+        role: "assistant",
+        content: null,
+        audio: { id: AUDIO_ID, data: AUDIO.data, expires_at: EXPIRES, transcript: "Hello" },
+      },
+      finish_reason: "stop",
+    });
+    expect(completion.usage).toEqual({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+  });
+
+  it("gives an empty transcript when there is no text, and an id for each request", () => {
+    const first = buildCompletion({ ...INPUT, content: "" });
+    const second = buildCompletion({ ...INPUT, requestId: "20261009T140640322Z-aaaaaa" });
+    expect(first.choices[0].message).toMatchObject({ audio: { transcript: "" } });
+    const idOf = (completion: typeof first) =>
+      (completion.choices[0].message as { audio: { id: string } }).audio.id;
+    expect(idOf(first)).not.toBe(idOf(second));
+  });
+
+  it("sets expires_at to created plus 3600 seconds, whatever the clock says", () => {
+    const completion = buildCompletion({ ...INPUT, nowSeconds: 5 });
+    expect(completion.created).toBe(5);
+    expect(completion.choices[0].message).toMatchObject({ audio: { expires_at: 3605 } });
+  });
+
+  it("streams the role, the audio, stop, expires_at and [DONE], in that order", () => {
+    const events = buildStreamEvents({ ...INPUT, includeUsage: false });
+    expect(events.at(-1)).toBe("data: [DONE]\n\n");
+    expect(parsed(events)).toEqual([
+      {
+        ...common,
+        choices: [{ index: 0, delta: { role: "assistant", content: null }, finish_reason: null }],
+      },
+      {
+        ...common,
+        choices: [
+          {
+            index: 0,
+            delta: { audio: { id: AUDIO_ID, data: AUDIO.data, transcript: "Hello" } },
+            finish_reason: null,
+          },
+        ],
+      },
+      { ...common, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      {
+        ...common,
+        choices: [{ index: 0, delta: { audio: { expires_at: EXPIRES } }, finish_reason: null }],
+      },
+      "[DONE]",
+    ]);
+  });
+
+  it("puts the usage chunk after expires_at and before [DONE] when asked", () => {
+    const events = parsed(buildStreamEvents({ ...INPUT, includeUsage: true }));
+    expect(events).toHaveLength(6);
+    expect(events[3]).toMatchObject({ choices: [{ delta: { audio: { expires_at: EXPIRES } } }] });
+    expect(events[4]).toEqual({
+      ...common,
+      choices: [],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    expect(events[5]).toBe("[DONE]");
+  });
+
+  it("sends the id, the data and expires_at exactly once, and each event as one line", () => {
+    const events = buildStreamEvents({ ...INPUT, includeUsage: true });
+    for (const event of events) {
+      expect(event.slice(0, -2)).not.toContain("\n");
+    }
+    const text = events.join("");
+    expect(text.split(AUDIO_ID)).toHaveLength(2);
+    expect(text.split(AUDIO.data)).toHaveLength(2);
+    expect(text.split("expires_at")).toHaveLength(2);
+  });
+
+  it("streams an empty transcript as an empty string", () => {
+    const events = parsed(buildStreamEvents({ ...INPUT, content: "", includeUsage: false }));
+    expect(events[1]).toMatchObject({ choices: [{ delta: { audio: { transcript: "" } } }] });
+  });
+
+  it("leaves a response without audio as it was", () => {
+    const { audio: _audio, ...text } = INPUT;
+    expect(buildCompletion(text).choices[0].message).toEqual({
+      role: "assistant",
+      content: "Hello",
+    });
+    expect(buildStreamEvents({ ...text, includeUsage: false })).toHaveLength(4);
+  });
+});
+
+describe("the audio of an assistant message in a request (FR17.1, FR17.2)", () => {
+  function conversationOf(message: Record<string, unknown>) {
+    const result = parseChatCompletionsRequest(
+      body({ model: "m", messages: [{ role: "user", content: "Say hi" }, message] }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error("expected the request to be accepted");
+    }
+    return result.request.conversation;
+  }
+
+  it("accepts an assistant message with audio and null content, and keeps the audio as received", () => {
+    const audio = { id: "audio_abc123" };
+    expect(conversationOf({ role: "assistant", content: null, audio })[1]).toEqual({
+      role: "assistant",
+      content: "",
+      audio,
+    });
+  });
+
+  it("accepts a string content next to the audio, and keeps an audio that is not an object", () => {
+    expect(conversationOf({ role: "assistant", content: "Hi", audio: { id: "a" } })[1]).toEqual({
+      role: "assistant",
+      content: "Hi",
+      audio: { id: "a" },
+    });
+    expect(conversationOf({ role: "assistant", content: "", audio: 5 })[1]).toMatchObject({
+      audio: 5,
+    });
+  });
+
+  it("still turns away an assistant message with audio and no content at all", () => {
+    const result = parseChatCompletionsRequest(
+      body({ model: "m", messages: [{ role: "assistant", audio: { id: "audio_abc123" } }] }),
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      rejection: {
+        message: "Message content must be a string, null, or an array of content parts.",
+      },
+    });
+  });
+
+  it("keeps no audio field on a message that had none", () => {
+    expect(Object.keys(conversationOf({ role: "assistant", content: "Hi" })[1] ?? {})).toEqual([
+      "role",
+      "content",
+    ]);
   });
 });
 

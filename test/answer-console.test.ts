@@ -1,11 +1,16 @@
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import {
   AnswerConsole,
+  type AudioFileRead,
+  type AudioFileReader,
+  createAudioFileReader,
   createReplyReader,
   normalizeReply,
   type ReadResult,
+  readAudioFile,
   type ServeStatus,
 } from "../src/answer/answer-console.js";
 import { ExchangeBroker } from "../src/broker/exchange-broker.js";
@@ -20,8 +25,10 @@ import {
   serializeFile,
 } from "../src/model.js";
 import type { AnswerInputMode } from "../src/platform.js";
+import { audioBytes, audioSizesAtLimit } from "./helpers/audio.js";
 import { FakeClock, settle } from "./helpers/fake-clock.js";
 import { FakeStore } from "./helpers/fake-store.js";
+import { makeTempDir } from "./helpers/fs.js";
 import { ScriptedReader, type StdinStep, type Step } from "./helpers/scripted-reader.js";
 
 const ID = "20261009T140512123Z-a1b2c3";
@@ -62,6 +69,8 @@ interface SetupOptions {
   /** Left out, the screen is built without a mode, which must mean `interactive`. */
   inputMode?: AnswerInputMode;
   stdin?: StdinStep[];
+  /** Left out, the screen reads files from the disk. */
+  readFile?: AudioFileReader;
 }
 
 function setup(
@@ -95,6 +104,7 @@ function setup(
       return serveStatus;
     },
     ...(options.inputMode === undefined ? {} : { inputMode: options.inputMode }),
+    ...(options.readFile === undefined ? {} : { readFile: options.readFile }),
   });
   const controller = new AbortController();
   return {
@@ -126,6 +136,11 @@ function setup(
     replyKind(id = ID): string | undefined {
       const bytes = store.entries.get(id)?.files.get("reply.json");
       return bytes === undefined ? undefined : (JSON.parse(bytes) as { kind: string }).kind;
+    },
+    /** The reply file that was placed, as parsed JSON. */
+    replyFile(id = ID): Record<string, unknown> | undefined {
+      const bytes = store.entries.get(id)?.files.get("reply.json");
+      return bytes === undefined ? undefined : (JSON.parse(bytes) as Record<string, unknown>);
     },
   };
 }
@@ -2445,5 +2460,553 @@ describe("replying from standard input", () => {
       t.controller.abort();
       await running;
     });
+  });
+});
+
+describe("replying with an audio file (FR15)", () => {
+  const ASKING: Partial<ConversationRequest> = {
+    originalRequest: {
+      model: "whatever",
+      modalities: ["text", "audio"],
+      audio: { voice: "alloy", format: "wav" },
+    },
+  };
+  const askingFor = (
+    format: string | undefined,
+    extra: Partial<ConversationRequest> = {},
+  ): Partial<ConversationRequest> => ({
+    ...extra,
+    originalRequest: {
+      model: "whatever",
+      modalities: ["text", "audio"],
+      ...(format === undefined ? {} : { audio: { voice: "alloy", format } }),
+    },
+  });
+  const again = "Type your reply again. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).";
+  const SECRET = "secret-token";
+
+  /** A reader of files that serves the given contents by the path as typed, and records the paths. */
+  function files(contents: Record<string, AudioFileRead>) {
+    const reads: string[] = [];
+    const readFile: AudioFileReader = async (path) => {
+      reads.push(path);
+      return contents[path] ?? { kind: "unreadable", reason: "missing" };
+    };
+    return { readFile, reads };
+  }
+  const wav = (tail = 4): AudioFileRead => ({ kind: "bytes", bytes: audioBytes("wav", tail) });
+
+  function interactive(steps: Step[], read: ReturnType<typeof files>, extra = ASKING) {
+    const t = setup(steps, undefined, { kind: "running" }, { readFile: read.readFile });
+    t.addWaiting(ID, undefined, extra);
+    return t;
+  }
+
+  describe("what the request shows", () => {
+    it("says that audio is requested with its format, and how to give a file", async () => {
+      const t = interactive(["EOF"], files({}));
+      const running = t.start();
+      await settle();
+      const lines = t.stdout();
+      expect(lines).toContain("Audio:    requested (format: wav)");
+      expect(lines).toContain("To reply with an audio file, type a line: @file <path>");
+      expect(lines.indexOf("Audio:    requested (format: wav)")).toBe(
+        lines.indexOf("Reply:    text") + 1,
+      );
+      expect(lines.indexOf("To reply with an audio file, type a line: @file <path>")).toBe(
+        lines.indexOf(PROMPT) - 1,
+      );
+      t.controller.abort();
+      await running;
+    });
+
+    it("leaves out the format when the request names none, and shows it without control characters", async () => {
+      const none = interactive(["EOF"], files({}), askingFor(undefined));
+      const runningNone = none.start();
+      await settle();
+      expect(none.stdout()).toContain("Audio:    requested");
+      none.controller.abort();
+      await runningNone;
+      const odd = interactive(["EOF"], files({}), askingFor("w\nav\u001b"));
+      const runningOdd = odd.start();
+      await settle();
+      expect(odd.stdout()).toContain("Audio:    requested (format: w\\x0aav\\x1b)");
+      odd.controller.abort();
+      await runningOdd;
+    });
+
+    it("shows neither line for a request that does not ask for audio", async () => {
+      const t = setup(["EOF"]);
+      t.addWaiting();
+      const running = t.start();
+      await settle();
+      expect(t.raw()).not.toContain("Audio:");
+      expect(t.raw()).not.toContain("@file");
+      t.controller.abort();
+      await running;
+    });
+  });
+
+  describe("sending the file", () => {
+    it("places an audio reply: the file as base64, the other lines as the transcript", async () => {
+      const read = files({ "voice.wav": wav() });
+      const t = interactive([`Hello\n@file voice.wav\nthere\n`], read);
+      const running = t.start();
+      await settle();
+      expect(t.replyFile()).toMatchObject({
+        formatVersion: 2,
+        kind: "audio",
+        body: "Hello\nthere",
+        audio: { format: "wav", data: Buffer.from(audioBytes("wav")).toString("base64") },
+      });
+      await t.serveBroker.pollOnce();
+      await t.clock.advance(500);
+      expect(t.stdout()).toContain("Sent.");
+      t.controller.abort();
+      await running;
+    });
+
+    it("sends an empty transcript when the marker line is the only line, and trims the path", async () => {
+      const read = files({ "my voice.wav": wav() });
+      const t = interactive(["@file   my voice.wav  "], read);
+      const running = t.start();
+      await settle();
+      expect(t.replyFile()).toMatchObject({ kind: "audio", body: "" });
+      expect(read.reads).toEqual(["my voice.wav"]);
+      t.controller.abort();
+      await running;
+    });
+
+    it("reads the file once, even when the reply is refused afterwards and typed again", async () => {
+      const read = files({ "a.wav": wav(), "b.wav": wav() });
+      const t = interactive(["@file a.wav\n@file b.wav", "@file a.wav"], read);
+      const running = t.start();
+      await settle();
+      expect(read.reads).toEqual(["a.wav"]);
+      t.controller.abort();
+      await running;
+    });
+
+    it("sends every format by its extension", async () => {
+      for (const [name, format] of [
+        ["a.mp3", "mp3"],
+        ["a.flac", "flac"],
+        ["a.opus", "opus"],
+        ["a.pcm", "pcm16"],
+      ] as const) {
+        const read = files({ [name]: { kind: "bytes", bytes: audioBytes(format) } });
+        const t = interactive([`@file ${name}`], read, askingFor(undefined));
+        const running = t.start();
+        await settle();
+        expect(t.replyFile()).toMatchObject({ kind: "audio", audio: { format } });
+        t.controller.abort();
+        await running;
+      }
+    });
+
+    it("treats a text that only looks like a marker as a text reply", async () => {
+      const read = files({});
+      const t = interactive(["@filename voice.wav"], read);
+      const running = t.start();
+      await settle();
+      expect(t.replyFile()).toMatchObject({ kind: "text", body: "@filename voice.wav" });
+      expect(read.reads).toEqual([]);
+      t.controller.abort();
+      await running;
+    });
+
+    it("sends the largest file whose reply file is within 10 MB and refuses one byte more", async () => {
+      const { fits, over } = audioSizesAtLimit(MAX_FILE_BYTES);
+      const read = files({
+        "fits.wav": { kind: "bytes", bytes: audioBytes("wav", fits - audioBytes("wav", 0).length) },
+        "over.wav": { kind: "bytes", bytes: audioBytes("wav", over - audioBytes("wav", 0).length) },
+      });
+      const refused = interactive(["@file over.wav", "second"], read);
+      const runningRefused = refused.start();
+      await settle();
+      const lines = refused.stdout();
+      const at = lines.indexOf("Not sent: your reply is larger than 10 MB.");
+      expect(at).toBeGreaterThan(-1);
+      expect(lines[at + 1]).toBe(again);
+      expect(refused.replyBody()).toBe("second");
+      refused.controller.abort();
+      await runningRefused;
+      const sent = interactive(["@file fits.wav"], read);
+      const runningSent = sent.start();
+      await settle();
+      expect(sent.replyFile()).toMatchObject({ kind: "audio" });
+      sent.controller.abort();
+      await runningSent;
+    });
+  });
+
+  describe("refusing a reply and asking again", () => {
+    interface Refusal {
+      name: string;
+      typed: string;
+      request: Partial<ConversationRequest>;
+      contents: Record<string, AudioFileRead>;
+      line: string;
+      /** The line that asks again; the default is the one for text. */
+      asksAgain?: string;
+    }
+    const CALLS = JSON.stringify([
+      { id: "call_1", type: "function", function: { name: "f", arguments: "{}" } },
+    ]);
+    const refusals: Refusal[] = [
+      {
+        name: "the request does not ask for audio",
+        typed: `${SECRET}\n@file a.wav`,
+        request: {},
+        contents: { "a.wav": wav() },
+        line: "Not sent: this request does not ask for audio.",
+      },
+      {
+        name: "the format of the request differs from the file",
+        typed: `${SECRET}\n@file a.wav`,
+        request: askingFor("mp3"),
+        contents: { "a.wav": wav() },
+        line: "Not sent: the request asks for mp3 audio, but this file is wav.",
+      },
+      {
+        name: "the file is an image",
+        typed: `${SECRET}\n@file picture.PNG`,
+        request: ASKING,
+        contents: {},
+        line: "Not sent: Chat Completions has no way to return an image, so only audio files can be sent.",
+      },
+      {
+        name: "the extension is not known",
+        typed: `${SECRET}\n@file voice.aac`,
+        request: ASKING,
+        contents: {},
+        line: "Not sent: the file name must end in .wav, .mp3, .flac, .opus or .pcm.",
+      },
+      {
+        name: "the file does not exist",
+        typed: `${SECRET}\n@file gone.wav`,
+        request: ASKING,
+        contents: {},
+        line: "Not sent: cannot read gone.wav: the file does not exist.",
+      },
+      {
+        name: "the file cannot be read for lack of permission",
+        typed: "@file locked.wav",
+        request: ASKING,
+        contents: { "locked.wav": { kind: "unreadable", reason: "denied" } },
+        line: "Not sent: cannot read locked.wav: permission denied.",
+      },
+      {
+        name: "the path is a folder",
+        typed: "@file folder.wav",
+        request: ASKING,
+        contents: { "folder.wav": { kind: "unreadable", reason: "directory" } },
+        line: "Not sent: cannot read folder.wav: it is a folder.",
+      },
+      {
+        name: "the path is not a regular file",
+        typed: "@file pipe.wav",
+        request: ASKING,
+        contents: { "pipe.wav": { kind: "unreadable", reason: "not-file" } },
+        line: "Not sent: cannot read pipe.wav: it is not a regular file.",
+      },
+      {
+        name: "the file is empty",
+        typed: "@file empty.wav",
+        request: ASKING,
+        contents: { "empty.wav": { kind: "unreadable", reason: "empty" } },
+        line: "Not sent: cannot read empty.wav: the file is empty.",
+      },
+      {
+        name: "the file cannot be read for another reason",
+        typed: "@file odd.wav",
+        request: ASKING,
+        contents: { "odd.wav": { kind: "unreadable", reason: "failed" } },
+        line: "Not sent: cannot read odd.wav: the file could not be read.",
+      },
+      {
+        name: "the file is larger than 10 MB",
+        typed: "@file big.wav",
+        request: ASKING,
+        contents: { "big.wav": { kind: "too-large" } },
+        line: "Not sent: your reply is larger than 10 MB.",
+      },
+      {
+        name: "the marker line has no path",
+        typed: `${SECRET}\n@file `,
+        request: ASKING,
+        contents: {},
+        line: "Not sent: the @file line has no path.",
+      },
+      {
+        name: "there are two marker lines",
+        typed: `${SECRET}\n@file a.wav\n@file b.wav`,
+        request: ASKING,
+        contents: { "a.wav": wav(), "b.wav": wav() },
+        line: "Not sent: only one @file line is allowed in a reply.",
+      },
+      {
+        name: "the beginning of the file does not fit its extension",
+        typed: "@file fake.wav",
+        request: ASKING,
+        contents: { "fake.wav": { kind: "bytes", bytes: audioBytes("flac") } },
+        line: "Not sent: the beginning of the file does not look like wav.",
+      },
+      {
+        name: "the request asks for structured output",
+        typed: "@file a.wav",
+        request: { ...ASKING, replyKind: "json" },
+        contents: { "a.wav": wav() },
+        line: "Not sent: audio cannot be returned for a request that asks for JSON.",
+        asksAgain: "Type the JSON again. Finish with Ctrl+D (Windows: Ctrl+Z, then Enter).",
+      },
+      {
+        name: "the text is tool calls",
+        typed: `${CALLS}\n@file a.wav`,
+        request: { ...ASKING, toolDefinitions: "tools" },
+        contents: { "a.wav": wav() },
+        line: "Not sent: audio cannot be sent together with tool calls.",
+      },
+    ];
+
+    for (const refusal of refusals) {
+      it(`does not send when ${refusal.name}, and asks again for the same request`, async () => {
+        const read = files(refusal.contents);
+        const seen: (string | undefined)[] = [];
+        const second = refusal.request.replyKind === "json" ? '{"ok": true}' : "second try";
+        const t = interactive(
+          [
+            refusal.typed,
+            () => {
+              seen.push(t.replyBody());
+              return second;
+            },
+          ],
+          read,
+          refusal.request,
+        );
+        const running = t.start();
+        await settle();
+        expect(seen).toEqual([undefined]);
+        const lines = t.stdout();
+        const at = lines.indexOf(refusal.line);
+        expect(at).toBeGreaterThan(-1);
+        expect(lines[at + 1]).toBe(refusal.asksAgain ?? again);
+        expect(lines.filter((line) => line.startsWith("--- Request"))).toHaveLength(1);
+        expect(t.reader.calls).toBe(2);
+        expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
+        expect(t.replyBody()).toBe(second);
+        expect(t.raw()).not.toContain(SECRET);
+        t.controller.abort();
+        await running;
+      });
+    }
+  });
+
+  describe("from standard input (FR15.14)", () => {
+    const tail = "Nothing was sent; the request is still waiting.";
+    const stdinSetup = (stdin: StdinStep[], read: ReturnType<typeof files>, extra = ASKING) => {
+      const t = setup(
+        [],
+        undefined,
+        { kind: "running" },
+        {
+          inputMode: "stdin",
+          stdin,
+          readFile: read.readFile,
+        },
+      );
+      t.addWaiting(ID, undefined, extra);
+      return t;
+    };
+
+    it("sends the audio of an @file line and tells so in one line, exit 0", async () => {
+      const read = files({ "voice.wav": wav() });
+      const t = stdinSetup(["Hello\r\n@file voice.wav\r\n"], read);
+      const running = t.start();
+      await settle();
+      expect(t.replyFile()).toMatchObject({
+        formatVersion: 2,
+        kind: "audio",
+        body: "Hello",
+        audio: { format: "wav" },
+      });
+      await t.serveBroker.pollOnce();
+      await t.clock.advance(500);
+      expect(await running).toBe(0);
+      expect(t.stdout()).toEqual(["Sent reply to request a1b2c3."]);
+      expect(t.stderr()).toEqual([]);
+      expect(read.reads).toEqual(["voice.wav"]);
+    });
+
+    it("passes a relative path as typed, so it counts from where the command was started", async () => {
+      const read = files({ "sounds/voice.wav": wav() });
+      const t = stdinSetup(["@file sounds/voice.wav\n"], read);
+      const running = t.start();
+      await settle();
+      expect(read.reads).toEqual(["sounds/voice.wav"]);
+      t.controller.abort();
+      await running;
+    });
+
+    const failures: [
+      string,
+      string,
+      Record<string, AudioFileRead>,
+      string,
+      Partial<ConversationRequest>,
+    ][] = [
+      [
+        "the request does not ask for audio",
+        "@file a.wav",
+        { "a.wav": wav() },
+        "Error: this request does not ask for audio.",
+        {},
+      ],
+      [
+        "the file cannot be read",
+        "@file gone.wav",
+        {},
+        "Error: cannot read gone.wav: the file does not exist.",
+        ASKING,
+      ],
+      [
+        "there are two marker lines",
+        "@file a.wav\n@file b.wav",
+        {},
+        "Error: only one @file line is allowed in a reply.",
+        ASKING,
+      ],
+      [
+        "the extension is for an image",
+        "@file a.jpg",
+        {},
+        "Error: Chat Completions has no way to return an image, so only audio files can be sent.",
+        ASKING,
+      ],
+      [
+        "the file is larger than 10 MB",
+        "@file big.wav",
+        { "big.wav": { kind: "too-large" } },
+        "Error: the reply is larger than 10 MB.",
+        ASKING,
+      ],
+      [
+        "the request asks for structured output",
+        "@file a.wav",
+        { "a.wav": wav() },
+        "Error: audio cannot be returned for a request that asks for JSON.",
+        { ...ASKING, replyKind: "json" },
+      ],
+    ];
+
+    for (const [name, typed, contents, line, request] of failures) {
+      it(`sends nothing and ends with exit 1 when ${name}`, async () => {
+        const t = stdinSetup([`${SECRET}\n${typed}\n`], files(contents), request);
+        const running = t.start();
+        await settle();
+        expect(await running).toBe(1);
+        expect(t.stderr()).toEqual([`${line} ${tail}`]);
+        expect(t.stdout()).toEqual([]);
+        expect(t.replyBody()).toBeUndefined();
+        expect(t.store.entries.get(ID)?.state).toMatchObject({ state: "waiting" });
+        expect(t.raw()).not.toContain(SECRET);
+      });
+    }
+  });
+});
+
+describe("reading an audio file from the disk", () => {
+  it("reads the bytes of a regular file", async () => {
+    const dir = await makeTempDir();
+    const file = path.join(dir, "voice.wav");
+    await writeFile(file, audioBytes("wav"));
+    expect(await readAudioFile(file)).toEqual({ kind: "bytes", bytes: audioBytes("wav") });
+  });
+
+  it("says a file that is not there is missing, and a folder is a folder", async () => {
+    const dir = await makeTempDir();
+    expect(await readAudioFile(path.join(dir, "gone.wav"))).toEqual({
+      kind: "unreadable",
+      reason: "missing",
+    });
+    expect(await readAudioFile(dir)).toEqual({ kind: "unreadable", reason: "directory" });
+  });
+
+  it("says an empty file is empty", async () => {
+    const dir = await makeTempDir();
+    const file = path.join(dir, "empty.wav");
+    await writeFile(file, "");
+    expect(await readAudioFile(file)).toEqual({ kind: "unreadable", reason: "empty" });
+  });
+
+  it("does not read a file of more than 10 MB", async () => {
+    const dir = await makeTempDir();
+    const exact = path.join(dir, "exact.wav");
+    const over = path.join(dir, "over.wav");
+    await writeFile(exact, Buffer.alloc(MAX_FILE_BYTES, 1));
+    await writeFile(over, Buffer.alloc(MAX_FILE_BYTES + 1, 1));
+    expect((await readAudioFile(exact)).kind).toBe("bytes");
+    expect(await readAudioFile(over)).toEqual({ kind: "too-large" });
+  });
+
+  it("says any other failure to open is a failure to read", async () => {
+    expect(await readAudioFile("a\0b.wav")).toEqual({ kind: "unreadable", reason: "failed" });
+  });
+});
+
+describe("the bounds of reading an audio file", () => {
+  const regular = (size: number) => ({ isDirectory: () => false, isFile: () => true, size });
+
+  it("never reads more than one byte past the limit, whatever the size said", async () => {
+    const limits: number[] = [];
+    const read = createAudioFileReader({
+      stat: async () => regular(3),
+      readUpTo: async (_path, limit) => {
+        limits.push(limit);
+        return new Uint8Array(limit);
+      },
+    });
+    expect(await read("grew.wav")).toEqual({ kind: "too-large" });
+    expect(limits).toEqual([MAX_FILE_BYTES + 1]);
+  });
+
+  it("reads a regular file that reports a size of zero, up to the limit", async () => {
+    const read = createAudioFileReader({
+      stat: async () => regular(0),
+      readUpTo: async () => audioBytes("wav"),
+    });
+    expect(await read("special.wav")).toEqual({ kind: "bytes", bytes: audioBytes("wav") });
+  });
+
+  it("does not read a file that the size says is over the limit", async () => {
+    let reads = 0;
+    const read = createAudioFileReader({
+      stat: async () => regular(MAX_FILE_BYTES + 1),
+      readUpTo: async () => {
+        reads += 1;
+        return new Uint8Array(1);
+      },
+    });
+    expect(await read("big.wav")).toEqual({ kind: "too-large" });
+    expect(reads).toBe(0);
+  });
+
+  it("says a path that is neither a folder nor a regular file is not a file", async () => {
+    const read = createAudioFileReader({
+      stat: async () => ({ isDirectory: () => false, isFile: () => false, size: 0 }),
+      readUpTo: async () => new Uint8Array(1),
+    });
+    expect(await read("pipe.wav")).toEqual({ kind: "unreadable", reason: "not-file" });
+  });
+
+  it("says a file that may not be opened is denied", async () => {
+    const read = createAudioFileReader({
+      stat: async () => regular(3),
+      readUpTo: async () => {
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      },
+    });
+    expect(await read("private.wav")).toEqual({ kind: "unreadable", reason: "denied" });
   });
 });

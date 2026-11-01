@@ -12,6 +12,7 @@ import {
   createStateFile,
   serializeFile,
 } from "../src/model.js";
+import { replyAudio } from "./helpers/audio.js";
 import { FakeClock } from "./helpers/fake-clock.js";
 import { FakeStore } from "./helpers/fake-store.js";
 
@@ -1797,5 +1798,120 @@ describe("unexpected failures are reported once and never answered with details"
     const inner = (context.server as unknown as { server: http.Server }).server;
     expect(() => inner.emit("error", failure)).not.toThrow();
     expect(context.unexpected).toEqual([failure]);
+  });
+});
+
+describe("a request that gets an audio reply (FR15.11, FR15.12, NFR17)", () => {
+  const AUDIO = replyAudio("wav");
+  const TRANSCRIPT = "secret transcript";
+  const asking = (extra: Record<string, unknown> = {}) =>
+    chat("Say hi", {
+      modalities: ["text", "audio"],
+      audio: { voice: "alloy", format: "wav" },
+      ...extra,
+    });
+
+  async function replyWithAudio(extra: Record<string, unknown>, transcript = TRANSCRIPT) {
+    const context = await startServer();
+    const watching = sendWatching(context.port, asking(extra));
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    context.store.putFile(
+      id,
+      "reply.json",
+      serializeFile(createReplyFile(transcript, "2026-10-09T14:05:12.000Z", "audio", AUDIO)),
+    );
+    await context.broker.pollOnce();
+    return { reply: await watching.pending, id, context };
+  }
+
+  it("answers 200 with message.audio, null content and stop when the request does not stream", async () => {
+    const { reply, id, context } = await replyWithAudio({});
+    expect(reply.status).toBe(200);
+    expect(reply.headers["content-type"]).toContain("application/json");
+    expect(JSON.parse(reply.text)).toEqual({
+      id: `chatcmpl-${id}`,
+      object: "chat.completion",
+      created: 1791813940,
+      model: "whatever",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            audio: {
+              id: `audio_${id}`,
+              data: AUDIO.data,
+              expires_at: 1791813940 + 3600,
+              transcript: TRANSCRIPT,
+            },
+          },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+    expect(context.store.entries.get(id)?.state).toMatchObject({ state: "replied" });
+  });
+
+  it("streams the audio in one chunk, then stop, then expires_at, then the usage and [DONE]", async () => {
+    const { reply, id } = await replyWithAudio({
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+    expect(reply.status).toBe(200);
+    expect(reply.headers["content-type"]).toContain("text/event-stream");
+    const events = eventsOf(reply.text);
+    expect(events).toHaveLength(6);
+    expect(events[5]).toBe("[DONE]");
+    const chunks = events.slice(0, 5).map((event) => JSON.parse(event));
+    expect(chunks.map((chunk) => chunk.choices[0]?.delta)).toEqual([
+      { role: "assistant", content: null },
+      { audio: { id: `audio_${id}`, data: AUDIO.data, transcript: TRANSCRIPT } },
+      {},
+      { audio: { expires_at: 1791813940 + 3600 } },
+      undefined,
+    ]);
+    expect(chunks.map((chunk) => chunk.choices[0]?.finish_reason)).toEqual([
+      null,
+      null,
+      "stop",
+      null,
+      undefined,
+    ]);
+    expect(chunks[4]).toMatchObject({ choices: [], usage: { total_tokens: 0 } });
+  });
+
+  it("writes none of the audio, the transcript or the file's path in the output of serve", async () => {
+    const { context } = await replyWithAudio({});
+    const output = context.out.join("") + context.err.join("");
+    expect(output).toContain("replied");
+    expect(output).not.toContain(AUDIO.data);
+    expect(output).not.toContain(TRANSCRIPT);
+    expect(output).not.toContain("audio_");
+  });
+
+  it("answers an audio reply to a request that did not ask for audio with the fixed 502 message", async () => {
+    const context = await startServer();
+    const watching = sendWatching(context.port, chat("Say hi"));
+    await waitFor(() => context.store.entries.size === 1);
+    const [id] = [...context.store.entries.keys()] as [string];
+    context.store.putFile(
+      id,
+      "reply.json",
+      serializeFile(createReplyFile(TRANSCRIPT, "2026-10-09T14:05:12.000Z", "audio", AUDIO)),
+    );
+    await context.broker.pollOnce();
+    const reply = await watching.pending;
+    expect(reply.status).toBe(502);
+    expect(reply.json().error).toEqual({
+      message:
+        "The reply file was invalid: reply file has audio but the request did not ask for audio.",
+      type: "server_error",
+      code: "invalid_reply",
+    });
+    expect(reply.text).not.toContain(TRANSCRIPT);
+    expect(context.out.join("")).not.toContain(AUDIO.data);
   });
 });

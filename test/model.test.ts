@@ -622,3 +622,102 @@ describe("attachments in a version 3 request file", () => {
     });
   });
 });
+
+describe("an audio reply file", () => {
+  const AUDIO = { format: "wav", data: "UklGRg==" } as const;
+
+  it("is written as version 2 with the audio next to the transcript", () => {
+    const written = createReplyFile("Hello", RECEIVED_AT, "audio", AUDIO);
+    expect(written).toEqual({
+      formatVersion: 2,
+      kind: "audio",
+      body: "Hello",
+      audio: AUDIO,
+      source: "imbehind-answer",
+      writtenAt: RECEIVED_AT,
+    });
+  });
+
+  it("reads back with its audio, and its body may be empty", () => {
+    const parsed = parseReplyFile(createReplyFile("", RECEIVED_AT, "audio", AUDIO));
+    expect(parsed.kind === "ok" && parsed.value).toMatchObject({
+      formatVersion: 2,
+      kind: "audio",
+      body: "",
+      audio: AUDIO,
+    });
+  });
+
+  it("keeps the text, json and skip replies at version 1 without an audio field", () => {
+    for (const kind of ["text", "json"] as const) {
+      const written = createReplyFile("x", RECEIVED_AT, kind);
+      expect(written.formatVersion).toBe(1);
+      expect("audio" in written).toBe(false);
+    }
+    expect(createReplyFile("", RECEIVED_AT, "skip").formatVersion).toBe(1);
+  });
+
+  it("does not read an audio reply that is broken", () => {
+    const base = { formatVersion: 2, kind: "audio", body: "" };
+    const cases: unknown[] = [
+      { ...base, formatVersion: 1, audio: AUDIO },
+      base,
+      { ...base, audio: null },
+      { ...base, audio: { format: "aac", data: "UklGRg==" } },
+      { ...base, audio: { format: "wav", data: "" } },
+      { ...base, audio: { format: "wav", data: 5 } },
+      { ...base, body: 5, audio: AUDIO },
+    ];
+    for (const data of cases) {
+      expect(parseReplyFile(data).kind).toBe("unreadable");
+    }
+  });
+
+  it("does not read a version 2 reply of another kind", () => {
+    expect(parseReplyFile({ formatVersion: 2, kind: "text", body: "x" }).kind).toBe("unreadable");
+    expect(parseReplyFile({ formatVersion: 3, kind: "audio", body: "", audio: AUDIO }).kind).toBe(
+      "unreadable",
+    );
+  });
+});
+
+describe("the fixed reasons for an audio reply file", () => {
+  const REASONS = [
+    INVALID_REPLY_REASONS.audioFormat,
+    INVALID_REPLY_REASONS.audioData,
+    INVALID_REPLY_REASONS.audioContent,
+    INVALID_REPLY_REASONS.audioNotAsked,
+    INVALID_REPLY_REASONS.audioFormatDiffers,
+    INVALID_REPLY_REASONS.audioStructured,
+    INVALID_REPLY_REASONS.audioToolCalls,
+  ];
+
+  it("are known to the log, and are all different", () => {
+    expect(new Set(REASONS).size).toBe(REASONS.length);
+    for (const reason of REASONS) {
+      expect(isInvalidReplyReason(reason)).toBe(true);
+    }
+  });
+
+  it("do not make any other text a known reason", () => {
+    expect(isInvalidReplyReason(`${INVALID_REPLY_REASONS.audioData} (secret)`)).toBe(false);
+  });
+});
+
+describe("the audio of an assistant message in the conversation", () => {
+  it("is kept as received in a request file", () => {
+    const conversation = [
+      { role: "user", content: "Say hi" },
+      { role: "assistant", content: "", audio: { id: "audio_abc123" } },
+      { role: "assistant", content: "", audio: "not an object" },
+    ];
+    const json = {
+      ...validRequestJson(),
+      formatVersion: 3,
+      toolDefinitions: "none",
+      conversation,
+    };
+    const parsed = parseRequestFile(json);
+    expect(parsed.kind === "ok" && parsed.value.conversation).toEqual(conversation);
+  });
+});

@@ -11,9 +11,11 @@ import {
   createReplyFile,
   createRequestFile,
   createStateFile,
+  INVALID_REPLY_REASONS,
   MAX_FILE_BYTES,
   serializeFile,
 } from "../src/model.js";
+import { audioSizesAtLimit, replyAudio, replyAudioOfSize } from "./helpers/audio.js";
 import { FakeClock, settle } from "./helpers/fake-clock.js";
 import { FakeStore } from "./helpers/fake-store.js";
 
@@ -2255,5 +2257,139 @@ describe("replies that call tools", () => {
       reason: BAD_REASON,
     });
     expect(text.outcomeOf()).toMatchObject({ kind: "invalid_reply" });
+  });
+});
+
+describe("replies with audio (FR15.11, FR15.16, FR16.2, FR16.3)", () => {
+  const AUDIO = replyAudio("wav");
+  const audioBytes = (body = "Hello", audio = AUDIO): string =>
+    serializeFile(createReplyFile(body, NOW, "audio", audio));
+  const asking: ConversationRequest = {
+    ...request,
+    originalRequest: {
+      model: "whatever",
+      modalities: ["text", "audio"],
+      audio: { voice: "alloy", format: "wav" },
+    },
+  };
+
+  async function submitWith(broker: ExchangeBroker, conversation: ConversationRequest) {
+    const submitted = await broker.submit(conversation);
+    let outcome: ExchangeOutcome | undefined;
+    submitted.outcome.then((value) => {
+      outcome = value;
+    });
+    return { id: submitted.id, outcomeOf: () => outcome };
+  }
+
+  it("accepts audio for a request that asked for it and passes the audio on with the transcript", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWith(broker, asking);
+    store.putFile(id, "reply.json", audioBytes());
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("replied");
+    expect(outcomeOf()).toEqual({
+      kind: "replied",
+      id,
+      body: "Hello",
+      reply: { kind: "text" },
+      audio: AUDIO,
+    });
+    expect(store.entries.get(id)?.files.get("reply.accepted.json")).toBe(audioBytes());
+    expect(events).toEqual([{ type: "replied", id }]);
+  });
+
+  it("ends a request that did not ask for audio as invalid_reply with a fixed reason", async () => {
+    const { store, broker, events } = setup();
+    const { id, outcomeOf } = await submitWith(broker, request);
+    store.putFile(id, "reply.json", audioBytes());
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("invalid_reply");
+    expect(outcomeOf()).toMatchObject({
+      kind: "invalid_reply",
+      reason: INVALID_REPLY_REASONS.audioNotAsked,
+    });
+    expect(events).toEqual([
+      { type: "invalid_reply", id, reason: INVALID_REPLY_REASONS.audioNotAsked },
+    ]);
+  });
+
+  it("refuses an audio format other than audio.format, and structured output", async () => {
+    const { store, broker } = setup();
+    const other = await submitWith(broker, asking);
+    const structured = await submitWith(broker, { ...asking, replyKind: "json" });
+    store.putFile(other.id, "reply.json", audioBytes("", replyAudio("mp3")));
+    store.putFile(structured.id, "reply.json", audioBytes());
+    await broker.pollOnce();
+    await settle();
+    expect(other.outcomeOf()).toMatchObject({
+      reason: INVALID_REPLY_REASONS.audioFormatDiffers,
+    });
+    expect(structured.outcomeOf()).toMatchObject({
+      reason: INVALID_REPLY_REASONS.audioStructured,
+    });
+  });
+
+  it("refuses a transcript that calls tools", async () => {
+    const { store, broker } = setup();
+    const calls = JSON.stringify([
+      { id: "call_1", type: "function", function: { name: "f", arguments: "{}" } },
+    ]);
+    const { id, outcomeOf } = await submitWith(broker, { ...asking, toolDefinitions: "tools" });
+    store.putFile(id, "reply.json", audioBytes(calls));
+    await broker.pollOnce();
+    await settle();
+    expect(outcomeOf()).toMatchObject({ reason: INVALID_REPLY_REASONS.audioToolCalls });
+  });
+
+  it("reads what the request asked for from request.json when this run did not save it", async () => {
+    const { store, broker } = setup();
+    const id = "20260101T000001000Z-000001";
+    store.addRaw(id, {
+      request: createRequestFile(id, NOW, asking),
+      state: createStateFile(id, "waiting", NOW, null),
+    });
+    store.putFile(id, "reply.json", audioBytes());
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("replied");
+  });
+
+  it("uses a reply.accepted.json with audio that an earlier run accepted", async () => {
+    const { store, broker } = setup();
+    const { id, outcomeOf } = await submitWith(broker, asking);
+    store.putFile(id, "reply.accepted.json", audioBytes("", AUDIO));
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("replied");
+    expect(outcomeOf()).toMatchObject({ kind: "replied", body: "", audio: AUDIO });
+  });
+
+  it("places an audio reply as a version 2 reply file that the check accepts", async () => {
+    const { store, broker } = setup();
+    const { id } = await submitWith(broker, asking);
+    const placed = await broker.placeReply(id, "Hello", "audio", AUDIO);
+    expect(placed.kind).toBe("placed");
+    const written = placed.kind === "placed" ? placed.bytes : "";
+    expect(JSON.parse(written)).toMatchObject({
+      formatVersion: 2,
+      kind: "audio",
+      body: "Hello",
+      audio: AUDIO,
+    });
+    expect(store.entries.get(id)?.files.get("reply.json")).toBe(written);
+    await broker.pollOnce();
+    await settle();
+    expect(stateOf(store, id)).toBe("replied");
+  });
+
+  it("counts the audio in the size of the file an answer writes (FR15.16, NFR18)", () => {
+    const { broker } = setup();
+    const { fits, over } = audioSizesAtLimit(MAX_FILE_BYTES);
+    expect(broker.replyFitsLimit("", "audio", replyAudioOfSize("wav", fits))).toBe(true);
+    expect(broker.replyFitsLimit("", "audio", replyAudioOfSize("wav", over))).toBe(false);
+    expect(broker.replyFitsLimit("Hello", "audio", AUDIO)).toBe(true);
   });
 });

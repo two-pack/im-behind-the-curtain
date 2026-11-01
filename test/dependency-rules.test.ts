@@ -112,6 +112,32 @@ describe("the dependency rules (logical-components: the leaf modules)", () => {
     ]);
   });
 
+  it("treats audio-reply as a leaf module that the answer screen, the check of a reply file and the broker may use", async () => {
+    const violations = await cruise({
+      "model.ts": LEAF,
+      "tool-calls.ts": 'import { value } from "./model.js";\nexport const calls = value;\n',
+      "audio-reply.ts":
+        'import { calls } from "./tool-calls.js";\nimport { value } from "./model.js";\nexport const audio = [calls, value];\n',
+      "answer/answer-console.ts":
+        'import { audio } from "../audio-reply.js";\nexport const screen = audio;\n',
+      "broker/reply-file-check.ts":
+        'import { audio } from "../audio-reply.js";\nexport const check = audio;\n',
+      "broker/exchange-broker.ts":
+        'import { audio } from "../audio-reply.js";\nexport const broker = audio;\n',
+    });
+    expect(violations).toEqual([]);
+  });
+
+  it("reports an audio-reply module that imports a module that is not a leaf", async () => {
+    const violations = await cruise({
+      "clock.ts": LEAF,
+      "audio-reply.ts": 'import { value } from "./clock.js";\nexport const audio = value;\n',
+    });
+    expect(violations.map((violation) => `${violation.from} -> ${violation.to}`)).toEqual([
+      "src/audio-reply.ts -> src/clock.ts",
+    ]);
+  });
+
   it("still allows an import the design allows", async () => {
     const violations = await cruise({
       "errors.ts": LEAF,

@@ -6,6 +6,9 @@
 /** The format version of state.json and reply.json. */
 export const FORMAT_VERSION = 1;
 
+/** The format version of a reply.json that carries audio. A reply of any other kind stays at 1. */
+export const AUDIO_REPLY_FORMAT_VERSION = 2;
+
 /** The format version that request.json is written with. Versions 1 and 2 are still read. */
 const REQUEST_FORMAT_VERSION = 3;
 
@@ -58,6 +61,13 @@ export const INVALID_REPLY_REASONS = {
   bodyMismatch: "reply file has a body that does not fit its kind",
   bodyNotJson: (detail: string): string => `reply body is not valid JSON (${detail})`,
   badToolCalls: (detail: string): string => `reply tool calls are not valid (${detail})`,
+  audioFormat: "reply file has an audio format that is not known",
+  audioData: "reply file has audio data that is not base64 or is empty",
+  audioContent: "reply file has audio data that does not match its format",
+  audioNotAsked: "reply file has audio but the request did not ask for audio",
+  audioFormatDiffers: "reply file has an audio format other than the one the request asked for",
+  audioStructured: "reply file has audio but the request asks for structured output",
+  audioToolCalls: "reply file has audio and a text that calls tools",
 } as const;
 
 const FIXED_REASONS: ReadonlySet<string> = new Set([
@@ -67,6 +77,13 @@ const FIXED_REASONS: ReadonlySet<string> = new Set([
   INVALID_REPLY_REASONS.unknownVersion,
   INVALID_REPLY_REASONS.unknownKind,
   INVALID_REPLY_REASONS.bodyMismatch,
+  INVALID_REPLY_REASONS.audioFormat,
+  INVALID_REPLY_REASONS.audioData,
+  INVALID_REPLY_REASONS.audioContent,
+  INVALID_REPLY_REASONS.audioNotAsked,
+  INVALID_REPLY_REASONS.audioFormatDiffers,
+  INVALID_REPLY_REASONS.audioStructured,
+  INVALID_REPLY_REASONS.audioToolCalls,
 ]);
 
 /** The three phrases for a text that is not valid JSON, which carry only numbers. */
@@ -156,27 +173,42 @@ export type ToolReply =
   | { kind: "tool_calls"; calls: ToolCallItem[] }
   | { kind: "function_call"; name: string; arguments: string };
 
+/** The audio formats of Chat Completions that a reply can carry. `aac` is not one of them. */
+export const AUDIO_FORMATS = ["wav", "mp3", "flac", "opus", "pcm16"] as const;
+export type AudioFormat = (typeof AUDIO_FORMATS)[number];
+
+/** The audio of a reply file: its format and its bytes as base64. */
+export interface ReplyAudio {
+  format: AudioFormat;
+  data: string;
+}
+
 /** What a human reply must be: free text, or text that reads as JSON. */
 export type ReplyKind = "text" | "json";
 
-/** The kinds a reply file can have. `skip` carries no text and ends the request. */
-export type ReplyFileKind = ReplyKind | "skip";
+/**
+ * The kinds a reply file can have. `skip` carries no text and ends the request. `audio` carries
+ * audio, and its body is the transcript, which may be empty.
+ */
+export type ReplyFileKind = ReplyKind | "skip" | "audio";
 
 const REPLY_KINDS: readonly ReplyKind[] = ["text", "json"];
-const REPLY_FILE_KINDS: readonly ReplyFileKind[] = ["text", "json", "skip"];
+const REPLY_FILE_KINDS: readonly ReplyFileKind[] = ["text", "json", "skip", "audio"];
 
 /**
- * The fields of a message that belong to tools. They are kept as received, with whatever type
- * the client sent, and only when the client sent them.
+ * The fields of a message that belong to tools, and the `audio` of an assistant message (the id of
+ * an earlier audio reply). They are kept as received, with whatever type the client sent, and only
+ * when the client sent them.
  */
 export interface ToolFields {
   tool_call_id?: unknown;
   name?: unknown;
   tool_calls?: unknown;
   function_call?: unknown;
+  audio?: unknown;
 }
 
-const TOOL_FIELD_NAMES = ["tool_call_id", "name", "tool_calls", "function_call"] as const;
+const TOOL_FIELD_NAMES = ["tool_call_id", "name", "tool_calls", "function_call", "audio"] as const;
 
 /** The kinds of a part that is not text. `other` is a part type this version does not know. */
 type AttachmentKind = "image" | "audio" | "file" | "other";
@@ -279,10 +311,16 @@ export interface StateFile {
 }
 
 export interface ReplyFile {
-  formatVersion: 1;
+  /** 2 for an `audio` reply, 1 for every other kind. */
+  formatVersion: 1 | 2;
   kind: ReplyFileKind;
-  /** Empty for a `skip` reply. At least one character for the other kinds. */
+  /**
+   * Empty for a `skip` reply, and for an `audio` reply without a transcript. At least one
+   * character for the other kinds.
+   */
   body: string;
+  /** Only an `audio` reply has it. */
+  audio?: ReplyAudio;
   source?: string;
   writtenAt?: string;
 }
@@ -591,22 +629,60 @@ export function parseStateFile(data: unknown): Loaded<StateFile> {
   };
 }
 
+/** Whether `value` is the name of an audio format that a reply can carry. */
+export function isAudioFormat(value: unknown): value is AudioFormat {
+  return typeof value === "string" && (AUDIO_FORMATS as readonly string[]).includes(value);
+}
+
+/** The `audio` field of an audio reply file: a known format and some data text. */
+function readReplyAudio(value: unknown): ReplyAudio | undefined {
+  if (!isRecord(value) || !isAudioFormat(value.format)) {
+    return undefined;
+  }
+  return typeof value.data === "string" && value.data !== ""
+    ? { format: value.format, data: value.data }
+    : undefined;
+}
+
 /**
- * A text, json or skip reply is accepted. Other kinds are `unsupported`. A skip reply with a
- * body, and a text or json reply without one, are `unreadable`.
+ * Whether the version and the body fit the kind: an audio reply is version 2 and any body, a skip
+ * reply is version 1 with no body, and a text or json reply is version 1 with a body.
+ */
+function versionAndBodyFit(data: Record<string, unknown>, kind: ReplyFileKind): boolean {
+  if (kind === "audio") {
+    return data.formatVersion === AUDIO_REPLY_FORMAT_VERSION;
+  }
+  // Only a skip reply has an empty body.
+  return data.formatVersion === FORMAT_VERSION && (kind === "skip") === (data.body === "");
+}
+
+/**
+ * A text, json, skip or audio reply is accepted. Other kinds are `unsupported`. A skip reply with
+ * a body, and a text or json reply without one, are `unreadable`. An audio reply needs version 2
+ * and a readable `audio`; every other kind needs version 1.
  */
 export function parseReplyFile(data: unknown): Loaded<ReplyFile> {
-  if (!isRecord(data) || data.formatVersion !== FORMAT_VERSION || typeof data.body !== "string") {
+  if (!isRecord(data) || typeof data.body !== "string") {
     return UNREADABLE;
   }
   if (!isReplyFileKind(data.kind)) {
-    return UNSUPPORTED;
+    return data.formatVersion === FORMAT_VERSION ? UNSUPPORTED : UNREADABLE;
   }
-  // Only a skip reply has an empty body.
-  if ((data.kind === "skip") !== (data.body === "")) {
+  if (!versionAndBodyFit(data, data.kind)) {
     return UNREADABLE;
   }
-  const reply: ReplyFile = { formatVersion: FORMAT_VERSION, kind: data.kind, body: data.body };
+  const reply: ReplyFile = {
+    formatVersion: data.kind === "audio" ? AUDIO_REPLY_FORMAT_VERSION : FORMAT_VERSION,
+    kind: data.kind,
+    body: data.body,
+  };
+  if (data.kind === "audio") {
+    const audio = readReplyAudio(data.audio);
+    if (audio === undefined) {
+      return UNREADABLE;
+    }
+    reply.audio = audio;
+  }
   if (typeof data.source === "string") {
     reply.source = data.source;
   }
@@ -647,18 +723,17 @@ export function createStateFile(
   return { formatVersion: FORMAT_VERSION, id, state, updatedAt, endedAt, endReason };
 }
 
+/** `audio` is given for an `audio` reply, and only then the file is version 2. */
 export function createReplyFile(
   body: string,
   writtenAt: string,
   kind: ReplyFileKind = "text",
+  audio?: ReplyAudio,
 ): ReplyFile {
-  return {
-    formatVersion: FORMAT_VERSION,
-    kind,
-    body,
-    source: "imbehind-answer",
-    writtenAt,
-  };
+  const origin = { source: "imbehind-answer", writtenAt };
+  return audio === undefined
+    ? { formatVersion: FORMAT_VERSION, kind, body, ...origin }
+    : { formatVersion: AUDIO_REPLY_FORMAT_VERSION, kind, body, audio, ...origin };
 }
 
 /** The text of a file as stored: indented JSON that ends with one newline. */

@@ -34,6 +34,7 @@ Any other path gets `404`. Another method on a known path gets `405` with an `Al
 - A part of the type `image_url`, `input_audio` or `file` is accepted in a message of every role. The request is stored and shown to the human, and the data of the part is saved as a file when it can be read. A part of any other `type` is accepted too, and is shown by its type name. A part of a known type whose content cannot be read is accepted and shown as unreadable. The server never fetches an address. See "Parts that are not text".
 - A part that is not an object, a part without a string `type`, and a `text` part without a string `text` are refused.
 - `tools`, `functions`, `tool_calls`, `function_call` and the messages of the roles `tool` and `function` are accepted. See "Tool calls".
+- `modalities` and `audio` decide whether a human may reply with an audio file. See "Replying with an audio file". An `assistant` message may have `audio: {id}`, the id of an earlier audio reply; it is stored as received. As for `tool_calls`, a message that has `audio` and no `content` is refused, and one with `content` set to `null` is accepted.
 - `n` must be missing or 1.
 - `response_format.type` set to `json_schema` or `json_object` asks for a JSON reply. Any other request asks for text.
 - `stream: true` asks for a streamed response. `stream_options.include_usage: true` adds a usage chunk.
@@ -112,7 +113,7 @@ Nothing is sent while the human writes. When the reply is complete, the server s
 4. With `stream_options.include_usage` true: a chunk with an empty `choices` array and a `usage` of zeros
 5. `data: [DONE]`
 
-All chunks share the same `id` and `created`. The `object` is `chat.completion.chunk`. If the request fails before the reply (skipped, timed out, not stored), the server returns a normal JSON error and starts no stream.
+All chunks share the same `id` and `created`. The `object` is `chat.completion.chunk`. A reply with audio has another order; see "Replying with an audio file". If the request fails before the reply (skipped, timed out, not stored), the server returns a normal JSON error and starts no stream.
 
 ### Structured output
 
@@ -154,6 +155,72 @@ In a stream, only `index`, `id`, `type`, `function.name` and `function.arguments
 When the request defines `functions` and no `tools`, the reply must have exactly one call. The response has `message.function_call` set to `{"name": ..., "arguments": ...}` (no `id` and no `type`), `content` `null` and `finish_reason` `function_call`. A stream has one chunk with the delta `{"function_call": {...}}` and a last chunk with `finish_reason` `function_call`. Several calls in the reply are not sent; the human types again.
 
 A text reply to a request with tools is sent as text, as for any request.
+
+### Replying with an audio file
+
+A request asks for audio when `modalities` is an array that holds the string `audio`. The client then also sends `audio` with a `voice` and a `format` (`wav`, `mp3`, `flac`, `opus` or `pcm16`). `imbehind` reads `modalities` and `audio.format` from `originalRequest` (the body as received) and does not check the rest. A request with `modalities` but without `audio` is accepted too. Only what `POST /v1/chat/completions` documents is built; the points that the documentation leaves open are marked as guesses below.
+
+**How to reply.** In the input of `imbehind answer` (typed, or from standard input), write one line that starts with `@file ` (the word and one space), then the path of the audio file. The other lines are the text, and the text becomes `audio.transcript`. The marker line is not part of the text.
+
+```
+Here is the greeting you asked for.
+@file /home/me/hello.wav
+```
+
+- The path is what follows `@file `, with the white space at both ends removed. It is used as it is: no quotes are read, no `~` is expanded, and a relative path is counted from where the command was started. A line such as `@filename` has no space after `@file`, so it is text. A reply cannot hold a text line that starts with `@file `: such a line is always the marker line.
+- The format comes from the extension, in lower case: `.wav` is `wav`, `.mp3` is `mp3`, `.flac` is `flac`, `.opus` is `opus` and `.pcm` is `pcm16`. A slash and a backslash both end a folder name on every system. The format `aac` is not accepted.
+- The first bytes are checked too. `wav`: `RIFF`, and `WAVE` from byte 8. `mp3`: `ID3`, or `0xFF` followed by a byte whose top 3 bits are set. `flac`: `fLaC`. `opus`: `OggS` (the container only). `pcm16`: no mark, an even length only. A file shorter than its mark does not match.
+- When `audio.format` of the request is a string, it must equal the format of the file. When it is missing, any of the five formats is sent.
+- The file is read once. It must be a regular file with at least one byte and at most 10 MB.
+
+**What is refused.** Nothing is sent and the request keeps waiting. The screen says why and asks again (`Type your reply again. ...`). From standard input the command prints one `Error:` line and exits with code 1. The sentences are fixed and never repeat the text or the data of the file.
+
+| When | Sentence (after `Not sent: ` on the screen, after `Error: ` on standard input) |
+|---|---|
+| The request does not have `audio` in `modalities` | `this request does not ask for audio` |
+| The marker line has no path | `the @file line has no path` |
+| There are two or more marker lines | `only one @file line is allowed in a reply` |
+| The extension is an image (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.bmp`, `.svg`) | `Chat Completions has no way to return an image, so only audio files can be sent` |
+| The extension is not in the table, `aac` included | `the file name must end in .wav, .mp3, .flac, .opus or .pcm` |
+| `audio.format` of the request differs from the file | `the request asks for <format> audio, but this file is <format>` |
+| The request asks for structured output (`json_object` or `json_schema`) | `audio cannot be returned for a request that asks for JSON` |
+| The text is tool calls (see "Tool calls") | `audio cannot be sent together with tool calls` |
+| The file cannot be read | `cannot read <path>: <why>`, where `<why>` is `the file does not exist`, `permission denied`, `it is a folder`, `it is not a regular file`, `the file is empty` or `the file could not be read` |
+| The first bytes do not fit the extension | `the beginning of the file does not look like <format>` |
+| The reply file would be over 10 MB | `Not sent: your reply is larger than 10 MB.` (from standard input: `the reply is larger than 10 MB`) |
+
+**What the screen shows.** For a request that asks for audio, `imbehind answer` adds a line `Audio:    requested (format: wav)` (without the part in brackets when the request names no format) after the `Reply:` line, and a line `To reply with an audio file, type a line: @file <path>` before the prompt. An `assistant` message of the conversation that has `audio` shows a line `audio: <id>` after its text, or `audio: (unreadable)` when the `audio` has no string `id`.
+
+**What the client receives.** The audio is returned as the file's content in base64, and the text as the transcript. The 10 MB limit of the reply file (see "Limits") holds for the base64 text, so the audio file can be about 7.5 MB at most. For a request that is not streamed:
+
+```json
+{
+  "role": "assistant",
+  "content": null,
+  "audio": { "id": "audio_<request id>", "data": "<base64>", "expires_at": 1791803600, "transcript": "<the text, or an empty string>" }
+}
+```
+
+with `finish_reason` `stop`. For a streamed request the chunks are:
+
+1. A chunk with the delta `{"role": "assistant", "content": null}`
+2. A chunk with the delta `{"audio": {"id": ..., "data": <all of the base64>, "transcript": ...}}`
+3. A chunk with the delta `{}` and `finish_reason` `stop`
+4. A chunk with the delta `{"audio": {"expires_at": ...}}` and `finish_reason` `null`
+5. With `stream_options.include_usage` true: the usage chunk, as for text
+6. `data: [DONE]`
+
+The chunk of step 4 comes after the one with `finish_reason` `stop`; this is the only case where a chunk follows the finish reason. The official OpenAI SDK for Node puts these chunks together into the same `message.audio` as a response that is not streamed, and a test checks it.
+
+**Guesses.** The documentation of the endpoint describes the fields but gives no example response. These points are therefore guesses, and they are changed as soon as a real response shows otherwise:
+
+- `message.content` is `null` for a response with audio. The documented type is a string or `null`.
+- `expires_at` is the `created` of the response plus 3600. A real service says when the audio can no longer be used in a later request; `imbehind` keeps no audio to fetch, so the value has no meaning.
+- The usage chunk of a stream comes after the chunk with `expires_at`, before `[DONE]`.
+- `id` is `audio_` followed by the request id. The documentation calls it an opaque string.
+- No limit on the format is made for a stream. Some community posts say that only `pcm16` streams; the documentation does not.
+
+Audio is not sent for a request for structured output, together with tool calls, or more than one file in a reply. An image cannot be a reply, because a Chat Completions response has no place for it. A reply file can carry audio too; see [storage-format.md](storage-format.md).
 
 ### Model list
 
@@ -301,7 +368,8 @@ Other rules:
 | Limit | Value |
 |---|---|
 | Request body | 10485760 bytes |
-| Reply (written file) | 10485760 bytes |
+| Reply (written file) | 10485760 bytes. The audio of an audio reply counts as base64 text, so the audio file is at most about 7.5 MB |
+| Audio of one reply | One file. Larger than 10 MB, or empty, is refused |
 | Messages shown by `imbehind answer` | all `system` and `developer`, and the last 3 others |
 | Lines of one message shown | 200 |
 | Characters of one line shown | 1000 Unicode characters. A longer line is cut |

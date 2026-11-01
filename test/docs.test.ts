@@ -847,6 +847,168 @@ describe("the repository ignores what it builds and what npm pack makes", () => 
   });
 });
 
+describe("audio replies in the documents (FR15, FR16, FR17)", () => {
+  let requirements = "";
+  let specification = "";
+  let storage = "";
+
+  beforeAll(async () => {
+    requirements = await document("docs", "requirements.md");
+    specification = await document("docs", "specification.md");
+    storage = await document("docs", "storage-format.md");
+  });
+
+  /** The line of a requirement, found by its number. */
+  const requirement = (id: string): string =>
+    requirements.split("\n").find((line) => line.startsWith(`- **${id}**`)) ?? "";
+
+  it("has the groups FR15, FR16 and FR17, and every requirement number under them", () => {
+    expect(requirements).toMatch(/^### FR15 Replying with an audio file \(Must\)$/m);
+    expect(requirements).toMatch(/^### FR16 Audio in a reply file \(Should\)$/m);
+    expect(requirements).toMatch(/^### FR17 The audio of an earlier reply \(Should\)$/m);
+    const numbers: Record<string, number> = { FR15: 16, FR16: 3, FR17: 3 };
+    for (const [group, count] of Object.entries(numbers)) {
+      for (let n = 1; n <= count; n += 1) {
+        const id = `${group}.${n}`;
+        expect(requirement(id), id).toMatch(new RegExp(`^- \\*\\*${group}\\.${n}\\*\\* \\S`));
+      }
+    }
+  });
+
+  it("has NFR16 to NFR20 as rows of the table of non-functional requirements", () => {
+    for (let n = 16; n <= 20; n += 1) {
+      expect(requirements, `NFR${n}`).toMatch(new RegExp(`^\\| NFR${n} \\| \\S`, "m"));
+    }
+  });
+
+  it("says which parts of the audio response are guesses", () => {
+    expect(requirement("FR15.11")).toMatch(/guess/i);
+    expect(requirement("FR15.11")).toContain("`null`");
+    expect(requirement("FR15.11")).toContain("3600");
+    expect(requirement("FR15.12")).toMatch(/guess/i);
+    expect(requirement("FR15.12")).toContain("usage");
+  });
+
+  it("names the audio exception in FR3.3 and the audio reply in FR12.3 and FR14.1", () => {
+    expect(requirement("FR3.3")).toContain("FR15.12");
+    expect(requirement("FR12.3")).toMatch(/audio file/i);
+    expect(requirement("FR12.3")).not.toMatch(/refus/i);
+    expect(requirement("FR14.1")).toMatch(/reply file that carries audio is 2/);
+  });
+
+  it("says in the out-of-scope table what an audio reply will not do", () => {
+    const section = sectionOf(requirements, "## Out of scope");
+    expect(section).toMatch(/\| [^|\n]*image[^|\n]*reply[^|\n]* \| Will not be built/i);
+    expect(section).toMatch(/\| [^|\n]*more than one audio[^|\n]* \| Will not be built/i);
+    expect(section).toMatch(/\| [^|\n]*`aac`[^|\n]* \| Will not be built/i);
+  });
+
+  it("has a section of the specification about replying with an audio file", () => {
+    const section = sectionOf(specification, "### Replying with an audio file");
+    expect(section).not.toBe("");
+    for (const word of [
+      "@file <path>",
+      "`.wav`",
+      "`.mp3`",
+      "`.flac`",
+      "`.opus`",
+      "`.pcm`",
+      "`pcm16`",
+      "RIFF",
+      "WAVE",
+      "ID3",
+      "fLaC",
+      "OggS",
+      "message.audio",
+      "transcript",
+      "expires_at",
+      "3600",
+      "`modalities`",
+      "`audio.format`",
+      "`aac`",
+      "10 MB",
+      "Not sent: your reply is larger than 10 MB.",
+      "Audio:    requested",
+    ]) {
+      expect(section, word).toContain(word);
+    }
+    expect(section).toMatch(/image/i);
+    expect(section).toMatch(/structured output|`json_schema`/);
+    expect(section).toMatch(/tool calls/i);
+  });
+
+  it("lists the chunks of an audio stream in order, and marks the guesses", () => {
+    const section = sectionOf(specification, "### Replying with an audio file");
+    const order = [
+      '{"role": "assistant", "content": null}',
+      '{"audio": {"id"',
+      "`finish_reason` `stop`",
+      '{"audio": {"expires_at"',
+      "usage chunk",
+      "[DONE]",
+    ];
+    let from = 0;
+    for (const part of order) {
+      const at = section.indexOf(part, from);
+      expect(at, part).toBeGreaterThanOrEqual(from);
+      from = at + part.length;
+    }
+    expect(section).toMatch(/guess/i);
+  });
+
+  it("says in the specification what the audio response is for a request that is not streamed", () => {
+    const section = sectionOf(specification, "### Replying with an audio file");
+    expect(section).toContain('"content": null');
+    expect(section).toMatch(/`finish_reason` is `stop`|`finish_reason` `stop`/);
+  });
+
+  it("says in the specification that the limit and the other limits of an audio reply hold", () => {
+    const limits = sectionOf(specification, "## Limits");
+    expect(limits).toMatch(/audio/i);
+  });
+
+  it("describes the audio reply file in the storage format: version 2, the audio field, the checks", () => {
+    expect(storage).toMatch(
+      /`state\.json` and `reply\.json` (stay|are) (at )?(version )?`?1`?[^\n]*`audio`[^\n]*`2`/,
+    );
+    expect(storage).toContain("`audio`");
+    expect(storage).toContain('"kind": "audio"');
+    for (const format of ["wav", "mp3", "flac", "opus", "pcm16"]) {
+      expect(storage, format).toContain(`\`${format}\``);
+    }
+    const reasons = [
+      INVALID_REPLY_REASONS.audioFormat,
+      INVALID_REPLY_REASONS.audioData,
+      INVALID_REPLY_REASONS.audioContent,
+      INVALID_REPLY_REASONS.audioNotAsked,
+      INVALID_REPLY_REASONS.audioFormatDiffers,
+      INVALID_REPLY_REASONS.audioStructured,
+      INVALID_REPLY_REASONS.audioToolCalls,
+    ];
+    let from = storage.indexOf(INVALID_REPLY_REASONS.badToolCalls("<detail>"));
+    for (const reason of reasons) {
+      const at = storage.indexOf(reason, from);
+      expect(at, reason).toBeGreaterThanOrEqual(from);
+      from = at + reason.length;
+    }
+  });
+
+  it("says in the storage format that request.json stays at version 3 and keeps the audio of a message", () => {
+    expect(storage).toMatch(/`audio`[^\n]*(assistant|earlier)[^\n]*as (it was )?received/i);
+    expect(storage).toMatch(/`request\.json` is `3`/);
+    expect(storage).not.toMatch(/all eight checks/);
+  });
+
+  it("tells in both READMEs that an audio file can be the reply, with the @file line", async () => {
+    for (const name of READMES) {
+      expect(await document(name), name).toContain("@file");
+    }
+    expect(await document("README.md")).toMatch(/audio file/i);
+    // The Japanese word for "audio", written as code points.
+    expect(await document("README.ja.md")).toContain(String.fromCodePoint(0x97f3, 0x58f0));
+  });
+});
+
 describe(".npmrc (supply chain)", () => {
   it("turns off the install scripts of dependencies and waits 7 days for a new release", async () => {
     const lines = (await document(".npmrc")).split("\n").map((line) => line.trim());

@@ -1,3 +1,4 @@
+import { type AudioRequest, audioRequestOf } from "../audio-reply.js";
 import type { Clock } from "../clock.js";
 import { AlreadyExistsError, IoFailure, type IoReason } from "../errors.js";
 import { createIdGenerator, type IdGenerator } from "../ids.js";
@@ -9,6 +10,7 @@ import {
   INVALID_REPLY_REASONS,
   MAX_FILE_BYTES,
   type PartFileData,
+  type ReplyAudio,
   type ReplyFile,
   type ReplyFileKind,
   type ReplyKind,
@@ -39,8 +41,11 @@ export type BrokerEventHandler = (event: BrokerEvent) => void;
  * client is gone.
  */
 export type ExchangeOutcome =
-  /** `reply` is what `body` is for the client, decided once when the reply was accepted. */
-  | { kind: "replied"; id: string; body: string; reply: ToolReply }
+  /**
+   * `reply` is what `body` is for the client, decided once when the reply was accepted. `audio` is
+   * there only for an audio reply, and then `body` is its transcript (which may be empty).
+   */
+  | { kind: "replied"; id: string; body: string; reply: ToolReply; audio?: ReplyAudio }
   | { kind: "skipped"; id: string }
   | { kind: "timed_out"; id: string; limitSeconds: number }
   | { kind: "cancelled"; id: string }
@@ -101,6 +106,8 @@ type Judged =
 interface ReplyRules {
   replyKind: ReplyKind;
   toolDefinitions: ToolDefinitions;
+  /** Whether the request asks for audio, and in which format. */
+  audio: AudioRequest;
 }
 
 export interface BrokerOptions {
@@ -218,6 +225,7 @@ export class ExchangeBroker {
     this.replyRules.set(id, {
       replyKind: request.replyKind,
       toolDefinitions: request.toolDefinitions ?? "none",
+      audio: audioRequestOf(request.originalRequest),
     });
     return { id, outcome };
   }
@@ -411,20 +419,27 @@ export class ExchangeBroker {
   }
 
   /**
-   * Whether the reply file that `placeReply` would write for this body is within the limit.
-   * The length is that of the written bytes: indented, with the body escaped as a JSON string, so quotes and
-   * line ends count for more than the body itself.
+   * Whether the reply file that `placeReply` would write for this body (and this audio, for an
+   * audio reply) is within the limit. The length is that of the written bytes: indented, with the
+   * body escaped as a JSON string, so quotes and line ends count for more than the body itself,
+   * and the audio counts as its base64 text.
    */
-  replyFitsLimit(body: string, kind: ReplyFileKind): boolean {
-    const bytes = serializeFile(createReplyFile(body, this.clock.now().toISOString(), kind));
+  replyFitsLimit(body: string, kind: ReplyFileKind, audio?: ReplyAudio): boolean {
+    const bytes = serializeFile(createReplyFile(body, this.clock.now().toISOString(), kind, audio));
     return Buffer.byteLength(bytes, "utf8") <= MAX_FILE_BYTES;
   }
 
   /**
    * Places this answer's reply. `too-late` means the request is no longer waiting or another
-   * reply came first. An input/output failure is thrown for the caller to show.
+   * reply came first. An input/output failure is thrown for the caller to show. `audio` is given
+   * for a reply of kind `audio`, whose `body` is then the transcript.
    */
-  async placeReply(id: string, body: string, kind: ReplyFileKind = "text"): Promise<PlaceResult> {
+  async placeReply(
+    id: string,
+    body: string,
+    kind: ReplyFileKind = "text",
+    audio?: ReplyAudio,
+  ): Promise<PlaceResult> {
     const state = await this.store.readState(id);
     if (state.kind !== "ok" || state.value.state !== "waiting") {
       return { kind: "too-late" };
@@ -433,7 +448,7 @@ export class ExchangeBroker {
     if (files.has("reply.json") || files.has("reply.accepted.json")) {
       return { kind: "too-late" };
     }
-    const bytes = serializeFile(createReplyFile(body, this.clock.now().toISOString(), kind));
+    const bytes = serializeFile(createReplyFile(body, this.clock.now().toISOString(), kind, audio));
     try {
       await this.store.placeReply(id, bytes);
     } catch (error) {
@@ -649,7 +664,7 @@ export class ExchangeBroker {
     if (rules === undefined) {
       return undefined;
     }
-    const verdict = checkReplyFile(read.bytes, rules.replyKind, rules.toolDefinitions);
+    const verdict = checkReplyFile(read.bytes, rules.replyKind, rules.toolDefinitions, rules.audio);
     if (verdict.kind !== "valid") {
       return verdict;
     }
@@ -674,6 +689,7 @@ export class ExchangeBroker {
       ? {
           replyKind: request.value.replyKind,
           toolDefinitions: request.value.toolDefinitions,
+          audio: audioRequestOf(request.value.originalRequest),
         }
       : undefined;
   }
@@ -875,7 +891,8 @@ function toolReplyOf(
   reply: ReplyFile,
   toolDefinitions: ToolDefinitions,
 ): ToolReply | { kind: "invalid"; reason: string } {
-  if (reply.kind === "skip") {
+  // The body of an audio reply is a transcript. The check has shown that it is not tool calls.
+  if (reply.kind === "skip" || reply.kind === "audio") {
     return { kind: "text" };
   }
   const result = classifyReply(reply.body, toolDefinitions);
@@ -899,7 +916,13 @@ function replyEnding(
   return {
     outcome: skipped
       ? { kind: "skipped", id }
-      : { kind: "replied", id, body: reply.body, reply: toolReply },
+      : {
+          kind: "replied",
+          id,
+          body: reply.body,
+          reply: toolReply,
+          ...(reply.audio === undefined ? {} : { audio: reply.audio }),
+        },
     state: skipped
       ? createStateFile(id, "skipped", now, now, "skipped by the human")
       : createStateFile(id, "replied", now, now),

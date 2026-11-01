@@ -18,6 +18,7 @@ import {
   type Message,
   type PartFileData,
   pickToolFields,
+  type ReplyAudio,
   type ReplyKind,
   ROLES,
   type Role,
@@ -85,9 +86,20 @@ export interface ErrorBody {
 /** Why the response ends: a text reply, tool calls, or one legacy function call. */
 type FinishReason = "stop" | "tool_calls" | "function_call";
 
-/** The message of a response. The content is null when the reply calls tools. */
+/** The audio of a response message. `transcript` is the text of the reply, possibly empty. */
+interface MessageAudio {
+  id: string;
+  data: string;
+  expires_at: number;
+  transcript: string;
+}
+
+/**
+ * The message of a response. The content is null when the reply calls tools, and when it is audio.
+ */
 type CompletionMessage =
   | { role: "assistant"; content: string }
+  | { role: "assistant"; content: null; audio: MessageAudio }
   | { role: "assistant"; content: null; tool_calls: Record<string, unknown>[] }
   | {
       role: "assistant";
@@ -513,11 +525,27 @@ export function parseChatCompletionsRequest(text: string): AdapterResult {
 export interface CompletionInput {
   requestId: string;
   model: string;
-  /** The reply as typed. It is the content of the response when `reply` is text or missing. */
+  /**
+   * The reply as typed. It is the content of the response when `reply` is text or missing, and
+   * the transcript when there is `audio`.
+   */
   content: string;
   nowSeconds: number;
   /** What the reply is. Missing means text. */
   reply?: ToolReply;
+  /** The audio of the reply. It is not tool calls, and the content is its transcript. */
+  audio?: ReplyAudio;
+}
+
+/**
+ * How long, in seconds after `created`, the audio of a response is said to stay available. This
+ * is a guess: the API documents the field but not its value, and imbehind keeps no audio to fetch.
+ */
+const AUDIO_LIFETIME_SECONDS = 3600;
+
+/** The id of the audio of a response. It is made from the id of the request, so it is different for each. */
+function audioIdOf(input: CompletionInput): string {
+  return `audio_${input.requestId}`;
 }
 
 /** The message and the finish reason of a response for this reply. */
@@ -525,6 +553,15 @@ function messageOf(input: CompletionInput): {
   message: CompletionMessage;
   finish: FinishReason;
 } {
+  if (input.audio !== undefined) {
+    const audio: MessageAudio = {
+      id: audioIdOf(input),
+      data: input.audio.data,
+      expires_at: input.nowSeconds + AUDIO_LIFETIME_SECONDS,
+      transcript: input.content,
+    };
+    return { message: { role: "assistant", content: null, audio }, finish: "stop" };
+  }
   const reply = input.reply;
   if (reply?.kind === "tool_calls") {
     const calls = reply.calls.map((call) => call.raw);
@@ -590,6 +627,11 @@ function event(chunk: StreamChunk): string {
  * chunk.
  */
 function bodyDeltas(input: CompletionInput): Record<string, unknown>[] {
+  if (input.audio !== undefined) {
+    // The whole audio and the transcript in one chunk. `expires_at` follows after the last chunk.
+    const { data } = input.audio;
+    return [{ audio: { id: audioIdOf(input), data, transcript: input.content } }];
+  }
   const reply = input.reply;
   if (reply?.kind === "tool_calls") {
     return reply.calls.map((call, index) => ({
@@ -612,7 +654,10 @@ function bodyDeltas(input: CompletionInput): Record<string, unknown>[] {
 /**
  * The events of a streamed response, in order: the role, the whole reply (one content chunk, one
  * chunk per tool call, or one function call chunk), the last chunk with the finish reason, the
- * usage chunk when asked, and `[DONE]`. Every chunk has the same id, created and model.
+ * usage chunk when asked, and `[DONE]`. Every chunk has the same id, created and model. An audio
+ * reply is the role chunk with null content, one chunk with the audio and the transcript, the
+ * chunk with the finish reason, and a chunk with `expires_at` alone; the usage chunk, when asked,
+ * comes after that one (its place is a guess: the API does not document it).
  */
 export function buildStreamEvents(input: StreamInput): string[] {
   const base = {
@@ -624,7 +669,8 @@ export function buildStreamEvents(input: StreamInput): string[] {
   const choice = (delta: Record<string, unknown>, finish: FinishReason | null): StreamChoice[] => [
     { index: 0, delta, finish_reason: finish },
   ];
-  const isText = input.reply === undefined || input.reply.kind === "text";
+  const isText =
+    input.audio === undefined && (input.reply === undefined || input.reply.kind === "text");
   const chunks: StreamChunk[] = [
     {
       ...base,
@@ -635,6 +681,19 @@ export function buildStreamEvents(input: StreamInput): string[] {
       choices: choice(delta, null),
     })),
     { ...base, choices: choice({}, messageOf(input).finish) },
+    // The expiry of audio comes in a chunk of its own, after the finish reason. This is the
+    // only chunk that follows the one with the finish reason (the SDK types show it so).
+    ...(input.audio === undefined
+      ? []
+      : [
+          {
+            ...base,
+            choices: choice(
+              { audio: { expires_at: input.nowSeconds + AUDIO_LIFETIME_SECONDS } },
+              null,
+            ),
+          },
+        ]),
   ];
   if (input.includeUsage) {
     chunks.push({

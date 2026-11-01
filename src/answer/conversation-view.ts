@@ -15,6 +15,7 @@ const TEXT = {
   saved: "saved",
   toolCall: "tool_call",
   functionCall: "function_call",
+  audio: "audio",
   unreadableCall: "(unreadable tool call)",
   unnamed: "(unnamed)",
   earlierMessages: (count: number, path: string) =>
@@ -154,6 +155,21 @@ function callLines(message: Message): string[] {
   return lines;
 }
 
+/**
+ * The line for the audio of an earlier reply: `audio: <id>` for an assistant message whose `audio`
+ * is an object with a string `id`, and `audio: (unreadable)` for any other `audio` that is there.
+ * A message of another role, and one without `audio` or with a null one, has no such line.
+ */
+function audioLines(message: Message): string[] {
+  const { audio } = message;
+  if (message.role !== "assistant" || audio === undefined || audio === null) {
+    return [];
+  }
+  const id = isRecord(audio) ? audio.id : undefined;
+  const shown = typeof id === "string" ? escapeAllControls(id) : TEXT.unreadable;
+  return [`${TEXT.audio}: ${shown}`];
+}
+
 /** The text of `content` cut at the given positions, counted in Unicode characters. */
 function textPieces(content: string, positions: readonly number[]): string[] {
   const pieces: string[] = [];
@@ -274,7 +290,7 @@ function bodyLines(message: Message, requestDir: string, path: string): string[]
 
 /** The lines of one message after the escape and the cut, limited to the first `MAX_LINES`. */
 function messageEntry(message: Message, requestDir: string, path: string): ViewEntry {
-  const calls = callLines(message).map((line) => cutLine(line, path));
+  const calls = [...callLines(message), ...audioLines(message)].map((line) => cutLine(line, path));
   const body = bodyLines(message, requestDir, path);
   if (body.length === 0 && calls.length === 0) {
     return { kind: "message", role: message.role, lines: [TEXT.empty], hiddenLines: 0 };

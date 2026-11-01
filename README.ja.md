@@ -39,6 +39,7 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 - `GET /v1/models`。
 - ツール: `tools` や `functions` を持つ依頼と、`tool_calls`、`function_call`、ロール `tool` と `function` を持つメッセージは、保存して表示します。ツールを呼ばせたいときは、返答としてツール呼び出しのJSON配列を打ち込みます。クライアントには `tool_calls`（`functions` だけを送ったときは `function_call`）が返り、ストリームでも同じです。それ以外の返答は文章として返します。書き方は[仕様書](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md)（英語）にあります。
 - 文章でない部品（画像、音声、ファイル）は、受け取って見せます。部品のデータは、依頼と同じフォルダにファイルとして保存し、`imbehind answer` は部品ごとに1行、メディアタイプ、大きさ、ファイルの場所を示します。部品の中のアドレスはそのまま示し、取りにいきません。画面に出す1行が1000文字を超えると、切って示します。
+- 音声での返答: 依頼が音声を求めているとき（`modalities` に `audio` がある）は、音声ファイルで返答できます。返答に `@file <パス>` の行を足します。たとえば `@file /home/me/hello.wav` です（`wav`、`mp3`、`flac`、`opus`、`pcm16`）。ほかの行は文字起こしになります。クライアントには `message.audio` が返り、ストリームでも同じです。画像は返せません。音声ファイルは、およそ7.5MBまでです。書き方は[仕様書](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md)（英語）にあります。
 
 サーバーは、返答を既定で30分待ちます。クライアントのタイムアウトを同じかそれ以上にし、自動の再試行は切ってください。そうしないと、クライアントが先にあきらめて、同じ依頼をもう一度送ることがあります。[仕様書](https://github.com/two-pack/im-behind-the-curtain/blob/main/docs/specification.md)（英語）に、公式SDKでの設定例、すべての設定、サーバーが書くファイルがあります。
 
